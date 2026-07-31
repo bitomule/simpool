@@ -59,8 +59,12 @@ func splitDoubleDash(args []string) (flagArgs, cmdArgs []string) {
 
 // envLines renders slots into the environment contract from design doc §5.
 // MAV_TARGET_* and MAV_EXACT_RUN_DIR describe the primary (first) slot,
-// which covers the common single-target case; SIMPOOL_UDID_N /
-// SIMPOOL_DEVICE_SET_N expose every slot for multi-target invocations.
+// which covers the common single-target case; SIMPOOL_UDID_N exposes every
+// slot for multi-target invocations. There is no SIMPOOL_DEVICE_SET_N
+// anymore: every slot's simulator lives in the default device set (design
+// decision "opción (b)"), the same one plain `xcrun simctl`/MAV/axe/idb
+// already talk to with no flag at all — a pooled UDID needs no extra
+// plumbing to be usable by any of them.
 func envLines(slots []*pool.Slot, runDir string) []string {
 	primary := slots[0]
 	lines := []string{
@@ -71,10 +75,7 @@ func envLines(slots []*pool.Slot, runDir string) []string {
 		"MAV_EXACT_RUN_DIR=" + runDir,
 	}
 	for i, s := range slots {
-		lines = append(lines,
-			fmt.Sprintf("SIMPOOL_UDID_%d=%s", i, s.Meta.UDID),
-			fmt.Sprintf("SIMPOOL_DEVICE_SET_%d=%s", i, s.SetDir()),
-		)
+		lines = append(lines, fmt.Sprintf("SIMPOOL_UDID_%d=%s", i, s.Meta.UDID))
 	}
 	return lines
 }

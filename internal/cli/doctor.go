@@ -55,10 +55,6 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 			dir := pool.SlotDir(groupDir, n)
 			label := fmt.Sprintf("%s/slot-%d", group, n)
 
-			if info, err := os.Stat(pool.SetDirFor(dir)); err != nil || !info.IsDir() {
-				note("%s: device set directory missing", label)
-			}
-
 			meta := pool.ReadMeta(dir)
 			free, err := pool.IsSlotFree(dir)
 			if err != nil {
@@ -67,8 +63,18 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 			}
 
 			if meta.UDID != "" {
-				if _, found, err := simctl.State(pool.SetDirFor(dir), meta.UDID); err == nil && !found {
-					note("%s: meta.json references device %s which no longer exists", label, meta.UDID)
+				if entry, found, err := simctl.Find(meta.UDID); err == nil {
+					if !found {
+						note("%s: meta.json references device %s which no longer exists", label, meta.UDID)
+					} else if !pool.IsPoolName(entry.Name) {
+						// The default device set also holds the user's own
+						// simulators; meta.json pointing at one of those
+						// would be a serious bug elsewhere in simpool, not
+						// something to paper over here.
+						note("%s: meta.json references device %s (name %q) that is NOT pool-owned — this should never happen", label, meta.UDID, entry.Name)
+					} else if want := pool.DeviceName(meta.Device, meta.OSVersion, n); entry.Name != want {
+						note("%s: meta.json's device %s is named %q, expected %q", label, meta.UDID, entry.Name, want)
+					}
 				}
 			}
 

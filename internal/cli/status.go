@@ -67,7 +67,7 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 
 			deviceState := "unprovisioned"
 			if meta.UDID != "" {
-				if state, found, err := simctl.State(pool.SetDirFor(dir), meta.UDID); err == nil && found {
+				if state, found, err := simctl.State(meta.UDID); err == nil && found {
 					deviceState = state
 				} else {
 					deviceState = "missing"

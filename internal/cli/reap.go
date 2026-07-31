@@ -29,8 +29,19 @@ import (
 //     design (see Meta.Mode) — see design doc §5's "for scripts that will
 //     manage the workload themselves".
 //
-// The lock file itself is never deleted or rewritten by reap — it stays
-// the pool's single source of truth for the next acquirer.
+// Every slot's simulator lives in the default device set (design decision
+// "opción (b)"), alongside the user's own simulators. Before shutting down
+// or deleting anything, reap always re-checks the device's actual name in
+// that set against pool.IsPoolName/pool.DeviceName — never just trusts a
+// UDID out of meta.json — so a stale or corrupt meta.json can never make
+// reap touch a simulator that isn't ours.
+//
+// The lock file itself is never deleted or rewritten while a slot's
+// simulator is still alive — it stays the pool's single source of truth
+// for the next acquirer. Once a slot's simulator has actually been purged
+// (or it was never provisioned and has sat abandoned past --purge), reap
+// removes the whole slot directory, lock file included: that is the "dead
+// slot" cleanup path, distinct from and in addition to deleting simulators.
 func RunReap(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -98,9 +109,10 @@ func reapSlot(dir string, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAf
 
 	if meta.UDID == "" {
 		fmt.Fprintf(stdout, "IDLE  %s  free, never provisioned\n", label)
+		removeDeadSlotDir(dir, label, purgeMinutes, dryRun, stdout, stderr)
 		return
 	}
-	state, found, err := simctl.State(pool.SetDirFor(dir), meta.UDID)
+	entry, found, err := simctl.Find(meta.UDID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap %s: checking device state: %v\n", label, err)
 		return
@@ -109,10 +121,20 @@ func reapSlot(dir string, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAf
 		fmt.Fprintf(stdout, "IDLE  %s  free, meta references missing device %s\n", label, meta.UDID)
 		return
 	}
-	if state == "Booted" {
+	if !pool.IsPoolName(entry.Name) {
+		// meta.json points at a real device that exists, but isn't ours —
+		// this should never happen (see EnsureProvisioned's exact-name
+		// check), but reap is the one place with the power to shut down or
+		// delete a simulator, so it is the one place that must refuse
+		// outright rather than trust meta.json. The default device set
+		// also holds the user's own simulators; they are never touched.
+		fmt.Fprintf(stdout, "SKIP  %s  meta references device %s named %q — not pool-owned, refusing to touch it (this should never happen)\n", label, meta.UDID, entry.Name)
+		return
+	}
+	if entry.State == "Booted" {
 		fmt.Fprintf(stdout, "SHUT  %s  shutting down %s (idle %s)\n", label, meta.UDID, idle.Round(time.Second))
 		if !dryRun {
-			if err := simctl.Shutdown(pool.SetDirFor(dir), meta.UDID); err != nil {
+			if err := simctl.Shutdown(meta.UDID); err != nil {
 				fmt.Fprintf(stderr, "reap %s: %v\n", label, err)
 			}
 		}
@@ -127,12 +149,51 @@ func reapSlot(dir string, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAf
 	if dryRun {
 		return
 	}
-	if err := simctl.Delete(pool.SetDirFor(dir), meta.UDID); err != nil {
+	if err := simctl.Delete(meta.UDID); err != nil {
 		fmt.Fprintf(stderr, "reap %s: purging %s: %v\n", label, meta.UDID, err)
 		return
 	}
-	if err := pool.WriteMeta(dir, pool.Meta{}); err != nil {
-		fmt.Fprintf(stderr, "reap %s: clearing meta after purge: %v\n", label, err)
+	// The slot directory (lock file included — we still hold it open, but
+	// unlinking it is fine: Release()/Close() below operate on the fd, not
+	// the name) is removed outright rather than just clearing meta.json:
+	// post-purge, an empty numbered slot directory has zero informational
+	// value over no directory at all, and leaving it around is exactly the
+	// "no subcommand ever deletes a dead slot" gap the design review
+	// flagged. AcquireSlots is unaffected either way — it discovers slots
+	// by walking whatever directories exist, not by any persisted count.
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(stderr, "reap %s: removing purged slot directory: %v\n", label, err)
+	}
+}
+
+// deadSlotGrace is the minimum time a never-provisioned slot directory must
+// have existed before reap considers it abandoned rather than "another
+// process is mid-acquire right now". take() in pool.AcquireSlots always
+// holds the lock across mkdir+provision, so reap can only ever observe an
+// unlocked, never-provisioned slot dir here if provisioning failed and the
+// caller released it — but the grace period costs nothing and removes any
+// doubt.
+const deadSlotGrace = 2 * time.Minute
+
+// removeDeadSlotDir deletes a free, never-provisioned slot directory (a
+// leftover from a provisioning attempt that failed before writing a UDID
+// to meta.json) once it is old enough and --purge is enabled — otherwise
+// failed provisioning attempts accumulate slot numbers under a group
+// forever, each one an empty directory nothing will ever clean up.
+func removeDeadSlotDir(dir, label string, purgeMinutes int, dryRun bool, stdout, stderr io.Writer) {
+	if purgeMinutes <= 0 {
+		return
+	}
+	info, err := os.Stat(dir)
+	if err != nil || time.Since(info.ModTime()) < deadSlotGrace {
+		return
+	}
+	fmt.Fprintf(stdout, "PURGE %s  removing empty, never-provisioned slot directory\n", label)
+	if dryRun {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Fprintf(stderr, "reap %s: removing dead slot directory: %v\n", label, err)
 	}
 }
 

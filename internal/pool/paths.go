@@ -7,6 +7,7 @@
 package pool
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -64,6 +65,31 @@ func sanitize(s string) string {
 // GroupName returns the on-disk directory name for a given device+OS pair.
 func GroupName(device, osVersion string) string {
 	return sanitize(device) + "_" + sanitize(osVersion)
+}
+
+// NamePrefix marks every simulator simpool owns in the (shared, default)
+// device set. Every simulator simpool creates gets a name starting with
+// this; reap and doctor must refuse to shut down, delete, or otherwise act
+// on any device whose name doesn't start with it — the default set also
+// holds the user's own simulators (34 on the dev machine at design time),
+// and they must never be touched.
+const NamePrefix = "SIMPOOL_"
+
+// DeviceName returns the deterministic, pool-wide-unique name simpool
+// gives the simulator for one slot, e.g. "SIMPOOL_iPhone-17-Pro_26.3_slot-0"
+// for slot 0 of the "iPhone 17 Pro" / 26.3 group. Deterministic and unique
+// per slot (not just per group) so EnsureProvisioned can recover a slot's
+// simulator by name alone if meta.json is lost or corrupted — all slots
+// now share one device set, so a name collision between slots would be a
+// real leak, not just cosmetic.
+func DeviceName(device, osVersion string, slotNumber int) string {
+	return fmt.Sprintf("%s%s_slot-%d", NamePrefix, GroupName(device, osVersion), slotNumber)
+}
+
+// IsPoolName reports whether name looks like a simulator simpool created
+// (see NamePrefix). Anything else in the default device set is off-limits.
+func IsPoolName(name string) bool {
+	return strings.HasPrefix(name, NamePrefix)
 }
 
 // GroupDir returns the absolute path of a device+OS group under root.
@@ -128,14 +154,12 @@ func ListGroupDirs(root string) ([]string, error) {
 }
 
 func lockPath(slotDir string) string { return filepath.Join(slotDir, "lock") }
-func setPath(slotDir string) string  { return filepath.Join(slotDir, "set") }
 func metaPath(slotDir string) string { return filepath.Join(slotDir, "meta.json") }
 
-// LockPath, SetDirFor and MetaPath are exported accessors for callers (cli,
-// tests) that only have a slot directory path, not a live *Slot.
-func LockPath(slotDir string) string  { return lockPath(slotDir) }
-func SetDirFor(slotDir string) string { return setPath(slotDir) }
-func MetaPath(slotDir string) string  { return metaPath(slotDir) }
+// LockPath and MetaPath are exported accessors for callers (cli, tests)
+// that only have a slot directory path, not a live *Slot.
+func LockPath(slotDir string) string { return lockPath(slotDir) }
+func MetaPath(slotDir string) string { return metaPath(slotDir) }
 
 // IsSlotFree reports whether the slot at slotDir is currently unlocked.
 func IsSlotFree(slotDir string) (bool, error) { return IsFree(lockPath(slotDir)) }

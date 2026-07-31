@@ -1,6 +1,12 @@
-// Package simctl wraps the subset of `xcrun simctl` simpool needs, always
-// scoped to a caller-provided device set via --set so that operations on
-// one slot can never see or touch another slot's simulators.
+// Package simctl wraps the subset of `xcrun simctl` simpool needs. All
+// operations run against the default device set — the same one Xcode and
+// the user's own simulators live in (see design decision "opción (b)":
+// custom device sets were tried and dropped because Simulator.app is
+// single-instance-per-set and axe/idb cannot see a non-default set at all).
+// Isolation is by name, not by set: every simulator simpool creates gets a
+// unique, deterministic SIMPOOL_-prefixed name (see pool.DeviceName) so
+// callers here and in package pool can positively identify a pool-owned
+// device and never mistake one of the user's own for one of ours.
 package simctl
 
 import (
@@ -26,11 +32,9 @@ type runtimesDoc struct {
 	Runtimes []Runtime `json:"runtimes"`
 }
 
-// ListRuntimes returns every runtime known to the default device set.
-// Runtimes are global to the host regardless of --set, so this never
-// needs a --set flag.
+// ListRuntimes returns every runtime known to the host.
 func ListRuntimes() ([]Runtime, error) {
-	out, err := run("", "list", "runtimes", "-j")
+	out, err := run("list", "runtimes", "-j")
 	if err != nil {
 		return nil, err
 	}
@@ -86,58 +90,75 @@ type devicesDoc struct {
 	Devices map[string][]deviceEntry `json:"devices"`
 }
 
-// Create makes a new simulator in the device set at setDir. Returns its
-// UDID.
-func Create(setDir, name, deviceTypeID, runtimeID string) (string, error) {
-	out, err := run(setDir, "create", name, deviceTypeID, runtimeID)
+// Create makes a new simulator in the default device set. Returns its
+// UDID. name must be unique within the set — callers in package pool are
+// responsible for that (see pool.DeviceName).
+func Create(name, deviceTypeID, runtimeID string) (string, error) {
+	out, err := run("create", name, deviceTypeID, runtimeID)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Boot starts udid in setDir. "Already booted" is not an error.
-func Boot(setDir, udid string) error {
-	_, err := run(setDir, "boot", udid)
+// Boot starts udid. "Already booted" is not an error.
+func Boot(udid string) error {
+	_, err := run("boot", udid)
 	if err != nil && !strings.Contains(err.Error(), "Unable to boot device in current state: Booted") {
 		return err
 	}
 	return nil
 }
 
-// Shutdown stops udid in setDir. "Already shutdown" is not an error.
-func Shutdown(setDir, udid string) error {
-	_, err := run(setDir, "shutdown", udid)
+// Shutdown stops udid. "Already shutdown" is not an error.
+func Shutdown(udid string) error {
+	_, err := run("shutdown", udid)
 	if err != nil && !strings.Contains(err.Error(), "Unable to shutdown device in current state: Shutdown") {
 		return err
 	}
 	return nil
 }
 
-// Delete removes udid (and its data) from setDir.
-func Delete(setDir, udid string) error {
-	_, err := run(setDir, "delete", udid)
+// Delete removes udid (and its data) from the default device set.
+func Delete(udid string) error {
+	_, err := run("delete", udid)
 	return err
 }
 
-// State returns the device's current state string (e.g. "Booted",
-// "Shutdown"), or "" plus false if udid is not found in setDir.
-func State(setDir, udid string) (string, bool, error) {
-	devices, err := ListDevices(setDir)
+// Find returns the device set entry for udid — its name and state — or
+// found=false if no device with that UDID exists. Callers that are about
+// to act destructively on a UDID pulled from meta.json should use this
+// (not just State) so they can check Name before trusting it: the default
+// device set also holds the user's own simulators, and a UDID is not by
+// itself proof that a device is pool-owned (see pool.IsPoolName).
+func Find(udid string) (DeviceEntry, bool, error) {
+	devices, err := ListDevices()
 	if err != nil {
-		return "", false, err
+		return DeviceEntry{}, false, err
 	}
 	for _, d := range devices {
 		if d.UDID == udid {
-			return d.State, true, nil
+			return d, true, nil
 		}
 	}
-	return "", false, nil
+	return DeviceEntry{}, false, nil
 }
 
-// ListDevices returns every device known to the device set at setDir.
-func ListDevices(setDir string) ([]deviceEntry, error) {
-	out, err := run(setDir, "list", "devices", "-j")
+// State returns the device's current state string (e.g. "Booted",
+// "Shutdown"), or "" plus false if udid is not found.
+func State(udid string) (string, bool, error) {
+	d, found, err := Find(udid)
+	if err != nil || !found {
+		return "", found, err
+	}
+	return d.State, true, nil
+}
+
+// ListDevices returns every device known to the default device set —
+// including the caller's own, unrelated simulators; callers must filter by
+// name (pool.IsPoolName) before treating any result as pool-owned.
+func ListDevices() ([]deviceEntry, error) {
+	out, err := run("list", "devices", "-j")
 	if err != nil {
 		return nil, err
 	}
@@ -157,12 +178,8 @@ func ListDevices(setDir string) ([]deviceEntry, error) {
 // type name.
 type DeviceEntry = deviceEntry
 
-func run(setDir string, args ...string) ([]byte, error) {
-	full := []string{"simctl"}
-	if setDir != "" {
-		full = append(full, "--set", setDir)
-	}
-	full = append(full, args...)
+func run(args ...string) ([]byte, error) {
+	full := append([]string{"simctl"}, args...)
 	cmd := exec.Command("xcrun", full...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

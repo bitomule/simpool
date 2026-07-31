@@ -67,7 +67,12 @@ func repoRoot(t *testing.T) string {
 
 // cleanupPool tears down every simulator (and any straggling process
 // referencing one) found under a SIMPOOL_HOME used by a test, so no
-// integration test ever leaks a simulator or an orphaned process.
+// integration test ever leaks a simulator or an orphaned process. Every
+// simulator these tests create lives in the default device set (design
+// decision "opción (b)"), so this — like reap — only ever acts on a UDID
+// after confirming its name is pool-owned (pool.IsPoolName): a test bug
+// that somehow left meta.UDID pointing at an unrelated device must not be
+// able to shut down or delete one of the user's own simulators.
 func cleanupPool(t *testing.T, home string) {
 	t.Helper()
 	groups, err := pool.ListGroupDirs(home)
@@ -87,10 +92,39 @@ func cleanupPool(t *testing.T, home string) {
 				}
 				time.Sleep(200 * time.Millisecond)
 			}
-			setDir := pool.SetDirFor(dir)
-			_ = simctl.Shutdown(setDir, meta.UDID)
-			_ = simctl.Delete(setDir, meta.UDID)
+			entry, found, err := simctl.Find(meta.UDID)
+			if err != nil || !found || !pool.IsPoolName(entry.Name) {
+				continue
+			}
+			_ = simctl.Shutdown(meta.UDID)
+			// Deleting immediately after Shutdown races CoreSimulator's own
+			// asynchronous teardown of the device's process tree: `delete`
+			// yanking the device's data volume out from under a
+			// still-tearing-down launchd_sim orphans its entire runtime
+			// (AccessibilityUIServer, healthd, dozens of others) with no
+			// parent left to reap them — reproduced directly on this
+			// machine while validating this change, hundreds of leaked
+			// 100%-CPU processes from a single premature delete. Poll for
+			// the shutdown to actually land first; if it doesn't within the
+			// timeout, still attempt Delete (best-effort test cleanup) but
+			// this is the one place worth spending a few seconds to avoid
+			// trashing the host running the test suite.
+			waitForShutdown(meta.UDID, 10*time.Second)
+			_ = simctl.Delete(meta.UDID)
 		}
+	}
+}
+
+// waitForShutdown polls until udid reports state "Shutdown" or timeout
+// elapses. See cleanupPool for why this matters: `delete` right after
+// `shutdown` can orphan the device's whole process tree.
+func waitForShutdown(udid string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if state, found, err := simctl.State(udid); err != nil || !found || state == "Shutdown" {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -108,7 +142,7 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	env := append(os.Environ(), "SIMPOOL_HOME="+home)
 
 	// --- happy path: env contract, run dir, device actually booted ---
-	script := `echo "UDID=$SIMPOOL_UDID_0"; echo "SET=$SIMPOOL_DEVICE_SET_0"; ` +
+	script := `echo "UDID=$SIMPOOL_UDID_0"; ` +
 		`echo "MAVUDID=$MAV_TARGET_UDID"; echo "MAVRUNTIME=$MAV_TARGET_RUNTIME"; ` +
 		`echo "RUNDIR=$MAV_EXACT_RUN_DIR"`
 	cmd := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "sh", "-c", script)
@@ -124,18 +158,21 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	if vals["MAVRUNTIME"] == "" {
 		t.Fatal("MAV_TARGET_RUNTIME was empty")
 	}
-	if info, err := os.Stat(vals["SET"]); err != nil || !info.IsDir() {
-		t.Fatalf("SIMPOOL_DEVICE_SET_0 %q is not a directory: %v", vals["SET"], err)
-	}
 	if info, err := os.Stat(vals["RUNDIR"]); err != nil || !info.IsDir() {
 		t.Fatalf("MAV_EXACT_RUN_DIR %q is not a directory: %v", vals["RUNDIR"], err)
 	}
-	state, found, err := simctl.State(vals["SET"], vals["UDID"])
+	// The whole point of option (b): a pooled UDID needs no --set to be
+	// usable by a plain `xcrun simctl` call — the same one MAV, axe, and
+	// idb already make.
+	entry, found, err := simctl.Find(vals["UDID"])
 	if err != nil || !found {
-		t.Fatalf("device %s not found in its own set after with: found=%v err=%v", vals["UDID"], found, err)
+		t.Fatalf("device %s not found in the default device set after with: found=%v err=%v", vals["UDID"], found, err)
 	}
-	if state != "Booted" {
-		t.Fatalf("device state = %q, want Booted (with should boot the device for its caller)", state)
+	if !pool.IsPoolName(entry.Name) {
+		t.Fatalf("device %s name %q does not look pool-owned (want prefix %q)", vals["UDID"], entry.Name, pool.NamePrefix)
+	}
+	if entry.State != "Booted" {
+		t.Fatalf("device state = %q, want Booted (with should boot the device for its caller)", entry.State)
 	}
 
 	// The slot must be free again immediately after `with` returns.
@@ -198,12 +235,14 @@ func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 	if meta.UDID == "" {
 		t.Fatal("warm-up did not leave a provisioned UDID in slot-0's meta.json")
 	}
-	udid, setDir := meta.UDID, pool.SetDirFor(slotDir)
+	udid := meta.UDID
 
 	// Launch `simpool with` running a `log stream`-shaped consumer that
 	// references the UDID in its own argv after exec — exactly how MAV's
 	// `xcrun simctl spawn <udid> log stream` looks to `pgrep -f <udid>`.
-	script := `exec xcrun simctl --set "$SIMPOOL_DEVICE_SET_0" spawn "$SIMPOOL_UDID_0" log stream`
+	// No `--set` needed: the pooled UDID lives in the default device set,
+	// the same one a bare `xcrun simctl` always talks to.
+	script := `exec xcrun simctl spawn "$SIMPOOL_UDID_0" log stream`
 	victim := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "sh", "-c", script)
 	victim.Env = env
 	if err := victim.Start(); err != nil {
@@ -211,11 +250,23 @@ func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 	}
 
 	// Wait for the orphan-to-be to actually be running and referencing the
-	// UDID before we pull the rug.
+	// UDID before we pull the rug. Matching on "spawn" as well as the UDID
+	// is deliberate: EnsureProvisioned's own (short-lived, expected)
+	// `simctl boot <udid>` call also matches a plain UDID pgrep for a
+	// second or so while the victim's `with` provisions its slot, and
+	// racing that instead of the actual `simctl spawn ... log stream`
+	// process makes this test kill the victim before its real child even
+	// starts — a false pass, not a real exercise of the scenario.
 	deadline := time.Now().Add(15 * time.Second)
 	var livePIDs []int
 	for time.Now().Before(deadline) {
-		livePIDs, _ = procs.MatchingPIDs(udid)
+		livePIDs = nil
+		matches, _ := procs.MatchingPIDs(udid)
+		for _, p := range matches {
+			if strings.Contains(procs.CommandLine(p), "spawn") {
+				livePIDs = append(livePIDs, p)
+			}
+		}
 		if len(livePIDs) > 0 {
 			break
 		}
@@ -258,7 +309,7 @@ func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 		t.Fatalf("reap should report SKIP for the slot with a live orphan, got:\n%s", reapOut)
 	}
 
-	state, found, err := simctl.State(setDir, udid)
+	state, found, err := simctl.State(udid)
 	if err != nil || !found {
 		t.Fatalf("device disappeared after reap: found=%v err=%v", found, err)
 	}

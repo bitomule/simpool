@@ -50,9 +50,9 @@ type Slot struct {
 	Meta Meta
 }
 
-// SetDir is where this slot's private `xcrun simctl --set` device set
-// lives.
-func (s *Slot) SetDir() string { return setPath(s.Dir) }
+// DeviceName is the deterministic, pool-wide-unique name of this slot's
+// simulator in the (shared, default) device set. See pool.DeviceName.
+func (s *Slot) DeviceName() string { return DeviceName(s.Device, s.OSVer, s.Number) }
 
 // LockPath is this slot's lock file — the pool's single source of truth.
 func (s *Slot) LockPath() string { return lockPath(s.Dir) }
@@ -156,10 +156,6 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			}
 		}
 
-		if err := os.MkdirAll(setPath(dir), 0o755); err != nil {
-			lock.Release()
-			return false, err
-		}
 		s := &Slot{
 			GroupDir: groupDir,
 			Dir:      dir,

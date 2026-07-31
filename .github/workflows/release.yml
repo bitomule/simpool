@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+      - name: Version
+        id: version
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+      - name: Test
+        run: go test -p 2 -parallel 2 ./...
+      - name: Build
+        run: |
+          mkdir -p dist
+          GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/simpool-darwin-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -trimpath -o dist/simpool-darwin-amd64 .
+          cd dist
+          shasum -a 256 * > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: simpool ${{ steps.version.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+      - name: Publish Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.COMMITTER_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "COMMITTER_TOKEN is required to publish bitomule/homebrew-tap" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          arm64_sha="$(awk '$2 == "simpool-darwin-arm64" { print $1 }' dist/checksums.txt)"
+          amd64_sha="$(awk '$2 == "simpool-darwin-amd64" { print $1 }' dist/checksums.txt)"
+          test -n "$arm64_sha"
+          test -n "$amd64_sha"
+          tmp="$(mktemp -d)"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/bitomule/homebrew-tap.git" "$tmp/homebrew-tap"
+          cat > "$tmp/homebrew-tap/Formula/simpool.rb" <<EOF
+          class Simpool < Formula
+            desc "iOS simulator pool broker with flock-guarded slots"
+            homepage "https://github.com/bitomule/simpool"
+            version "$version"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/bitomule/simpool/releases/download/v#{version}/simpool-darwin-arm64"
+                sha256 "$arm64_sha"
+              else
+                url "https://github.com/bitomule/simpool/releases/download/v#{version}/simpool-darwin-amd64"
+                sha256 "$amd64_sha"
+              end
+            end
+
+            def install
+              bin.install cached_download => "simpool"
+              chmod 0755, bin/"simpool"
+            end
+
+            test do
+              assert_match "simpool", shell_output("#{bin}/simpool status 2>&1", 0)
+            end
+          end
+          EOF
+          ruby -c "$tmp/homebrew-tap/Formula/simpool.rb"
+          cd "$tmp/homebrew-tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/simpool.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date for $TAG"
+            exit 0
+          fi
+          git commit -m "Update simpool to $version"
+          git push

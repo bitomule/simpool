@@ -119,6 +119,21 @@ func Descendants(pid int) []int {
 	return out
 }
 
+// PGIDAlive reports whether any process still belongs to process group pgid,
+// via kill(-pgid, 0): the kernel delivers a null signal to every member of
+// the group and reports ESRCH only if there are none left. Unlike
+// MatchingPIDs/LiveConsumers, this needs no command-line evidence at all —
+// it catches a consumer whose only distinguishing trace is an environment
+// variable (MAV_TARGET_UDID, SIMPOOL_UDID_N) rather than anything visible in
+// `ps`, which is exactly how simpool hands off a simulator (see design doc
+// §5) and therefore exactly the case a pgrep-based check cannot see.
+func PGIDAlive(pgid int) bool {
+	if pgid <= 0 {
+		return false
+	}
+	return syscall.Kill(-pgid, 0) == nil
+}
+
 // LiveConsumers returns the PIDs of live host processes that reference udid
 // on their command line and are NOT the simulator's own runtime (its
 // `launchd_sim` process and everything launchd_sim spawns inside the

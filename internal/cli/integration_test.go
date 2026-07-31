@@ -324,6 +324,73 @@ func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 	}
 }
 
+// TestIntegration_ReapRefusesCrossSlotDevice is the regression test for the
+// HIGH finding that reap checked only pool.IsPoolName(entry.Name) — the
+// SIMPOOL_ prefix — before shutting down or deleting a simulator, never that
+// the name matched the specific slot doing the reaping. A stale or corrupt
+// meta.json (which the design doc explicitly tolerates, §6) could then make
+// reap act on a *different* slot's simulator — reproduced directly during
+// review by planting a slot-1 meta.json that pointed at slot-0's live,
+// booted device: reap shut it down out from under its live holder, and
+// with --purge would have deleted it. No boot needed here: the guard is a
+// name comparison that must refuse before ever calling Shutdown/Delete, so
+// paying for a boot would only slow the test down for no extra coverage.
+func TestIntegration_ReapRefusesCrossSlotDevice(t *testing.T) {
+	requireIntegration(t)
+	bin := buildSimpool(t)
+	home := t.TempDir()
+	t.Cleanup(func() { cleanupPool(t, home) })
+
+	runtimeID, deviceTypeID, err := simctl.ResolveRuntime(testDevice, testOS)
+	if err != nil {
+		t.Fatalf("resolving runtime: %v", err)
+	}
+	name := pool.DeviceName(home, testDevice, testOS, 0)
+	udid, err := simctl.Create(name, deviceTypeID, runtimeID)
+	if err != nil {
+		t.Fatalf("creating slot-0's device: %v", err)
+	}
+	t.Cleanup(func() { _ = simctl.Delete(udid) })
+
+	// Plant a stale meta.json in slot-1 pointing at slot-0's device, idle
+	// and with the lock free so both --cold 0 and --purge would otherwise
+	// fire immediately.
+	groupDir := pool.GroupDir(home, testDevice, testOS)
+	slot1Dir := pool.SlotDir(groupDir, 1)
+	if err := os.MkdirAll(slot1Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(slot1Dir, pool.Meta{
+		Device:    testDevice,
+		OSVersion: testOS,
+		UDID:      udid,
+		LastUsed:  time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	reapCmd := exec.Command(bin, "reap", "--cold", "0", "--purge", "1")
+	reapCmd.Env = append(os.Environ(), "SIMPOOL_HOME="+home)
+	out, err := reapCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("simpool reap failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "SKIP") {
+		t.Fatalf("reap should SKIP a device whose name doesn't match this slot, got:\n%s", out)
+	}
+	if strings.Contains(string(out), "SHUT") || strings.Contains(string(out), "PURGE") {
+		t.Fatalf("reap must never shut down or purge a cross-slot device, got:\n%s", out)
+	}
+
+	entry, found, err := simctl.Find(udid)
+	if err != nil || !found {
+		t.Fatalf("slot-0's device should still exist after reap misfired on slot-1: found=%v err=%v", found, err)
+	}
+	if entry.Name != name {
+		t.Fatalf("slot-0's device was renamed/altered by reap: got %q, want %q", entry.Name, name)
+	}
+}
+
 func parseKV(t *testing.T, out string) map[string]string {
 	t.Helper()
 	vals := map[string]string{}

@@ -208,3 +208,100 @@ func TestAcquireSlots_SkipsSlotWithLiveOrphanConsumer(t *testing.T) {
 		t.Fatalf("expected a fresh slot-1 (slot-0 has a live orphan attached), got slot-%d", slots[0].Number)
 	}
 }
+
+// TestAcquireSlots_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv is the
+// regression test for the CRITICAL finding that the poisoned-slot check
+// relied entirely on `pgrep -f <udid>` (MatchingPIDs/LiveConsumers), which
+// is blind to a consumer that only ever receives the UDID by environment
+// variable (MAV_TARGET_UDID, SIMPOOL_UDID_N — exactly simpool's own
+// contract, §5) rather than anywhere in its own argv. `simpool with`
+// records that consumer's process-group id in meta.ConsumerPGID; this must
+// be enough on its own to refuse a slot whose consumer is still alive, with
+// nothing UDID-shaped in its command line at all.
+func TestAcquireSlots_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv(t *testing.T) {
+	root := t.TempDir()
+
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	slotDir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stands in for the child `simpool with` launches: its own process
+	// group leader (Setpgid, mirroring with.go), with nothing in its argv
+	// or the process table that a UDID-based pgrep could ever match.
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+
+	if err := WriteMeta(slotDir, Meta{
+		UDID:         "simpool-test-udid-not-in-any-argv",
+		ConsumerPGID: pgid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// slot-0's lock starts free (never taken), simulating: `simpool` itself
+	// was SIGKILLed (design doc §4's one accepted failure window) and the
+	// kernel released its flock, but the child it launched — recorded by
+	// pgid, not by anything pgrep-able — is still running.
+	_, err := AcquireSlots(root, "TestDevice", "1.0", 1, 1, 0)
+	if !errors.Is(err, ErrAtCapacity) {
+		t.Fatalf("acquire with poisoned slot-0 (live ConsumerPGID, no UDID anywhere in argv) at max=1: want ErrAtCapacity, got %v", err)
+	}
+}
+
+// TestAcquireSlots_FillsGapLeftByRemovedSlotDir is the regression test for
+// the HIGH finding that capacity was tracked by the highest slot number ever
+// created (`next = existing[len(existing)-1] + 1`) rather than by how many
+// slot directories are actually resident. Once reap started deleting purged
+// slot directories, a gap below the high-water mark became the normal
+// post-purge state, and the old logic refused to ever reuse it: it demanded
+// a brand-new, higher-numbered slot while comparing that number (not the
+// resident count) against --max, permanently wedging the group even with
+// spare capacity sitting empty.
+func TestAcquireSlots_FillsGapLeftByRemovedSlotDir(t *testing.T) {
+	root := t.TempDir()
+
+	slots, err := AcquireSlots(root, "TestDevice", "1.0", 2, 2, 0)
+	if err != nil {
+		t.Fatalf("initial acquire of 2 slots at max=2: %v", err)
+	}
+	for _, s := range slots {
+		if err := s.Release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	// Mirrors what reap does after purging slot-0: the directory (lock file
+	// included) is gone, leaving a gap below slot-1.
+	if err := RemoveSlotDir(groupDir, SlotDir(groupDir, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if got := ListSlotNumbers(groupDir); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("expected only slot-1 to remain resident after removing slot-0, got %v", got)
+	}
+
+	got, err := AcquireSlots(root, "TestDevice", "1.0", 2, 2, 0)
+	if err != nil {
+		t.Fatalf("acquiring 2 slots at max=2 with only 1 resident (slot-0's gap should be fillable): %v", err)
+	}
+	defer func() {
+		for _, s := range got {
+			s.Release()
+		}
+	}()
+	var nums []int
+	for _, s := range got {
+		nums = append(nums, s.Number)
+	}
+	sortInts(nums)
+	if len(nums) != 2 || nums[0] != 0 || nums[1] != 1 {
+		t.Fatalf("expected slot numbers [0 1] (slot-0's gap filled), got %v", nums)
+	}
+}

@@ -7,6 +7,8 @@
 package pool
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,9 +64,17 @@ func sanitize(s string) string {
 	return strings.Trim(s, "-")
 }
 
+// groupSep joins the sanitized device and OS parts of a GroupName. It must
+// be a character sanitize() can never produce (sanitize only ever emits
+// [A-Za-z0-9._-]), or two different (device, osVersion) pairs can collapse
+// onto the same GroupName: sanitize("iPhone 17", "Pro_26.3") and
+// sanitize("iPhone 17_Pro", "26.3") both used to end in "...17_Pro_26.3"
+// when the separator was "_", which sanitize passes through unchanged.
+const groupSep = "@"
+
 // GroupName returns the on-disk directory name for a given device+OS pair.
 func GroupName(device, osVersion string) string {
-	return sanitize(device) + "_" + sanitize(osVersion)
+	return sanitize(device) + groupSep + sanitize(osVersion)
 }
 
 // NamePrefix marks every simulator simpool owns in the (shared, default)
@@ -75,15 +85,34 @@ func GroupName(device, osVersion string) string {
 // and they must never be touched.
 const NamePrefix = "SIMPOOL_"
 
-// DeviceName returns the deterministic, pool-wide-unique name simpool
-// gives the simulator for one slot, e.g. "SIMPOOL_iPhone-17-Pro_26.3_slot-0"
-// for slot 0 of the "iPhone 17 Pro" / 26.3 group. Deterministic and unique
-// per slot (not just per group) so EnsureProvisioned can recover a slot's
-// simulator by name alone if meta.json is lost or corrupted — all slots
-// now share one device set, so a name collision between slots would be a
-// real leak, not just cosmetic.
-func DeviceName(device, osVersion string, slotNumber int) string {
-	return fmt.Sprintf("%s%s_slot-%d", NamePrefix, GroupName(device, osVersion), slotNumber)
+// RootTag returns a short, stable, filesystem- and simctl-name-safe
+// fingerprint of a pool root directory. DeviceName folds this into every
+// simulator name because the default device set (design decision "opción
+// (b)") is a single, machine-wide namespace, while a pool root is not: two
+// independent SIMPOOL_HOME roots (e.g. two test suites, or a real pool
+// alongside one under test) otherwise produce byte-identical names for
+// "their" slot-0, and the name-based recovery path in EnsureProvisioned
+// would make the second root silently adopt — and reap could then delete —
+// the first root's simulator out from under a live holder.
+func RootTag(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = root
+	}
+	sum := sha256.Sum256([]byte(abs))
+	return hex.EncodeToString(sum[:])[:8]
+}
+
+// DeviceName returns the deterministic, pool-wide-unique name simpool gives
+// the simulator for one slot of a given pool root, e.g.
+// "SIMPOOL_a1b2c3d4_iPhone-17-Pro@26.3_slot-0" for slot 0 of the
+// "iPhone 17 Pro" / 26.3 group under root. Deterministic and unique per
+// (root, group, slot) so EnsureProvisioned can recover a slot's simulator by
+// name alone if meta.json is lost or corrupted — all slots across all pool
+// roots now share one device set, so a name collision would be a real leak
+// (see RootTag), not just cosmetic.
+func DeviceName(root, device, osVersion string, slotNumber int) string {
+	return fmt.Sprintf("%s%s_%s_slot-%d", NamePrefix, RootTag(root), GroupName(device, osVersion), slotNumber)
 }
 
 // IsPoolName reports whether name looks like a simulator simpool created
@@ -155,6 +184,16 @@ func ListGroupDirs(root string) ([]string, error) {
 
 func lockPath(slotDir string) string { return filepath.Join(slotDir, "lock") }
 func metaPath(slotDir string) string { return filepath.Join(slotDir, "meta.json") }
+
+// allocLockPath is a group-wide (not per-slot) lock file that serializes
+// structural changes to a group's slot directories: creating a brand-new
+// slot (first MkdirAll+open of its lock file) and tearing one down
+// (os.RemoveAll after a purge). See RemoveSlotDir — without this, a slot's
+// lock file could be unlinked by reap in the narrow window after a second
+// process has opened it but before it has flocked it, letting that second
+// process end up "holding" a deleted, unlinked lock file while a third
+// process creates a brand-new one for the same slot number.
+func allocLockPath(groupDir string) string { return filepath.Join(groupDir, ".alloc.lock") }
 
 // LockPath and MetaPath are exported accessors for callers (cli, tests)
 // that only have a slot directory path, not a live *Slot.

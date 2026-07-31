@@ -47,15 +47,31 @@ func EnsureProvisioned(s *Slot, ownerCmd, mode string) error {
 		// meta.json is advisory and can be lost entirely (crash mid-write,
 		// disk full, a human `rm`). Before creating a new simulator, look
 		// for one already sitting in the default set under the
-		// deterministic, slot-unique name we always use — otherwise a lost
-		// meta.json leaks the previous device forever, since nothing else
-		// in simpool ever inspects device-set contents directly.
+		// deterministic, root+slot-unique name we always use — otherwise a
+		// lost meta.json leaks the previous device forever, since nothing
+		// else in simpool ever inspects device-set contents directly.
 		if existing, err := simctl.ListDevices(); err == nil {
+			var matches []simctl.DeviceEntry
 			for _, d := range existing {
 				if d.Name == name {
-					udid = d.UDID
-					break
+					matches = append(matches, d)
 				}
+			}
+			// simctl itself does not enforce unique names — verified by
+			// creating two devices with the same name directly — so this is
+			// not just theoretical. Recovering from an arbitrary one of
+			// several matches would be non-deterministic across runs (Go's
+			// map iteration order for `simctl list devices -j`'s JSON is
+			// randomized) and could silently hand two different callers two
+			// different simulators for what they each believe is the same
+			// slot. Refuse loudly instead of guessing; this should never
+			// happen given DeviceName's own uniqueness contract, so it is
+			// always worth surfacing rather than working around.
+			if len(matches) > 1 {
+				return fmt.Errorf("%d simulators are named %q in the default device set — refusing to guess which one belongs to this slot; delete the duplicates manually", len(matches), name)
+			}
+			if len(matches) == 1 {
+				udid = matches[0].UDID
 			}
 		}
 	}
@@ -72,6 +88,18 @@ func EnsureProvisioned(s *Slot, ownerCmd, mode string) error {
 		udid = newUDID
 		s.Meta.Created = time.Now()
 		s.Meta.RuntimeID = runtimeID
+	}
+
+	if s.Meta.RuntimeID == "" {
+		// udid was adopted (matched by UDID or recovered by name) rather
+		// than freshly created above, so the branch that resolves and
+		// records RuntimeID never ran. Left empty, MAV_TARGET_RUNTIME (§5)
+		// would silently and permanently export "" for this slot. Best
+		// effort: a failure here must not block handing out an otherwise
+		// perfectly usable simulator.
+		if runtimeID, _, err := simctl.ResolveRuntime(s.Device, s.OSVer); err == nil {
+			s.Meta.RuntimeID = runtimeID
+		}
 	}
 
 	if err := simctl.Boot(udid); err != nil {

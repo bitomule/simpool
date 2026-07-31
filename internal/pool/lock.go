@@ -41,6 +41,25 @@ func TryLock(path string) (*Lock, error) {
 	return &Lock{f: f, path: path}, nil
 }
 
+// lockBlocking acquires an exclusive lock on path, waiting if another
+// process currently holds it (unlike TryLock, which never blocks). Only
+// used for the group allocation lock (see allocLockPath): that lock is only
+// ever held for the duration of a single mkdir+open or RemoveAll, so
+// waiting for it is always brief, and — same as every other lock in this
+// package — the kernel releases it immediately if its holder dies for any
+// reason, including mid-syscall.
+func lockBlocking(path string) (*Lock, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &Lock{f: f, path: path}, nil
+}
+
 // Release unlocks and closes the underlying descriptor. Safe to call once.
 func (l *Lock) Release() error {
 	if l == nil || l.f == nil {

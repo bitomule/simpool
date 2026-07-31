@@ -72,17 +72,21 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// would be a serious bug elsewhere in simpool, not
 						// something to paper over here.
 						note("%s: meta.json references device %s (name %q) that is NOT pool-owned — this should never happen", label, meta.UDID, entry.Name)
-					} else if want := pool.DeviceName(meta.Device, meta.OSVersion, n); entry.Name != want {
+					} else if want := pool.DeviceName(root, meta.Device, meta.OSVersion, n); entry.Name != want {
 						note("%s: meta.json's device %s is named %q, expected %q", label, meta.UDID, entry.Name, want)
 					}
 				}
 			}
 
 			if free {
-				if meta.UDID != "" {
+				poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
+				if !poisoned && meta.UDID != "" {
 					if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
-						note("%s: lock is free but %d process(es) still reference device %s (run `simpool reap`)", label, len(live), meta.UDID)
+						poisoned = true
 					}
+				}
+				if poisoned {
+					note("%s: lock is free but its consumer is still alive (device %s) — run `simpool reap`", label, meta.UDID)
 				}
 				continue
 			}
@@ -103,7 +107,16 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 				continue // released between our check and lsof; not a real problem
 			}
 			for _, h := range holders {
-				if !procs.Alive(h) || !procs.IsSimpoolHolder(h, "with") {
+				// lsof reports every process with the lock file open, not
+				// just whichever one holds the flock (Darwin doesn't
+				// reliably distinguish the two) — a concurrent `status`/
+				// `doctor`/`reap` probe that briefly opened the same path
+				// would otherwise be misread as a stuck holder. meta.OwnerPID
+				// is the pid EnsureProvisioned recorded for whichever process
+				// actually completed provisioning while holding this lock,
+				// so requiring an exact match is the corroborating signal
+				// (mirrors reap.go's reapHeldSlot — keep both in sync).
+				if h != meta.OwnerPID || !procs.Alive(h) || !procs.IsSimpoolHolder(h, "with") {
 					continue
 				}
 				children, _ := procs.ChildPIDs(h)

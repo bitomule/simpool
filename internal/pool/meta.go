@@ -24,6 +24,15 @@ type Meta struct {
 	// child-less holder (`acquire`, which never spawns anything by design)
 	// apart from a `with` whose consumer already exited out from under it.
 	Mode string `json:"mode,omitempty"`
+	// ConsumerPGID is the process-group id of the command `simpool with`
+	// launched (which, thanks to Setpgid, always equals that command's own
+	// pid). AcquireSlots and reap use it to tell whether a free-looking
+	// slot's consumer is still alive even when that consumer never puts the
+	// simulator's UDID anywhere in its own command line — it gets the UDID
+	// by environment (MAV_TARGET_UDID, SIMPOOL_UDID_N), so a pgrep-based
+	// check alone cannot see it. Unset (0) for `acquire`, which never
+	// spawns a child.
+	ConsumerPGID int `json:"consumerPgid,omitempty"`
 }
 
 // ReadMeta loads meta.json for a slot. A missing or corrupt file yields a

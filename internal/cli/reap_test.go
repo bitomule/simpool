@@ -50,7 +50,7 @@ func TestReapSlot_RemovesDeadNeverProvisionedSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(dir, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("slot directory %s should have been removed, stat err = %v\nstdout:\n%s\nstderr:\n%s", dir, err, stdout.String(), stderr.String())
@@ -70,7 +70,7 @@ func TestReapSlot_KeepsFreshNeverProvisionedSlotDir(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(dir, 0, 1, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("fresh slot directory should survive reap, stat err = %v\nstdout:\n%s", err, stdout.String())
@@ -86,7 +86,7 @@ func TestReapSlot_PurgeDisabledKeepsDeadSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(dir, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("slot directory should survive with --purge disabled, stat err = %v", err)
@@ -102,7 +102,7 @@ func TestReapSlot_DryRunNeverDeletes(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(dir, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("--dry-run must not remove the slot directory, stat err = %v", err)

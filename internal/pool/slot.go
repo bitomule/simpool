@@ -40,6 +40,7 @@ func MaxSlotsPerGroup() int {
 // Slot is one locked (or lockable) unit of the pool: a device set plus its
 // flock and informational metadata.
 type Slot struct {
+	Root     string
 	GroupDir string
 	Dir      string
 	Number   int
@@ -52,7 +53,7 @@ type Slot struct {
 
 // DeviceName is the deterministic, pool-wide-unique name of this slot's
 // simulator in the (shared, default) device set. See pool.DeviceName.
-func (s *Slot) DeviceName() string { return DeviceName(s.Device, s.OSVer, s.Number) }
+func (s *Slot) DeviceName() string { return DeviceName(s.Root, s.Device, s.OSVer, s.Number) }
 
 // LockPath is this slot's lock file — the pool's single source of truth.
 func (s *Slot) LockPath() string { return lockPath(s.Dir) }
@@ -128,22 +129,64 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		}
 	}
 
+	// resident tracks every slot number that has (or, by the end of this
+	// call, will have) a directory under groupDir — free, busy, purged, or
+	// mid-creation, it doesn't matter: a directory existing at all is what
+	// costs a slot number against `max`. Seeded from disk once and kept in
+	// sync locally as this call creates new ones, so `max` is enforced
+	// against the group's actual footprint instead of the previous
+	// highest-numbered slot ever created (which undercounted after a purge
+	// freed up a low-numbered gap, and overcounted a group that simply
+	// hasn't used its low numbers yet).
+	existing := ListSlotNumbers(groupDir)
+	resident := make(map[int]bool, len(existing))
+	for _, n := range existing {
+		resident[n] = true
+	}
+
 	take := func(n int) (bool, error) {
 		dir := SlotDir(groupDir, n)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+
+		// The mkdir+open+flock-attempt is serialized against reap's
+		// RemoveAll of a purged slot directory via a short-lived,
+		// group-wide lock (see RemoveSlotDir): without this, a process that
+		// has opened but not yet flocked a slot's lock file could end up
+		// holding a flock on an inode reap has since unlinked, while a
+		// third process creates a brand-new lock file for the same slot
+		// number — two holders, one slot.
+		var lock *Lock
+		busy := false
+		err := withGroupAllocLock(groupDir, func() error {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return err
+			}
+			l, err := TryLock(lockPath(dir))
+			if err != nil {
+				if err == ErrBusy {
+					busy = true
+					return nil
+				}
+				return err
+			}
+			lock = l
+			return nil
+		})
+		if err != nil {
 			return false, err
 		}
-		lock, err := TryLock(lockPath(dir))
-		if err != nil {
-			if err == ErrBusy {
-				return false, nil
-			}
-			return false, err
+		if busy {
+			return false, nil
 		}
 
 		meta := ReadMeta(dir)
 		if meta.UDID != "" {
-			if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
+			poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
+			if !poisoned {
+				if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
+					poisoned = true
+				}
+			}
+			if poisoned {
 				// The previous holder died abruptly (SIGKILL to simpool
 				// itself, not its process group — design doc §4's one
 				// accepted failure window) and its consumer is still
@@ -151,12 +194,20 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 				// to a new owner would put two consumers on one simulator,
 				// exactly what simpool exists to prevent. `simpool reap`
 				// is what cleans this up; skip to the next candidate slot.
+				// ConsumerPGID is checked first because it catches a
+				// consumer whose only distinguishing trace is an
+				// environment variable (MAV_TARGET_UDID, SIMPOOL_UDID_0)
+				// rather than anything in its argv, which LiveConsumers
+				// (pgrep -f <udid>) cannot see at all; LiveConsumers remains
+				// as a second signal for slots with no recorded PGID (e.g.
+				// `acquire` mode, or meta.json predating this field).
 				lock.Release()
 				return false, nil
 			}
 		}
 
 		s := &Slot{
+			Root:     root,
 			GroupDir: groupDir,
 			Dir:      dir,
 			Number:   n,
@@ -169,7 +220,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		return true, nil
 	}
 
-	for _, n := range ListSlotNumbers(groupDir) {
+	for _, n := range existing {
 		if len(acquired) >= count {
 			break
 		}
@@ -182,11 +233,11 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	}
 
 	next := 0
-	if existing := ListSlotNumbers(groupDir); len(existing) > 0 {
-		next = existing[len(existing)-1] + 1
-	}
 	for len(acquired) < count {
-		if next >= max {
+		for resident[next] {
+			next++
+		}
+		if len(resident) >= max {
 			release()
 			return nil, ErrAtCapacity
 		}
@@ -195,6 +246,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			release()
 			return nil, err
 		}
+		resident[next] = true
 		next++
 		if !ok {
 			continue
@@ -202,4 +254,29 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	}
 
 	return acquired, nil
+}
+
+// withGroupAllocLock serializes structural mutations to a group's slot
+// directories — creating a brand-new one, or removing a purged one (see
+// RemoveSlotDir) — under a single, group-wide lock file distinct from any
+// individual slot's own lock. See allocLockPath for why this exists.
+func withGroupAllocLock(groupDir string, fn func() error) error {
+	l, err := lockBlocking(allocLockPath(groupDir))
+	if err != nil {
+		return err
+	}
+	defer l.Release()
+	return fn()
+}
+
+// RemoveSlotDir deletes a slot directory in its entirety. Callers (reap)
+// must hold that slot's own lock across this call — this only additionally
+// serializes against AcquireSlots' take() via the group allocation lock, so
+// a slot's lock file is never unlinked in the window after some other
+// process has opened it but before it has flocked it (see
+// allocLockPath/withGroupAllocLock).
+func RemoveSlotDir(groupDir, dir string) error {
+	return withGroupAllocLock(groupDir, func() error {
+		return os.RemoveAll(dir)
+	})
 }

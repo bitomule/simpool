@@ -63,6 +63,18 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	}
 	pgid := cmd.Process.Pid
 
+	// Record the child's process-group id in every acquired slot's meta.json
+	// so a free-looking slot can be told apart from one whose consumer is
+	// still alive even when that consumer never puts the simulator's UDID
+	// anywhere in its own argv — it gets it by environment (MAV_TARGET_UDID,
+	// SIMPOOL_UDID_N), which a pgrep-based check cannot see at all (design
+	// review CRITICAL finding). Best-effort: a write failure here must not
+	// abort a command that has already started.
+	for _, s := range slots {
+		s.Meta.ConsumerPGID = pgid
+		_ = s.SaveMeta()
+	}
+
 	// SIGHUP matters here specifically because the child lives in its own
 	// process group (Setpgid above): closing the terminal or ending an
 	// SSH/agent session does not reach it directly the way it would a
@@ -96,6 +108,14 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	// forgot about (a `log stream` MAV spawned and never reaped) — see
 	// design doc §4.
 	_ = procs.KillProcessGroup(pgid, syscall.SIGKILL)
+
+	// The sweep above guarantees pgid is gone, so ConsumerPGID no longer
+	// identifies a live (or even meaningful) process group; clear it before
+	// the deferred releaseAll persists LastUsed, so a slot recycled by reap
+	// while free is never second-guessed against a stale, long-dead pgid.
+	for _, s := range slots {
+		s.Meta.ConsumerPGID = 0
+	}
 
 	if waitErr == nil {
 		return 0

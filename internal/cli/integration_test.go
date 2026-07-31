@@ -42,7 +42,11 @@ func requireIntegration(t *testing.T) {
 func buildSimpool(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "simpool")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/bitomule/simpool")
+	// -buildvcs=false: `go build` otherwise shells out to `git status` to
+	// stamp VCS info, which fails with "error obtaining VCS status: exit
+	// status 128" when run from inside a git worktree (this repo's normal
+	// workflow) instead of the primary checkout.
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", bin, "github.com/bitomule/simpool")
 	cmd.Dir = repoRoot(t)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

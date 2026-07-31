@@ -36,7 +36,7 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ownerCmd := strings.Join(cmdArgs, " ")
-	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, ownerCmd)
+	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, af.max, af.wait, ownerCmd, "with")
 	if err != nil {
 		fmt.Fprintln(stderr, "simpool with:", err)
 		return 1
@@ -63,8 +63,15 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	}
 	pgid := cmd.Process.Pid
 
+	// SIGHUP matters here specifically because the child lives in its own
+	// process group (Setpgid above): closing the terminal or ending an
+	// SSH/agent session does not reach it directly the way it would a
+	// plain foreground child, so if `with` itself dies to the default
+	// SIGHUP action without running this handler, the child (and the slot)
+	// is orphaned. `acquire` already listens for it; `with` is the 95% of
+	// usage and needs it more.
 	sigCh := make(chan os.Signal, 2)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 
 	done := make(chan error, 1)
@@ -94,6 +101,12 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			// Conventional 128+signal, not ExitCode()'s -1 (which collapses
+			// to os.Exit(-1) -> 255, indistinguishable from a real exit(255)
+			// from the command itself).
+			return 128 + int(status.Signal())
+		}
 		return exitErr.ExitCode()
 	}
 	fmt.Fprintln(stderr, "simpool with:", waitErr)

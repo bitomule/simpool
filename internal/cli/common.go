@@ -17,12 +17,16 @@ type acquireFlags struct {
 	device string
 	os     string
 	count  int
+	max    int
+	wait   time.Duration
 }
 
 func parseAcquireFlags(fs *flag.FlagSet, f *acquireFlags) {
 	fs.StringVar(&f.device, "device", "", "simulator device type, e.g. \"iPhone 17 Pro\" (required)")
 	fs.StringVar(&f.os, "os", "", "simulator OS version, e.g. \"26.3\" (required)")
 	fs.IntVar(&f.count, "count", 1, "number of slots to acquire")
+	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
+	fs.DurationVar(&f.wait, "wait", 10*time.Minute, "how long to wait for a slot to free up once --max is reached (0 = fail immediately instead of waiting)")
 }
 
 func (f *acquireFlags) validate() error {
@@ -34,6 +38,9 @@ func (f *acquireFlags) validate() error {
 	}
 	if f.count < 1 {
 		return fmt.Errorf("--count must be >= 1")
+	}
+	if f.max < f.count {
+		return fmt.Errorf("--max (%d) must be >= --count (%d)", f.max, f.count)
 	}
 	return nil
 }

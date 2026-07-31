@@ -22,19 +22,22 @@ const EnvPoolHome = "SIMPOOL_HOME"
 // quota shared with Bazel's disk cache (see design doc §6).
 const forbiddenRoot = "/Volumes/BazelCache"
 
-// Root returns the pool's root directory, creating it if necessary.
+// Root returns the pool's root directory, creating it if necessary. The
+// forbidden-volume guard applies to SIMPOOL_HOME overrides too: that is the
+// only way anyone can actually put the pool under the quota-limited Bazel
+// cache volume, so it is the branch that most needs the check, not the one
+// that can be skipped.
 func Root() (string, error) {
+	root := ""
 	if override := os.Getenv(EnvPoolHome); override != "" {
-		if err := os.MkdirAll(override, 0o755); err != nil {
+		root = override
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
 			return "", err
 		}
-		return override, nil
+		root = filepath.Join(home, "Library", "Developer", "SimPool")
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	root := filepath.Join(home, "Library", "Developer", "SimPool")
 	if strings.HasPrefix(root, forbiddenRoot) {
 		return "", errPoolOnForbiddenVolume
 	}

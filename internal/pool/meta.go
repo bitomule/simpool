@@ -19,6 +19,11 @@ type Meta struct {
 	LastUsed  time.Time `json:"lastUsed"`
 	OwnerPID  int       `json:"ownerPid"`
 	OwnerCmd  string    `json:"ownerCmd,omitempty"`
+	// Mode is "with" or "acquire" — which subcommand currently holds (or
+	// last held) this slot. `reap` uses it to tell a legitimately
+	// child-less holder (`acquire`, which never spawns anything by design)
+	// apart from a `with` whose consumer already exited out from under it.
+	Mode string `json:"mode,omitempty"`
 }
 
 // ReadMeta loads meta.json for a slot. A missing or corrupt file yields a

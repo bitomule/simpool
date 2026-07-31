@@ -6,11 +6,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/bitomule/simpool/internal/pool"
 	"github.com/bitomule/simpool/internal/procs"
 	"github.com/bitomule/simpool/internal/simctl"
 )
+
+// stuckGrace mirrors reap's default --stuck-after: a `with` holder that has
+// had zero live children for less than this is presumed to be mid-startup
+// (booting a fresh simulator, resolving a runtime), not stuck.
+const stuckGrace = 3 * time.Minute
 
 // RunDoctor implements `simpool doctor`: a read-only coherence check.
 // Non-zero exit means something is wrong; it never modifies the pool
@@ -68,10 +74,17 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 
 			if free {
 				if meta.UDID != "" {
-					if live, _ := procs.MatchingPIDs(meta.UDID); len(live) > 0 {
+					if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
 						note("%s: lock is free but %d process(es) still reference device %s (run `simpool reap`)", label, len(live), meta.UDID)
 					}
 				}
+				continue
+			}
+
+			if meta.Mode != "with" {
+				// `acquire` holders are supposed to have zero children for
+				// their entire lifetime; that is not a coherence problem
+				// (mirrors reap.go's reapHeldSlot — keep both in sync).
 				continue
 			}
 
@@ -84,12 +97,12 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 				continue // released between our check and lsof; not a real problem
 			}
 			for _, h := range holders {
-				if !procs.Alive(h) {
+				if !procs.Alive(h) || !procs.IsSimpoolHolder(h, "with") {
 					continue
 				}
 				children, _ := procs.ChildPIDs(h)
-				if len(children) == 0 {
-					note("%s: held by pid %d with no live child work — stuck, run `simpool reap`", label, h)
+				if len(children) == 0 && time.Since(meta.LastUsed) >= stuckGrace {
+					note("%s: held by pid %d with no live child work for %s — stuck, run `simpool reap`", label, h, time.Since(meta.LastUsed).Round(time.Second))
 				}
 			}
 		}

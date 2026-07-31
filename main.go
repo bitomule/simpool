@@ -16,17 +16,17 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `simpool — iOS simulator pool broker
 
 Usage:
-  simpool with [--device D] [--os V] [--count N] -- <cmd>
+  simpool with [--device D] [--os V] [--count N] [--max M] [--wait D] -- <cmd>
       Acquire N slots, export the environment, run <cmd>, release on exit.
 
-  simpool acquire [--device D] [--os V] [--count N]
+  simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
       Print the environment for N slots and hold the lock until signaled.
 
   simpool status
       List every slot: lock state, holder, device boot state.
 
-  simpool reap [--cold N] [--dry-run]
-      Recycle free+cold slots; never touches a locked one.
+  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
+      Recycle free+cold slots; never touches one with a live owner.
 
   simpool doctor
       Check pool coherence. Exits non-zero if anything looks wrong.`)

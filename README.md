@@ -22,11 +22,11 @@ Go 1.25+, stdlib only, single binary, macOS only (uses BSD `flock`,
 ## Usage
 
 ```
-simpool with [--device D] [--os V] [--count N] -- <cmd>
+simpool with [--device D] [--os V] [--count N] [--max M] [--wait D] -- <cmd>
     Acquire N slots, export the environment, run <cmd>, release on exit.
     This is the normal way to use simpool — wrap your command in it.
 
-simpool acquire [--device D] [--os V] [--count N]
+simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
     Print the environment for N slots as shell `export` lines and hold
     the lock until signaled (SIGINT/SIGTERM/SIGHUP). For scripts that
     want the UDIDs up front and will manage the workload themselves.
@@ -34,14 +34,26 @@ simpool acquire [--device D] [--os V] [--count N]
 simpool status
     List every slot: lock state, holder (best-effort), device boot state.
 
-simpool reap [--cold N] [--dry-run]
+simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
     Recycle free+cold slots. Bidirectional: never shuts down a simulator
     that still has a live process attached even if its lock is free, and
-    kills stuck lock-holders that have no live work left under them.
+    kills a stuck `with` holder that has no live work left under it
+    (never an `acquire` holder — see "Capacity" below). Also prunes old
+    run directories and, with --purge, deletes long-cold simulators
+    outright to reclaim disk.
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
 ```
+
+### Capacity
+
+Each device+OS group is capped at `--max` resident slots (default 3,
+override with `SIMPOOL_MAX_SLOTS`) — booting one costs ~1.75GB (design doc
+§3), so an uncapped pool turns ordinary contention into the kind of jetsam
+this tool exists to prevent. Once a group is at capacity, `with`/`acquire`
+poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
+before giving up.
 
 ### Environment `with`/`acquire` export
 
@@ -55,12 +67,31 @@ SIMPOOL_UDID_0..N-1
 SIMPOOL_DEVICE_SET_0..N-1
 ```
 
-### Example
+### Known limitation: MAV cannot use pooled simulators yet
+
+**This example does not work today** — it's the target shape, not a
+working command:
 
 ```
 simpool with --device "iPhone 17 Pro" --os 26.3 --count 2 -- \
     mav run flow.yaml --target "$SIMPOOL_UDID_0" --target "$SIMPOOL_UDID_1" --jobs 2
 ```
+
+Every slot's simulator lives in a private `xcrun simctl --set <dir>` device
+set (design doc §3 — that's the whole isolation mechanism). MAV always
+invokes `simctl` without `--set`, so a pooled UDID is invisible to it:
+`xcrun simctl bootstatus <pooled-udid>` returns `Invalid device`. There is
+no environment-variable escape hatch either — `simctl` does not honor
+`CORESIMULATOR_DEVICE_SET_PATH` or any other env var for this, only the
+`--set` flag, and MAV has no code path that passes it (verified: MAV reads
+`MAV_TARGET_UDID` etc., never a device-set path, and none of its `simctl`
+call sites take one). Concretely, MAV needs a new `MAV_TARGET_DEVICE_SET`
+(or similar) input plumbed into `--set` on every `simctl` invocation before
+this wrapper works. That change belongs in the MAV repo (design doc §7c
+lists MAV's own concurrency fixes but not this one — it was missed there
+too). Until it lands, `simpool with -- mav ...` will either fail outright
+or fall back to whatever `simulator_udid` is hardcoded in `config.yaml`,
+silently defeating the whole point of the pool.
 
 ## Pool layout
 

@@ -1,0 +1,10 @@
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+sh_binary(
+    name = "simulator_locator",
+    srcs = ["simulator_locator.sh"],
+)
+
+exports_files(["simpool_ios_test_runner.bzl"])

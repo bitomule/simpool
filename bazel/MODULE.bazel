@@ -1,0 +1,15 @@
+"""Bazel integration for simpool: simpool_ios_test_runner.
+
+This subtree is its own bzlmod module, separate from the Go module at the
+repo root, so app repos can pull in just the Bazel rule via `git_override`
+with `strip_prefix = "bazel"` without dragging Go tooling along.
+"""
+
+module(
+    name = "simpool",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+bazel_dep(name = "rules_apple", version = "4.3.3", repo_name = "build_bazel_rules_apple")
+bazel_dep(name = "rules_shell", version = "0.6.1")

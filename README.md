@@ -84,7 +84,15 @@ MAV_TARGET_NAME=<device>
 MAV_TARGET_RUNTIME=<runtime id>
 MAV_EXACT_RUN_DIR=<dir private to this invocation>
 SIMPOOL_UDID_0..N-1
+SIMPOOL_NAME_0..N-1
 ```
+
+`SIMPOOL_NAME_N` is slot N's simulator *name* in the default device set
+(`SIMPOOL_<roottag>_<device>@<os>_slot-N`) — for a consumer that creates or
+reuses simulators by name rather than UDID, such as `rules_apple`'s
+`ios_xctestrun_runner` (`simulator_creator.py --name`, reuse-by-name on by
+default), this is what lets it be pointed at the pooled simulator instead of
+creating a brand-new `New-<device>-<os>` one every run.
 
 There is no `SIMPOOL_DEVICE_SET_N` — every pooled UDID lives in the
 default device set, so it is already usable by a plain `xcrun simctl`

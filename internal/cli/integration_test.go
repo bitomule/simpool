@@ -142,7 +142,7 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	env := append(os.Environ(), "SIMPOOL_HOME="+home)
 
 	// --- happy path: env contract, run dir, device actually booted ---
-	script := `echo "UDID=$SIMPOOL_UDID_0"; ` +
+	script := `echo "UDID=$SIMPOOL_UDID_0"; echo "NAME=$SIMPOOL_NAME_0"; ` +
 		`echo "MAVUDID=$MAV_TARGET_UDID"; echo "MAVRUNTIME=$MAV_TARGET_RUNTIME"; ` +
 		`echo "RUNDIR=$MAV_EXACT_RUN_DIR"`
 	cmd := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "sh", "-c", script)
@@ -173,6 +173,12 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	}
 	if entry.State != "Booted" {
 		t.Fatalf("device state = %q, want Booted (with should boot the device for its caller)", entry.State)
+	}
+	// SIMPOOL_NAME_0 must be the slot's actual simulator name, so a
+	// name-based consumer (rules_apple's ios_xctestrun_runner) can be
+	// pointed at this exact simulator instead of creating its own.
+	if vals["NAME"] == "" || vals["NAME"] != entry.Name {
+		t.Fatalf("SIMPOOL_NAME_0 (%q) should equal the slot's actual simulator name (%q)", vals["NAME"], entry.Name)
 	}
 
 	// The slot must be free again immediately after `with` returns.

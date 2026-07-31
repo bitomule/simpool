@@ -150,6 +150,37 @@ func buildFakeSimpool(t *testing.T) string {
 	return bin
 }
 
+// TestPGIDAlive is the unit-level regression test for the CRITICAL finding
+// that the poisoned-slot check relied entirely on argv (MatchingPIDs/
+// LiveConsumers), which cannot see a consumer that only ever receives its
+// UDID by environment variable — simpool's own handoff contract (design
+// doc §5). PGIDAlive replaces that: it inspects process-group membership
+// via kill(-pgid, 0), not command-line text, so it is correct whether or
+// not the UDID appears anywhere in argv.
+func TestPGIDAlive(t *testing.T) {
+	cmd := exec.Command("sleep", "300")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := cmd.Process.Pid
+	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+
+	waitUntil(t, 3*time.Second, func() bool { return PGIDAlive(pgid) })
+
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return !PGIDAlive(pgid) })
+
+	if PGIDAlive(0) {
+		t.Error("PGIDAlive(0) should be false")
+	}
+	if PGIDAlive(-1) {
+		t.Error("PGIDAlive(-1) should be false")
+	}
+}
+
 func TestIsSimpoolHolder(t *testing.T) {
 	bin := buildFakeSimpool(t)
 

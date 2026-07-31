@@ -14,10 +14,14 @@ and booted — instead of creating a new one. `reuse_simulator = True` makes
 the stock `clean_up_simulator_action` (simulator_cleanup.sh) skip deletion
 on the way out, so the slot's simulator survives for the next run.
 
-The test itself must run under `simpool with --device <device_type> --os
-<os_version> -- bazel test //target`, which is what exports SIMPOOL_NAME_0
-naming that exact simulator — this rule does not invoke simpool itself, it
-only consumes the environment contract simpool sets up.
+Run the test under `simpool with --device <device_type> --os <os_version>
+-- bazel test --test_env=SIMPOOL_NAME_0 //target` to get the leak-free
+path — SIMPOOL_NAME_0 doesn't cross into the sandboxed test action on its
+own, `--test_env` (or a matching `test --test_env=SIMPOOL_NAME_0` in
+.bazelrc) is what forwards it. A bare `bazel test`, with no simpool slot in
+play, still works: `:simulator_locator` falls back to the stock
+reuse-or-create-by-fixed-name behavior so nothing regresses for callers not
+yet using simpool.
 """
 
 load(

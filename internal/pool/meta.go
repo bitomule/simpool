@@ -1,0 +1,50 @@
+package pool
+
+import (
+	"encoding/json"
+	"os"
+	"time"
+)
+
+// Meta is informational bookkeeping about a slot. It is never consulted to
+// decide whether a slot is free — the lock file is the only source of truth
+// for that. Meta can be missing, stale, or corrupt without the pool
+// becoming incorrect; callers must tolerate a zero-value Meta.
+type Meta struct {
+	Device    string    `json:"device"`
+	OSVersion string    `json:"osVersion"`
+	RuntimeID string    `json:"runtimeId"`
+	UDID      string    `json:"udid"`
+	Created   time.Time `json:"created"`
+	LastUsed  time.Time `json:"lastUsed"`
+	OwnerPID  int       `json:"ownerPid"`
+	OwnerCmd  string    `json:"ownerCmd,omitempty"`
+}
+
+// ReadMeta loads meta.json for a slot. A missing or corrupt file yields a
+// zero-value Meta and no error — meta is advisory, never authoritative.
+func ReadMeta(slotDir string) Meta {
+	var m Meta
+	data, err := os.ReadFile(metaPath(slotDir))
+	if err != nil {
+		return m
+	}
+	_ = json.Unmarshal(data, &m)
+	return m
+}
+
+// WriteMeta best-effort persists meta.json via write-to-temp + rename so a
+// crash never leaves a half-written file. Errors are non-fatal to callers
+// by design (meta is informational); this function still returns them so
+// callers can log if they wish.
+func WriteMeta(slotDir string, m Meta) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := metaPath(slotDir) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, metaPath(slotDir))
+}

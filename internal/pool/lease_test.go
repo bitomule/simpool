@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+// TestDefaultLeaseTTL_IsShortEnoughToRotateASmallPool pins DefaultLeaseTTL
+// at 3 minutes so a future change doesn't silently drift back toward the
+// old 30-minute default. The number matters operationally, not just as a
+// magic constant: with --max slots per group shared by several repos, a
+// TTL this short is what lets an idle repo give its slot back quickly
+// enough for others to rotate through a small pool, while still comfortably
+// covering the gap between consecutive hot-loop calls (seconds, not
+// minutes) that it actually exists to bridge. A longer silent gap — the
+// build inside one `mav run` step — is deliberately not this TTL's problem
+// to solve; that is MAV's own target_command keepalive's job (see MAV's
+// README, "MAV in the hot loop" below).
+func TestDefaultLeaseTTL_IsShortEnoughToRotateASmallPool(t *testing.T) {
+	if DefaultLeaseTTL != 3*time.Minute {
+		t.Fatalf("DefaultLeaseTTL=%v, want 3m", DefaultLeaseTTL)
+	}
+}
+
 // TestAcquireLease_StickyByKey proves the whole point of `simpool lease`:
 // repeated calls with the same key land on the same slot and renew its
 // TTL, rather than wandering to a different slot number each time — that

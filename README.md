@@ -125,10 +125,25 @@ Every `mav tap`/`mav swipe`/`mav screenshot` MAV runs will now call this
 before each action to resolve its target. Leases are **sticky by key** —
 default `--key` is the current git repo's root (or the working directory
 if there's no repo) — so every call from the same repo lands on the same
-slot, renewing a TTL (default ~30 minutes) each time. Two worktrees of the
+slot, renewing a TTL (default ~3 minutes) each time. Two worktrees of the
 same repo get two different keys, and therefore two different simulators,
 automatically. Release explicitly with `simpool release` once a session is
 done, or just let the TTL lapse.
+
+The TTL is deliberately short: it only has to cover the gap between
+consecutive hot-loop calls, which is seconds, not the gap a long-running
+`mav run` step (a build) can leave between calls, which can be minutes. A
+short TTL is what lets an idle repo give its slot back within a few
+minutes instead of camping on it for half an hour, which matters when
+there are more repos than slots. Covering that longer gap is deliberately
+not this TTL's job: a `mav run` reinvokes `target_command` periodically on
+its own as a liveness signal for as long as it runs, independent of what
+TTL the pool manager behind it happens to use — see MAV's README
+(`target_command`) for that half of the story. A workload with a real
+long-lived process of its own to attach a lock to (`bazel test`, or `mav
+run` invoked directly rather than through `target_command`) should still
+use `with`, not `lease` — see "Environment `with`/`acquire` export" and
+the top of this section for that distinction.
 
 **A lease is not a flock, and it does not pretend to be one.** `with` and
 `acquire` are backed by a real kernel `flock()`: the instant the holding

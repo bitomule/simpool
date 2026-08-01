@@ -14,7 +14,16 @@ import (
 // DefaultLeaseTTL is how long `simpool lease` reserves a slot for its key
 // before the reservation is considered abandoned and the slot becomes
 // available again. Renewed on every call made with the same key.
-const DefaultLeaseTTL = 30 * time.Minute
+//
+// Kept short (minutes, not tens of minutes) on purpose: the lease is meant
+// to cover the gap between consecutive hot-loop calls (`mav tap`, `mav
+// swipe`, ...), which is seconds, not the gap MAV's own longer-running
+// steps (a build inside `mav run`) can leave between calls, which can be
+// minutes. That longer gap is MAV's problem to solve by reinvoking
+// target_command periodically as a liveness signal (see MAV's README), not
+// this TTL's — a short TTL here is what lets an idle repo give its slot
+// back quickly enough for others to rotate through a small pool.
+const DefaultLeaseTTL = 3 * time.Minute
 
 // Lease is a time-bounded, key-scoped reservation on a slot, for the "hot"
 // MAV use case: many short, independent `mav tap`/`mav swipe`/

@@ -305,3 +305,35 @@ func TestAcquireSlots_FillsGapLeftByRemovedSlotDir(t *testing.T) {
 		t.Fatalf("expected slot numbers [0 1] (slot-0's gap filled), got %v", nums)
 	}
 }
+
+func TestAcquirePrefersMostRecentlyUsedSlot(t *testing.T) {
+	root := t.TempDir()
+	group := GroupDir(root, "iPhone 17 Pro", "26.3")
+	if err := os.MkdirAll(group, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// slot-0 is the lower number, so a naive ascending walk would pick it.
+	// slot-1 was used more recently, so a warm-first walk must pick that one:
+	// its simulator is the one still booted with the caller's app installed.
+	for n, used := range map[int]time.Time{
+		0: time.Now().Add(-2 * time.Hour),
+		1: time.Now().Add(-1 * time.Minute),
+	} {
+		dir := SlotDir(group, n)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		WriteMeta(dir, Meta{Device: "iPhone 17 Pro", OSVersion: "26.3", UDID: "", LastUsed: used})
+	}
+
+	slots, err := AcquireSlots(root, "iPhone 17 Pro", "26.3", 1, 4, 0)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer slots[0].Release()
+
+	if slots[0].Number != 1 {
+		t.Fatalf("expected the most recently used slot (1), got slot-%d", slots[0].Number)
+	}
+}

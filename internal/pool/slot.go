@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
@@ -219,6 +220,16 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		acquired = append(acquired, s)
 		return true, nil
 	}
+
+	// Most-recently-used first. A warm slot still has its simulator booted and
+	// the consumer's app installed, so reusing it skips a ~30s boot and a
+	// reinstall; walking slot-0 upward instead would hand out a cold slot while
+	// a warm one sat idle. Busy slots are skipped by the flock either way, so
+	// this only changes which *free* slot wins.
+	sort.SliceStable(existing, func(i, j int) bool {
+		return ReadMeta(SlotDir(groupDir, existing[i])).LastUsed.
+			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
+	})
 
 	for _, n := range existing {
 		if len(acquired) >= count {

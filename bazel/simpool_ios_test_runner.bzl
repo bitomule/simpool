@@ -27,8 +27,22 @@ and the real `$HOME` for the pool from inside the test action itself (see
 the template's header for why neither can be assumed present in a
 sanitized test action's environment), and falls back to stock
 `ios_xctestrun_runner`-equivalent behavior — reuse-or-create a simulator by
-a fixed name — when `simpool` isn't installed at all, so this rule is
-always a safe drop-in whether or not the host has simpool.
+a fixed name — when `simpool` isn't installed at all, so this rule always
+builds and runs whether or not the host has simpool. That fallback is not
+equally *safe*, though: it reuses one fixed name across every concurrent
+test action missing simpool, which is exactly the collision this rule
+exists to prevent — the template warns on stderr when it takes that path.
+
+`_get_template_substitutions` and `_get_execution_environment` below, and
+most of the attributes' names/docstrings, are adapted near-verbatim from
+@build_bazel_rules_apple//apple/testing/default_runner:ios_xctestrun_runner.bzl
+(Apache License 2.0, https://github.com/bazelbuild/rules_apple). Beyond the
+substitutions this rule adds for its own template (`max_slots`, `wait`),
+the two functions are otherwise unchanged; the differences are in
+`_simpool_ios_test_runner_impl` (no `_simulator_creator` exec tool — this
+rule's own template resolves the simulator itself, see its header) and in
+the `rule()` attrs (this rule's own `_test_template` default, added
+`max_slots`/`wait`, dropped `_simulator_creator`).
 """
 
 load(
@@ -52,7 +66,9 @@ def _get_template_substitutions(
         xctrunner_entitlements_template,
         pre_action_binary,
         post_action_binary,
-        post_action_determines_exit_code):
+        post_action_determines_exit_code,
+        max_slots,
+        wait):
     substitutions = {
         "device_type": device_type,
         "os_version": os_version,
@@ -69,6 +85,8 @@ def _get_template_substitutions(
         "pre_action_binary": pre_action_binary,
         "post_action_binary": post_action_binary,
         "post_action_determines_exit_code": post_action_determines_exit_code,
+        "max_slots": max_slots,
+        "wait": wait,
     }
 
     return {"%({})s".format(key): value for key, value in substitutions.items()}
@@ -129,6 +147,8 @@ def _simpool_ios_test_runner_impl(ctx):
             pre_action_binary = pre_action_binary,
             post_action_binary = post_action_binary,
             post_action_determines_exit_code = "true" if post_action_determines_exit_code else "false",
+            max_slots = str(ctx.attr.max_slots) if ctx.attr.max_slots > 0 else "",
+            wait = ctx.attr.wait,
         ),
     )
 
@@ -212,6 +232,44 @@ Toggle simulator reuse for the fallback path (no `simpool` installed) only.
 When a `simpool` slot is in play its simulator is always reused regardless
 of this attribute — it belongs to the pool, not to this test run, so this
 rule never deletes it.
+""",
+        ),
+        "max_slots": attr.int(
+            default = 0,
+            doc = """
+Forwarded to `simpool with --max` for this rule's device+OS group. 0 (the
+default) omits `--max` entirely, so `simpool` falls back to its own
+default resolution (`SIMPOOL_MAX_SLOTS` if set in `simpool`'s own
+environment, else its built-in default of 3).
+
+This is the only way to raise the cap from a Bazel test action:
+`SIMPOOL_MAX_SLOTS` is read from `simpool`'s environment, which a
+sanitized test action cannot set via `--test_env` any more than it can set
+`$HOME` (see the template's header) — this attribute is a compile-time
+substitution instead, exactly like `device_type`/`os_version`.
+
+Mind `--local_test_jobs` (default: number of local cores) when raising
+this: with more concurrently-scheduled iOS test actions than `max_slots`,
+the excess actions block inside `simpool with`'s own `--wait` instead of
+running, and a blocked action that outlives its test's `size`/`timeout`
+(the Bazel default for `size = "medium"` is 300s; `simpool`'s own
+`--wait` default is 600s) is reported as a plain TIMEOUT — nothing in that
+report says it was pool contention rather than the test itself hanging.
+Raise `max_slots` to cover your real peak concurrency, or cap
+`--local_test_jobs` to it, rather than debugging a phantom timeout later.
+""",
+        ),
+        "wait": attr.string(
+            default = "",
+            doc = """
+Forwarded to `simpool with --wait` for this rule's device+OS group — how
+long a test action blocks for a free slot once `max_slots` is reached,
+as a Go `time.Duration` string (e.g. `"2m"`, `"0"` to fail immediately
+instead of waiting). Empty (the default) omits `--wait` entirely, so
+`simpool` uses its own default (10 minutes). See `max_slots`'s docstring
+for why this can't just be set via the environment from a test action,
+and for the interaction with `--local_test_jobs` and Bazel's own test
+timeout.
 """,
         ),
         "pre_action": attr.label(

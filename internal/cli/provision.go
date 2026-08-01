@@ -54,3 +54,23 @@ func releaseAll(slots []*pool.Slot) {
 		s.Release()
 	}
 }
+
+// removeRunDirIfEmpty deletes runDir if the consumer never wrote anything
+// into it. MAV_EXACT_RUN_DIR is opt-in — plenty of consumers, most notably
+// `simpool_ios_test_runner` (a plain `bazel test` action never references
+// it at all), never touch it — so without this, `runs/` accumulates one
+// empty directory per invocation forever; only `simpool reap
+// --prune-runs-after` (default 24h, and nothing calls it automatically)
+// ever cleared it before. A non-empty run dir is left untouched: it holds
+// evidence (screenshots, videos, HARs, logs) a failing run left behind on
+// purpose, and reap's own pruning already handles aging that out safely.
+func removeRunDirIfEmpty(runDir string) {
+	if runDir == "" {
+		return
+	}
+	entries, err := os.ReadDir(runDir)
+	if err != nil || len(entries) > 0 {
+		return
+	}
+	_ = os.Remove(runDir)
+}

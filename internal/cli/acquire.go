@@ -39,6 +39,7 @@ func RunAcquire(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer releaseAll(slots)
+	defer removeRunDirIfEmpty(runDir)
 
 	printEnvLines(stdout, envLines(slots, runDir))
 	if f, ok := stdout.(interface{ Sync() error }); ok {

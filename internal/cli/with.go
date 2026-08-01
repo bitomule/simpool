@@ -42,6 +42,7 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer releaseAll(slots)
+	defer removeRunDirIfEmpty(runDir)
 
 	env := append(os.Environ(), envLines(slots, runDir)...)
 

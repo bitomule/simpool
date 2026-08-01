@@ -4,9 +4,16 @@ A broker for iOS simulators shared by several agents on one machine. Every
 slot gets its own simulator in the **default** device set — the same one
 Xcode, the user's own simulators, MAV, axe, and idb already use with no
 special flag — identified by a unique, deterministic name
-(`SIMPOOL_<device>_<os>_slot-<n>`) rather than by a private device set.
-Arbitration is a real `flock()` held by a live process; simpool guarantees
-slots come back — no central daemon, no PID-file heuristics.
+(`SIMPOOL_<roottag>_<device>@<os>_slot-<n>`, see "Pool layout" below) rather
+than by a private device set. Arbitration is a real `flock()` held by a
+live process, not a PID-file heuristic or a central daemon: the kernel
+always releases it the instant its holder dies, with no cleanup step of
+its own required. The one gap that leaves is a SIGKILL to `simpool` itself
+(not its whole process group) — the lock frees but the child survives as
+an orphan — and that is not silently unsafe: `reap` refuses to hand a
+lock-free slot to a new consumer while its old one is still alive, so the
+slot is quarantined, not corrupted; recovering it takes an explicit
+`simpool reap` (see "Architecture" below).
 
 Isolation by private device set was the original design (see git history)
 and was dropped after implementing and running it: `Simulator.app` is
@@ -115,12 +122,20 @@ simpool with --device "iPhone 17 Pro" --os 26.3 --count 2 -- \
 
 ## Bazel: `simpool_ios_test_runner`
 
-`ios_xctestrun_runner`'s stock simulator creation (`xctestrunner`'s
-`simulator_creator.py`) makes a brand-new `New-<device>-<os>` simulator per
-test action and deletes it in a Python `finally` — one a `SIGKILL` (a Bazel
-test timeout, an interrupted CI job) skips entirely. Each one left behind
-costs 1-3GB; a handful of flaky runs in an afternoon is enough to put a
-laptop into swap.
+`ios_xctestrun_runner`'s stock simulator creation (`rules_apple`'s own
+`simulator_creator.py`) already reuses one fixed-name `BAZEL_TEST_<type>_<os>`
+simulator by default rather than creating a fresh one per action — but
+that's the actual problem, not the fix: with more than one test action
+running at once (the normal case with `--local_test_jobs` > 1, or several
+repos/agents on the same machine), they all resolve and reuse that *same*
+name, so concurrent test actions collide on one shared simulator. (A
+different rule, Google's `xctestrunner`/`ios_test_runner`, does create a
+fresh `New-<device>-<os>` simulator per action and delete it in a Python
+`finally` that a `SIGKILL` — a Bazel test timeout, an interrupted CI job —
+skips entirely, leaking 1-3GB per skipped run; that is a real bug, just not
+this rule's.) Either way, nothing in the stock behavior gives concurrent
+test actions their own simulator safely — which is what a `simpool` pool
+actually provides.
 
 `simpool_ios_test_runner` is a full replacement for `ios_xctestrun_runner`
 that resolves its simulator from a `simpool` pool instead: no per-run
@@ -140,8 +155,22 @@ for itself (a Bazel test action's environment is sanitized — no inherited
 `PATH`, no `$HOME` — so nothing here can be assumed to arrive from the
 caller), and falls back to stock `ios_xctestrun_runner`-equivalent
 behavior (reuse-or-create a fixed-name simulator) when `simpool` isn't
-installed at all, so this rule is always safe to depend on whether or not
-the host machine has it.
+installed at all, so this rule always *builds and runs* whether or not the
+host machine has `simpool`. That fallback is not equally *safe*, though:
+every concurrent test action missing `simpool` shares that one fixed-name
+simulator — exactly the collision this rule exists to prevent — and the
+runner warns on stderr when it takes that path.
+
+`max_slots`/`wait` attributes on the rule forward to `simpool with
+--max`/`--wait` for its device+OS group; both default to unset, which
+defers to `simpool`'s own defaults (3 resident slots, 10 minute wait — see
+"Capacity" above). Mind `--local_test_jobs` when raising `max_slots`: more
+concurrently-scheduled test actions than resident slots means the excess
+actions block inside `simpool with`'s wait instead of running, and a
+blocked action that outlives its test's Bazel `size`/`timeout` (300s for
+`size = "medium"`, well under `simpool`'s own 600s default wait) is
+reported as a plain TIMEOUT with nothing pointing at pool contention as the
+cause.
 
 ```bzl
 # MODULE.bazel
@@ -192,8 +221,8 @@ subsequent runs pick up the pool automatically.
 ```
 
 Slot 0's simulator, for the `iPhone 17 Pro` / `26.3` group, is named
-`SIMPOOL_iPhone-17-Pro_26.3_slot-0` in the default device set (`xcrun
-simctl list devices`) — deterministic, so `EnsureProvisioned` can recover
+`SIMPOOL_<roottag>_iPhone-17-Pro@26.3_slot-0` in the default device set
+(`xcrun simctl list devices`) — deterministic, so `EnsureProvisioned` can recover
 it by name alone if `meta.json` is ever lost, and unique across the whole
 pool (not just within a group), since every slot now shares one device set
 instead of getting its own.
@@ -218,12 +247,19 @@ This was resolved by experiment, not by reasoning about it (see design doc
   consumer as a child with `CLOEXEC` intact. Neither the child nor its
   descendants ever see the fd.
 
-**(b) won.** Its own failure mode — `SIGKILL` to `simpool` specifically
-releases the lock while the consumer survives as an orphan — is covered by
-two things: `simpool` kills the child's whole process group on every exit
-path (catches SIGTERM/SIGINT and sweeps up orphaned grandchildren for
-free), and `reap` refuses to recycle a free-looking slot that still has a
-live process attached to it.
+**(b) won.** Its own failure mode is a `SIGKILL` to `simpool` itself
+specifically (not its process group): the kernel releases the flock
+immediately, but the child — and anything it spawned — survives as an
+orphan, because the process-group sweep that normally reclaims them
+(`simpool` catches SIGTERM/SIGINT and kills the child's whole process
+group on every exit path it's alive to run) never gets to execute; a dead
+process can't run its own cleanup. This is **not** silently unsafe: `reap`
+refuses to recycle a free-looking slot that still has a live process
+attached, so the slot is quarantined rather than handed to a second
+consumer — but quarantined is not the same as recovered. Nothing on the
+`with`/Bazel path calls `reap` automatically, so an orphaned slot stays
+stuck until something (a human, a cron job, CI) runs `simpool reap`
+itself.
 
 ## Testing
 

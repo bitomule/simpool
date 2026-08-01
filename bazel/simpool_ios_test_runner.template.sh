@@ -9,15 +9,23 @@
 #      `simpool with`, so the flock it holds on a pool slot covers
 #      simulator creation, the xctestrun run, AND cleanup — not just a
 #      short pre/post hook, which is the whole reason this isn't just
-#      ios_xctestrun_runner with pre_action/post_action set.
+#      ios_xctestrun_runner with pre_action/post_action set. `--max`/`--wait`
+#      are forwarded to that `simpool with` call from the rule's own
+#      `max_slots`/`wait` attributes when set (see simpool_ios_test_runner.bzl)
+#      — otherwise Bazel test actions have no way to reach them at all, since
+#      the sanitized test-action environment this rule exists to route
+#      around is also what `SIMPOOL_MAX_SLOTS`/`--test_env` would otherwise
+#      require.
 #   2. Simulator resolution is reimplemented inline (~20 lines of `xcrun
 #      simctl`) instead of shelling out to rules_apple's own
 #      simulator_creator.py, whose CLI is not a stable contract across
-#      rules_apple releases (see the comment at its call site). It reuses
-#      by name exactly the same way: the slot simpool already booted
-#      (SIMPOOL_NAME_0) when present, its own fixed BAZEL_TEST_<type>_<os>
-#      name otherwise, and is never allowed to delete a pool slot's
-#      simulator.
+#      rules_apple releases (see the comment at its call site). It matches
+#      simulator_creator.py's own reuse-or-create-by-name behavior exactly
+#      (see the resolver's comments below), with one deliberate addition:
+#      when the name in play is a specific pool slot (SIMPOOL_NAME_0), not
+#      finding it is a hard error, never a cue to create a same-named
+#      simulator the pool doesn't know about — this rule is never allowed
+#      to create or delete a pool slot's simulator out from under it.
 # Everything else, including the fallback when simpool isn't installed
 # (this script then behaves like a stock ios_xctestrun_runner), is
 # unmodified upstream behavior.
@@ -32,13 +40,18 @@ set -euo pipefail
 # for a new checkout or a new agent). `simpool with` is the parent-holds-
 # the-lock model: it execs *this same script* as its child with CLOEXEC
 # intact on the lock fd, so nothing this script — or anything it spawns —
-# can ever inherit or fumble the lock. Only a SIGKILL to `simpool` itself
-# can lose it, and the kernel reclaims a flock on process death with no
-# cleanup step required, which is the entire property being relied on.
+# can ever inherit or fumble the lock. A SIGKILL to `simpool` itself (not
+# its whole process group) is the one case that loses it: the kernel
+# reclaims the flock immediately with no cleanup step of its own required,
+# but this script (and anything it spawned) survives that as an orphan —
+# the slot is not recovered, just quarantined, since `internal/pool/slot.go`
+# refuses to hand a slot with a live but lock-free consumer to anyone else.
+# Recovering it for reuse takes an explicit `simpool reap`; nothing on this
+# path calls that automatically.
 if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
   simpool_bin=""
   for candidate in "${SIMPOOL_BIN:-}" /opt/homebrew/bin/simpool /usr/local/bin/simpool; do
-    if [[ -n "$candidate" && -x "$candidate" ]]; then
+    if [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]]; then
       simpool_bin="$candidate"
       break
     fi
@@ -58,19 +71,48 @@ if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
     # empty "pool" rather than sharing the real one. Ignore whatever $HOME
     # is (or isn't) and always resolve the actual user's home directory
     # from the password database, the same source `~` falls back to.
-    real_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $NF}')"
+    #
+    # This intentionally does NOT shell out to `dscl . -read`: that only
+    # ever consults the *local* directory node, so it returns exit 56 for
+    # any account resolved through a network/domain directory (LDAP, a
+    # directory-bound CI runner account, ...) — silently, since stderr is
+    # discarded. Under `set -euo pipefail` that assignment's failure (and
+    # `pipefail` propagating it through the `awk` stage) kills this whole
+    # script before it prints anything: `bazel test` fails in ~0s with no
+    # message. Python's `pwd.getpwuid` calls the same libc getpwuid() that
+    # backs `id -un`/`~` expansion, which walks the *full* directory
+    # services search path instead of just the local node, so it resolves
+    # exactly the accounts `dscl` can miss. `|| true` on the substitution
+    # itself (not just the fallback `if`) is what actually saves this
+    # script if that ever fails anyway: with `set -e`, a bare `var=$(cmd)`
+    # still aborts the script on `cmd`'s failure unless the failure is
+    # absorbed inside the substitution.
+    real_home="$(/usr/bin/python3 -c 'import pwd, os; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)"
     if [[ -z "$real_home" || "$real_home" == "/var/empty" ]]; then
       real_home="/Users/$(id -un)"
     fi
 
     export _SIMPOOL_WRAPPED=1
     export HOME="$real_home"
-    exec "$simpool_bin" with --device "%(device_type)s" --os "%(os_version)s" -- "$0" "$@"
+    simpool_with_args=(--device "%(device_type)s" --os "%(os_version)s")
+    if [[ -n "%(max_slots)s" ]]; then
+      simpool_with_args+=(--max "%(max_slots)s")
+    fi
+    if [[ -n "%(wait)s" ]]; then
+      simpool_with_args+=(--wait "%(wait)s")
+    fi
+    exec "$simpool_bin" with "${simpool_with_args[@]}" -- "$0" "$@"
   fi
-  # simpool: no simpool binary found anywhere on this machine — fall
-  # through to the exact stock ios_xctestrun_runner behavior below, so
-  # this rule stays a correct (if leakier) drop-in for anyone who hasn't
-  # installed it yet.
+  # simpool: no simpool binary found anywhere on this machine (not at
+  # SIMPOOL_BIN, not at either Homebrew prefix, not on $PATH) — fall
+  # through to the stock ios_xctestrun_runner-equivalent behavior below, so
+  # this rule stays a correct drop-in for anyone who hasn't installed it
+  # yet. That fallback is *not* equally safe, though: it reuses one fixed
+  # BAZEL_TEST_<type>_<os> simulator by name, so every test action
+  # concurrently missing simpool shares that one simulator — precisely the
+  # collision this whole rule exists to prevent. Warn loudly rather than
+  # let that be discovered from a flaky/racy test run.
+  echo "warning: simpool binary not found (checked \$SIMPOOL_BIN, /opt/homebrew/bin, /usr/local/bin, \$PATH) — falling back to a single shared BAZEL_TEST_%(device_type)s_%(os_version)s simulator with no concurrency safety; install simpool (see https://github.com/bitomule/simpool#build) to fix" >&2
 fi
 
 if [[ -n "${TEST_PREMATURE_EXIT_FILE:-}" ]]; then
@@ -129,9 +171,15 @@ done
 # BAZEL_TEST_<type>_<os> default computed below) — simulator_creator.py
 # already reuses purely by device name, so this alone is what lands it on
 # the pool's already-booted, already-provisioned simulator instead of a
-# brand-new one.
+# brand-new one. simpool_slot_name tells the resolver below that this name
+# is not just a default to reuse-or-create — it is a specific slot simpool
+# already provisioned, so failing to find it is an error, never a cue to
+# create a same-named simulator the pool doesn't know about (see the
+# resolver's own comment).
+simpool_slot_name=false
 if [[ -n "${SIMPOOL_NAME_0:-}" ]]; then
   simulator_name="$SIMPOOL_NAME_0"
+  simpool_slot_name=true
 fi
 
 # Retrieve the basename of a file or folder with an extension.
@@ -502,43 +550,97 @@ import random
 import string
 import subprocess
 import sys
+import time
 
 
 def simctl(*args):
     return subprocess.check_output(["xcrun", "simctl", *args]).decode()
 
 
-def find_by_name(name):
+def find_by_name(name, runtime_id):
+    # Scoped to the requested runtime, exactly like upstream
+    # simulator_creator.py's `devices.get(runtime_identifier)` — searching
+    # every runtime bucket (as an earlier version of this resolver did)
+    # can reuse-by-name a simulator sitting under an unavailable/mismatched
+    # runtime, which upstream never does.
+    devices = json.loads(simctl("list", "devices", "-j"))["devices"]
+    for device in devices.get(runtime_id, []):
+        if device["name"] == name:
+            return device
+    return None
+
+
+def find_by_udid(udid):
     devices = json.loads(simctl("list", "devices", "-j"))["devices"]
     for group in devices.values():
         for device in group:
-            if device["name"] == name:
+            if device["udid"] == udid:
                 return device
     return None
 
 
 def boot(udid):
-    # Best-effort, mirroring the standard tolerance for "already booted".
-    # Output goes to stderr -- stdout must be only the UDID.
-    subprocess.run(
-        ["xcrun", "simctl", "bootstatus", udid, "-b"],
-        stderr=subprocess.STDOUT,
-        stdout=sys.stderr,
-    )
+    # Mirrors upstream simulator_creator.py's _boot_simulator exactly:
+    # `bootstatus` exit 149 means "already booted" (confirmed by checking
+    # the device's own state rather than trusted blindly), 164/165 are
+    # known-benign "strange but usable" states that get ignored, and
+    # anything else re-raises so a genuinely broken simulator fails here
+    # instead of surfacing later as an unrelated-looking `xcodebuild`
+    # error. The trailing `time.sleep(3)` is also load-bearing upstream
+    # behavior: `bootstatus` alone doesn't wait long enough for the
+    # simulator to be ready, and upstream added this specifically to stop
+    # tests flaking on a simulator that returns before it's truly usable.
+    try:
+        output = simctl("bootstatus", udid, "-b")
+        print(output, file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        exit_code = e.returncode
+        if exit_code == 149:
+            device = find_by_udid(udid)
+            if device and device["state"].lower() == "booted":
+                print(f"Simulator ({udid}) is already booted", file=sys.stderr)
+                exit_code = 0
+        if exit_code in (164, 165):
+            print(f"Ignoring 'simctl bootstatus' exit code {exit_code}", file=sys.stderr)
+        elif exit_code != 0:
+            print(f"'simctl bootstatus' exit code {exit_code}", file=sys.stderr)
+            raise
+    time.sleep(3)
 
 
 device_type = os.environ["SIMULATOR_DEVICE_TYPE"]
 os_version = os.environ["SIMULATOR_OS_VERSION"]
 reuse = os.environ.get("SIMULATOR_REUSE_SIMULATOR") == "true"
 name = os.environ.get("SIMULATOR_NAME") or f"BAZEL_TEST_{device_type}_{os_version}"
+# Set when SIMPOOL_NAME_0 supplied `name` above: it is a specific slot
+# simpool already provisioned, not just a default to reuse-or-create.
+is_simpool_slot = os.environ.get("SIMPOOL_SLOT_NAME") == "true"
 runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-" + os_version.replace(".", "-")
 
-device = find_by_name(name) if reuse else None
+device = find_by_name(name, runtime_id) if reuse else None
 if device is not None:
     if device["state"].lower() != "booted":
         boot(device["udid"])
     print(device["udid"])
     sys.exit(0)
+
+if is_simpool_slot:
+    # The pool slot's own simulator should already exist under this exact
+    # name -- if it doesn't, something is wrong (a stale/mismatched pool,
+    # a race, meta.json pointing somewhere real EnsureProvisioned didn't
+    # actually reach). Silently creating a new simulator that happens to
+    # collide with a deterministic pool slot name is worse than a leak: it
+    # produces a device simpool doesn't know the UDID of, sitting under a
+    # name simpool's own name-based recovery (EnsureProvisioned) treats as
+    # authoritative, and `internal/pool/provision.go` refuses to guess
+    # between duplicates -- so that slot goes dead until a human deletes
+    # one of the two simulators by hand. Fail loudly instead.
+    print(
+        f"error: no simulator named '{name}' in runtime {runtime_id} "
+        "(the simpool slot should already have provisioned it)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 if not reuse:
     # Reuse is off and there is no fixed pool name to protect -- generate
@@ -555,6 +657,7 @@ PY
     SIMULATOR_DEVICE_TYPE="%(device_type)s" \
     SIMULATOR_OS_VERSION="%(os_version)s" \
     SIMULATOR_REUSE_SIMULATOR="$reuse_simulator" \
+    SIMPOOL_SLOT_NAME="$simpool_slot_name" \
     /usr/bin/python3 "$simpool_resolver")"
 fi
 

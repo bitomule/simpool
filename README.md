@@ -29,11 +29,20 @@ other silently.
 ## Build
 
 ```
+brew install bitomule/tap/simpool
+```
+
+or from source:
+
+```
 go build -o simpool .
 ```
 
 Go 1.25+, stdlib only, single binary, macOS only (uses BSD `flock`,
-`xcrun simctl`, `pgrep`, `lsof`, `ps`).
+`xcrun simctl`, `pgrep`, `lsof`, `ps`). `simpool_ios_test_runner` (see
+Bazel, below) looks for the Homebrew install path first
+(`/opt/homebrew/bin/simpool` or `/usr/local/bin/simpool`), so that's the
+path of least resistance for CI/agent machines too.
 
 ## Usage
 
@@ -103,6 +112,71 @@ their end:
 simpool with --device "iPhone 17 Pro" --os 26.3 --count 2 -- \
     mav run flow.yaml --target "$SIMPOOL_UDID_0" --target "$SIMPOOL_UDID_1" --jobs 2
 ```
+
+## Bazel: `simpool_ios_test_runner`
+
+`ios_xctestrun_runner`'s stock simulator creation (`xctestrunner`'s
+`simulator_creator.py`) makes a brand-new `New-<device>-<os>` simulator per
+test action and deletes it in a Python `finally` — one a `SIGKILL` (a Bazel
+test timeout, an interrupted CI job) skips entirely. Each one left behind
+costs 1-3GB; a handful of flaky runs in an afternoon is enough to put a
+laptop into swap.
+
+`simpool_ios_test_runner` is a full replacement for `ios_xctestrun_runner`
+that resolves its simulator from a `simpool` pool instead: no per-run
+simulator, no leak, and — because it owns its own `test_runner_template`
+rather than hooking `pre_action`/`post_action` on top of the stock
+rule — it holds the pool slot's flock for the *entire* test action
+(simulator resolution through cleanup), not just a short setup/teardown
+step that finishes before the test itself even starts. That's what makes
+two test targets running concurrently land on two different slots instead
+of serializing behind one lock: each test action's `simpool with` call
+races the others for a free slot exactly the way two independent shell
+invocations would.
+
+Zero configuration: no `.bazelrc` `--run_under` prefix, no `--test_env`.
+Each test action resolves the `simpool` binary and the pool's real `$HOME`
+for itself (a Bazel test action's environment is sanitized — no inherited
+`PATH`, no `$HOME` — so nothing here can be assumed to arrive from the
+caller), and falls back to stock `ios_xctestrun_runner`-equivalent
+behavior (reuse-or-create a fixed-name simulator) when `simpool` isn't
+installed at all, so this rule is always safe to depend on whether or not
+the host machine has it.
+
+```bzl
+# MODULE.bazel
+bazel_dep(name = "simpool", version = "0.3.0")
+git_override(
+    module_name = "simpool",
+    remote = "https://github.com/bitomule/simpool.git",
+    commit = "<pinned commit>",
+    strip_prefix = "bazel",
+)
+```
+
+```bzl
+# BUILD.bazel
+load("@simpool//:simpool_ios_test_runner.bzl", "simpool_ios_test_runner")
+
+simpool_ios_test_runner(
+    name = "iphone_17_pro_test_runner",
+    device_type = "iPhone 17 Pro",  # must match `simpool ... --device`
+    os_version = "26.3",            # must match `simpool ... --os`
+)
+
+ios_unit_test(
+    name = "MyTests",
+    minimum_os_version = "17.0",
+    runner = ":iphone_17_pro_test_runner",
+    deps = [":MyTestsLib"],
+)
+```
+
+Then just `bazel test //:MyTests` — no wrapper, no flags. If a `simpool`
+pool for that device/OS group doesn't exist yet, the rule's fallback path
+creates and reuses a plain `BAZEL_TEST_<device>_<os>` simulator, same as
+`ios_xctestrun_runner` always has; install `simpool` (see Build, below) and
+subsequent runs pick up the pool automatically.
 
 ## Pool layout
 
@@ -214,16 +288,15 @@ these tests were last validated on.
 ## What's out of scope here
 
 This repo implements the CLI (`with`, `acquire`, `status`, `reap`,
-`doctor`) only. Not included, per the design doc's own scoping (§9's A2 vs
-B1/M1-3/R1-2, all separate workstreams):
+`doctor`) and the Bazel integration (`simpool_ios_test_runner`, under
+`bazel/`, consumed via `git_override`). Not included, per the design doc's
+own scoping (§9's B1/M1-3/R1-2, separate workstreams):
 
-- The Bazel `simpool_ios_test_runner` rule (§7b) — a thin wrapper the
-  design says should live under `bazel/` in this same repo later, consumed
-  via `git_override`.
 - The MAV-side fixes (§7c) — global run pointer, atomic/adelanted lock,
   per-run comparison, signal handling, `SaveConfig` atomicity. None of
   these couple to simpool; they make MAV correct under concurrency on
   their own.
 - App-repo changes (§7d) — removing hardcoded `simulator_udid`, dead
   scripts, `ios_test_runner` → `simpool_ios_test_runner` migration,
-  `/tmp` path fixes, `+no-cache` bundling.
+  `/tmp` path fixes, `+no-cache` bundling — done per-repo as each one
+  adopts the Bazel integration above.

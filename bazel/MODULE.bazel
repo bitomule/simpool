@@ -7,9 +7,8 @@ with `strip_prefix = "bazel"` without dragging Go tooling along.
 
 module(
     name = "simpool",
-    version = "0.1.0",
+    version = "0.3.0",
     compatibility_level = 1,
 )
 
 bazel_dep(name = "rules_apple", version = "4.3.3", repo_name = "build_bazel_rules_apple")
-bazel_dep(name = "rules_shell", version = "0.6.1")

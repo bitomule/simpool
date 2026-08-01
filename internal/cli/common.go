@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -96,4 +98,18 @@ func printEnvLines(w io.Writer, lines []string) {
 
 func nowStamp() string {
 	return time.Now().UTC().Format("20060102T150405.000000000Z")
+}
+
+// defaultLeaseKey resolves the implicit --key for `lease`/`release`: the
+// current git repo's root, or the working directory if there is none. Two
+// worktrees of the same repo resolve to two different roots — and so two
+// different keys — which is the intended behavior: each worktree's `mav`
+// invocations get their own sticky simulator.
+func defaultLeaseKey() (string, error) {
+	if out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
+		if root := strings.TrimSpace(string(out)); root != "" {
+			return root, nil
+		}
+	}
+	return os.Getwd()
 }

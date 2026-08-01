@@ -62,6 +62,17 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 				continue
 			}
 
+			if lease := pool.ReadLease(dir); lease.Alive() && !free {
+				// Should never happen: `with`/`acquire` refuse a slot with
+				// a live lease (see AcquireSlots' take()), and a lease
+				// claim refuses a slot whose flock is held (see
+				// claimSlotForLease) — both routed through the same group
+				// allocation lock. Seeing both at once means two consumers
+				// may be sharing one simulator right now, exactly what
+				// simpool exists to prevent.
+				note("%s: lock is busy while lease key %q is also alive on this slot — two consumers may be sharing one simulator, this should never happen", label, lease.Key)
+			}
+
 			if meta.UDID != "" {
 				if entry, found, err := simctl.Find(meta.UDID); err == nil {
 					if !found {

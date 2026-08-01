@@ -184,6 +184,87 @@ func TestReapSlot_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv(t *testing.T) {
 	}
 }
 
+// TestReapSlot_SkipsSlotWithActiveLease proves reap never touches a slot
+// currently reserved by a live `simpool lease` — a lease's flock is free
+// by design (see lease.go), so without this check reap would treat an
+// actively hot-looped MAV slot exactly like any other idle free slot.
+// purgeMinutes is enabled and the slot is old enough to otherwise be
+// purged, so a failure here would actually delete the (never-provisioned,
+// in this test) slot directory out from under the lease.
+func TestReapSlot_SkipsSlotWithActiveLease(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
+	if err := pool.WriteLease(dir, pool.Lease{Key: "hot-repo", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
+		t.Fatalf("reap should SKIP a slot with an active lease, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("slot directory with an active lease must survive reap, stat err = %v", err)
+	}
+	if lease := pool.ReadLease(dir); lease.Key != "hot-repo" {
+		t.Fatalf("active lease must be left untouched, got %+v", lease)
+	}
+}
+
+// TestReapSlot_RemovesExpiredLeaseFile proves reap tidies up a stale
+// lease.json once it has actually expired, so `simpool status` doesn't
+// keep reporting a reservation that no longer means anything.
+func TestReapSlot_RemovesExpiredLeaseFile(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(dir, pool.Lease{Key: "old-repo", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// purgeMinutes=0 (disabled) so the never-provisioned-slot path leaves
+	// the directory itself alone — this test is only about the lease file.
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+
+	if lease := pool.ReadLease(dir); lease.Key != "" {
+		t.Fatalf("expired lease.json should have been removed, got %+v\nstdout:\n%s", lease, stdout.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("expired lease")) {
+		t.Errorf("reap should report removing the expired lease, got:\n%s", stdout.String())
+	}
+}
+
+// TestReapSlot_DryRunNeverRemovesExpiredLease proves --dry-run reports
+// what it would clean up without actually touching lease.json.
+func TestReapSlot_DryRunNeverRemovesExpiredLease(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(dir, pool.Lease{Key: "old-repo", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, &stdout, &stderr)
+
+	if lease := pool.ReadLease(dir); lease.Key != "old-repo" {
+		t.Fatalf("--dry-run must not remove the expired lease, got %+v", lease)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("would remove expired lease")) {
+		t.Errorf("--dry-run should still report the expired lease it would clean up, got:\n%s", stdout.String())
+	}
+}
+
 // TestReapHeldSlot_NeverKillsAcquireHolder is the regression test for the
 // finding that reap's stuck-holder detection, before Meta.Mode existed,
 // could not tell a `simpool acquire` holder (which legitimately has zero

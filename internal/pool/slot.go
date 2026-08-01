@@ -179,6 +179,23 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			return false, nil
 		}
 
+		if lease := ReadLease(dir); lease.Alive() {
+			// The flock was free, but the slot is currently reserved by a
+			// `simpool lease` holder (see lease.go) — a lease deliberately
+			// never holds the flock, so `with`/`acquire` must consult
+			// lease.json explicitly or they would silently steal a slot
+			// out from under an active MAV hot-loop session. Safe to check
+			// here, outside the allocation lock: our TryLock above already
+			// succeeded inside it, so no concurrent AcquireLease call can
+			// write a *new* lease for this slot from this point on (its own
+			// claimSlotForLease would see the flock we now hold as busy) —
+			// only a lease written before we got here can possibly be
+			// found, and the allocation lock's ordering guarantees we'd see
+			// it.
+			lock.Release()
+			return false, nil
+		}
+
 		meta := ReadMeta(dir)
 		if meta.UDID != "" {
 			poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)

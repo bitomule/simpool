@@ -89,6 +89,23 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	}
 	defer lock.Release()
 
+	// A leased slot's flock is free by design (a Lease never holds it —
+	// see lease.go), so without this check reap would treat an actively
+	// hot-looped MAV slot exactly like any other idle free slot and could
+	// shut down or purge its simulator out from under the lease holder.
+	if lease := pool.ReadLease(dir); lease.Alive() {
+		fmt.Fprintf(stdout, "SKIP  %s  active lease (key=%q, expires in %s) — not touching\n", label, lease.Key, time.Until(lease.ExpiresAt).Round(time.Second))
+		return
+	} else if lease.Key != "" {
+		if dryRun {
+			fmt.Fprintf(stdout, "PRUNE %s  would remove expired lease (key=%q)\n", label, lease.Key)
+		} else if removed, err := pool.CleanupExpiredLease(groupDir, dir); err != nil {
+			fmt.Fprintf(stderr, "reap %s: removing expired lease: %v\n", label, err)
+		} else if removed {
+			fmt.Fprintf(stdout, "PRUNE %s  removed expired lease (key=%q)\n", label, lease.Key)
+		}
+	}
+
 	pruneRunDirs(dir, label, pruneRunsAfter, dryRun, stdout, stderr)
 
 	meta := pool.ReadMeta(dir)

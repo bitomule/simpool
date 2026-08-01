@@ -22,11 +22,22 @@ Usage:
   simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
       Print the environment for N slots and hold the lock until signaled.
 
+  simpool lease --device D --os V [--key K] [--ttl D] [--max M]
+      Print just a UDID and exit. For short, independent commands in a
+      hot loop (mav tap/swipe/screenshot, wired as MAV's target_command)
+      that have nothing to hold "with"'s lock across. Sticky per --key
+      (default: git repo root, else cwd): repeated calls with the same
+      key return the same slot, renewing a TTL — NOT a flock, see README.
+
+  simpool release [--key K]
+      Drop --key's lease immediately instead of waiting out its TTL.
+
   simpool status
-      List every slot: lock state, holder, device boot state.
+      List every slot: lock state, holder, lease, device boot state.
 
   simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
-      Recycle free+cold slots; never touches one with a live owner.
+      Recycle free+cold slots; never touches one with a live owner or an
+      active lease. Also clears expired lease files.
 
   simpool doctor
       Check pool coherence. Exits non-zero if anything looks wrong.`)
@@ -44,6 +55,10 @@ func main() {
 		code = cli.RunWith(rest, os.Stdout, os.Stderr)
 	case "acquire":
 		code = cli.RunAcquire(rest, os.Stdout, os.Stderr)
+	case "lease":
+		code = cli.RunLease(rest, os.Stdout, os.Stderr)
+	case "release":
+		code = cli.RunRelease(rest, os.Stdout, os.Stderr)
 	case "status":
 		code = cli.RunStatus(rest, os.Stdout, os.Stderr)
 	case "reap":

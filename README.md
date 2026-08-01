@@ -63,20 +63,30 @@ simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
     the lock until signaled (SIGINT/SIGTERM/SIGHUP). For scripts that
     want the UDIDs up front and will manage the workload themselves.
 
+simpool lease --device D --os V [--key K] [--ttl D] [--max M]
+    Print just a UDID and exit — for many short, independent commands
+    (mav tap/swipe/screenshot) that have nothing to hold `with`'s lock
+    across. Sticky per --key (default: git repo root, else cwd); NOT a
+    flock — see "MAV in the hot loop" below.
+
+simpool release [--key K]
+    Drop --key's lease immediately instead of waiting out its TTL.
+
 simpool status
-    List every slot: lock state, holder (best-effort), device boot state.
+    List every slot: lock state, holder (best-effort), lease, device
+    boot state.
 
 simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
     Recycle free+cold slots. Bidirectional: never shuts down a simulator
     that still has a live process attached even if its lock is free, and
     kills a stuck `with` holder that has no live work left under it
     (never an `acquire` holder — see "Capacity" below). Also prunes old
-    run directories and, with --purge, deletes long-cold simulators
-    outright *and their slot directory* to reclaim disk — the only
-    subcommand that actually deletes anything, by design. Never touches a
-    device whose name doesn't start with `SIMPOOL_`, no matter what
-    meta.json says: the default device set also holds the user's own
-    simulators.
+    run directories, clears expired lease files, and, with --purge,
+    deletes long-cold simulators outright *and their slot directory* to
+    reclaim disk — the only subcommand that actually deletes anything, by
+    design. Never touches a device whose name doesn't start with
+    `SIMPOOL_`, no matter what meta.json says: the default device set
+    also holds the user's own simulators.
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
@@ -89,7 +99,56 @@ override with `SIMPOOL_MAX_SLOTS`) — booting one costs ~1.75GB (design doc
 §3), so an uncapped pool turns ordinary contention into the kind of jetsam
 this tool exists to prevent. Once a group is at capacity, `with`/`acquire`
 poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
-before giving up.
+before giving up. `lease` counts against the same `--max` (a leased slot is
+just as resident as a locked one) but never polls — see below.
+
+### MAV in the hot loop
+
+`with` holds its lock for the lifetime of one process — perfect for
+`bazel test` or `mav run`, which are single long-lived commands. It is the
+wrong shape for how MAV is actually driven interactively: an agent calls
+`mav tap`, `mav swipe`, `mav screenshot`, one short independent process at
+a time, dozens of them, with nothing to hold a lock across. `acquire`
+doesn't fit either — it prints the environment but then blocks holding
+the lock until signaled, so something still has to stay alive to release
+it.
+
+`simpool lease` is the third shape, built for exactly this. It prints one
+line — the slot's UDID — and exits immediately. Point MAV's
+`target_command` (`.mav/config.yaml`, MAV 0.9.1+) at it:
+
+```yaml
+target_command: simpool lease --device "iPhone 17 Pro" --os 26.3
+```
+
+Every `mav tap`/`mav swipe`/`mav screenshot` MAV runs will now call this
+before each action to resolve its target. Leases are **sticky by key** —
+default `--key` is the current git repo's root (or the working directory
+if there's no repo) — so every call from the same repo lands on the same
+slot, renewing a TTL (default ~30 minutes) each time. Two worktrees of the
+same repo get two different keys, and therefore two different simulators,
+automatically. Release explicitly with `simpool release` once a session is
+done, or just let the TTL lapse.
+
+**A lease is not a flock, and it does not pretend to be one.** `with` and
+`acquire` are backed by a real kernel `flock()`: the instant the holding
+process dies, for any reason including SIGKILL, the lock is gone — no
+cleanup step required. A lease has no equivalent. It is a plain
+timestamped reservation file (`lease.json`) that expires by wall-clock
+time; if the agent session holding it vanishes, the slot simply stays
+reserved (and unusable by anyone else) until the TTL runs out, however
+that compares to how quickly the session actually finished. That is a
+real, accepted weakness in exchange for fitting a workload that has no
+long-lived process to attach a lock to at all — accept it consciously, and
+call `simpool release` when a session ends if you want the slot back
+sooner than the TTL.
+
+The two mechanisms are mutually exclusive over the *same* slot: `with`/
+`acquire` refuse a slot with a live lease even though the lease never
+holds the flock, and `lease` refuses a slot whose flock is currently held,
+even though holding a lease doesn't require one. Both paths funnel through
+the same allocation lock that already arbitrates slot creation, so a
+`with` and a `lease` racing for the same slot can never both win it.
 
 ### Environment `with`/`acquire` export
 
@@ -215,6 +274,9 @@ subsequent runs pick up the pool automatically.
     slot-0/
       lock            <- flock() exclusive. The only thing that arbitrates.
       meta.json        <- udid, created, last used. Informative, never authoritative.
+      lease.json       <- present only while `simpool lease` reserves this
+                           slot: {key, expiresAt}. Advisory + time-bounded,
+                           not flock-backed — see "MAV in the hot loop".
       runs/            <- one dir per invocation (MAV_EXACT_RUN_DIR)
     slot-1/
     ...
@@ -228,7 +290,10 @@ pool (not just within a group), since every slot now shares one device set
 instead of getting its own.
 
 The lock file is the single source of truth. `meta.json` can be lost,
-corrupted, or stale without the pool becoming incorrect.
+corrupted, or stale without the pool becoming incorrect. `lease.json` sits
+one level further down the trust chain still: an *absent* lease never
+blocks anything, but a *live* one is honored by `with`/`acquire`/`reap`
+exactly like a real reservation, right up until it expires.
 
 Override the pool root with `SIMPOOL_HOME` (used by the test suite to
 avoid touching the real pool).
@@ -294,6 +359,21 @@ releases the lock on SIGKILL with no cleanup step":
   (`--purge`'s deletion of an abandoned, never-provisioned slot) purely
   against the filesystem — no simulators needed since that path never
   touches `simctl`.
+- `internal/pool/lease_test.go` covers `lease`'s own contract — sticky by
+  key, two keys never share a slot, an expired lease is reusable, `--max`
+  is a real cap and fails immediately (no polling) — and, symmetrically,
+  that `with`/`acquire` refuse a leased slot and `lease` refuses a
+  flock-held one. `TestAcquireLease_ConcurrentDifferentKeysNeverCollide`
+  races several goroutines' `AcquireLease` calls with distinct keys
+  against one group and asserts no two land on the same slot; real
+  concurrency, not a simulation, since BSD `flock()` (what the shared
+  allocation lock is built on) is scoped to the open file description, so
+  goroutines racing in one process exercise the same kernel exclusion
+  separate `simpool` processes would. `internal/cli/reap_test.go` and
+  `doctor_test.go` cover the CLI-facing half: reap skips an actively
+  leased slot and cleans up an expired one, and doctor flags the one
+  invariant that must never hold — a slot with both a busy flock and a
+  live lease at once.
 
 ```
 SIMPOOL_RUN_INTEGRATION=1 go test ./internal/cli/... -run Integration -v

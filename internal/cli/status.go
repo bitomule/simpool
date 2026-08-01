@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/bitomule/simpool/internal/pool"
 	"github.com/bitomule/simpool/internal/procs"
@@ -40,7 +41,7 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "GROUP\tSLOT\tLOCK\tHELD BY\tDEVICE STATE\tUDID")
+	fmt.Fprintln(tw, "GROUP\tSLOT\tLOCK\tHELD BY\tLEASE\tDEVICE STATE\tUDID")
 	for _, groupDir := range groups {
 		group := filepath.Base(groupDir)
 		for _, n := range pool.ListSlotNumbers(groupDir) {
@@ -74,7 +75,16 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 
-			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\n", group, n, lockCol, heldBy, deviceState, meta.UDID)
+			leaseCol := "-"
+			if lease := pool.ReadLease(dir); lease.Key != "" {
+				if lease.Alive() {
+					leaseCol = fmt.Sprintf("%s (expires in %s)", lease.Key, time.Until(lease.ExpiresAt).Round(time.Second))
+				} else {
+					leaseCol = fmt.Sprintf("%s (expired)", lease.Key)
+				}
+			}
+
+			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\n", group, n, lockCol, heldBy, leaseCol, deviceState, meta.UDID)
 		}
 	}
 	tw.Flush()

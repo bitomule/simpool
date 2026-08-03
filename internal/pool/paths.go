@@ -112,7 +112,23 @@ func RootTag(root string) string {
 // roots now share one device set, so a name collision would be a real leak
 // (see RootTag), not just cosmetic.
 func DeviceName(root, device, osVersion string, slotNumber int) string {
-	return fmt.Sprintf("%s%s_%s_slot-%d", NamePrefix, RootTag(root), GroupName(device, osVersion), slotNumber)
+	return DeviceNameForGroup(root, GroupName(device, osVersion), slotNumber)
+}
+
+// DeviceNameForGroup is DeviceName for callers that know a slot only by
+// where it lives on disk — its group directory name — rather than by the
+// device/OS a caller asked for.
+//
+// Use this, not DeviceName, whenever the name is being computed to *check*
+// a device's identity against meta.json. Deriving the expected name from
+// meta.Device/meta.OSVersion makes the guard self-referential: it compares
+// what meta claims against what meta claims, so it catches an incoherent
+// meta.json but never a coherent one that simply points at another group's
+// live simulator. The directory a slot sits in is the authority on which
+// group it belongs to; meta.json is explicitly allowed to be stale or
+// corrupt (see ReadMeta) and so can never be its own witness.
+func DeviceNameForGroup(root, groupName string, slotNumber int) string {
+	return fmt.Sprintf("%s%s_%s_slot-%d", NamePrefix, RootTag(root), groupName, slotNumber)
 }
 
 // IsPoolName reports whether name looks like a simulator simpool created

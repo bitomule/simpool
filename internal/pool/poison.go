@@ -156,12 +156,15 @@ const recoveryPostKillWait = 50 * time.Millisecond
 // slot's simulator plus the user's own, so only an exact name match proves
 // this UDID is actually this slot's, not merely *a* pool-owned device that
 // happens to still exist.
-func deviceBelongsToSlot(root, udid, device, osVersion string, n int) bool {
+// groupName must come from the slot's own directory, never from meta —
+// see DeviceNameForGroup for why deriving it from meta makes this guard
+// self-referential and blind to a coherent-but-wrong meta.json.
+func deviceBelongsToSlot(root, udid, groupName string, n int) bool {
 	entry, found, err := simctl.Find(udid)
 	if err != nil || !found {
 		return false
 	}
-	return entry.Name == DeviceName(root, device, osVersion, n)
+	return entry.Name == DeviceNameForGroup(root, groupName, n)
 }
 
 // AttemptRecovery tries to reclaim dir's slot from a poisoned prior
@@ -203,7 +206,7 @@ func deviceBelongsToSlot(root, udid, device, osVersion string, n int) bool {
 // begin with. Returns false to mean "leave this slot exactly as it was":
 // the caller must fall back to its existing quarantine behavior (refuse to
 // hand it out, or leave it alone).
-func AttemptRecovery(root, dir string, n int, device, osVersion string, meta *Meta, poison Poison) bool {
+func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, poison Poison) bool {
 	if meta.Mode != "with" {
 		// Only a `with`-launched process group is something simpool itself
 		// spawned (Setpgid) and can therefore safely kill. `acquire` never
@@ -241,7 +244,7 @@ func AttemptRecovery(root, dir string, n int, device, osVersion string, meta *Me
 		return false
 	}
 
-	if meta.UDID != "" && deviceBelongsToSlot(root, meta.UDID, device, osVersion, n) {
+	if meta.UDID != "" && deviceBelongsToSlot(root, meta.UDID, groupName, n) {
 		// Best-effort, and deliberately asynchronous (not waited on here):
 		// EnsureProvisioned boots a fresh device for the next holder
 		// regardless of exactly what state this one is in when handed

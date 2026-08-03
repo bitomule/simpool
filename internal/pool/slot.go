@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"time"
-
-	"github.com/bitomule/simpool/internal/simctl"
 )
 
 // DefaultMaxSlotsPerGroup caps how many simulators of the same device+OS
@@ -188,7 +186,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			// leader process (see AttemptRecovery); never based on
 			// LiveConsumers alone, and never when the liveness check itself
 			// failed to complete (PoisonedByCheckFailure).
-			if !AttemptRecovery(root, dir, n, device, osVersion, &meta, poison) {
+			if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, poison) {
 				// Couldn't verify identity (or the kill didn't stick, or
 				// the check itself failed) — quarantine exactly as before
 				// this feature existed and skip to the next candidate slot.
@@ -254,18 +252,6 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		}
 	}
 
-	// The caller has already paid for walking this group's slot directories
-	// above (the most-recently-used sort, the poison check on each candidate
-	// it actually tried) — sweeping the rest for idle, genuinely unattached
-	// simulators rides along on that same arrival for free. See
-	// sweepIdleSiblings for the exact safety conditions; never applied to
-	// the slot(s) this call just claimed for itself.
-	claimed := make(map[int]bool, len(acquired))
-	for _, s := range acquired {
-		claimed[s.Number] = true
-	}
-	sweepIdleSiblings(root, groupDir, device, osVersion, claimed)
-
 	return acquired, nil
 }
 
@@ -326,113 +312,6 @@ func claimSlotLock(groupDir, dir string) (*Lock, error) {
 		return nil, nil
 	}
 	return lock, nil
-}
-
-// IdleShutdownThreshold is how long a slot that is already completely
-// unattached (free flock, no live lease, not poisoned) must have sat idle
-// before sweepIdleSiblings shuts its simulator down as a side effect of a
-// sibling's acquisition. The safety of shutting it down at all does not
-// depend on this number: a slot in that exact state is, by definition, not
-// in use by anything simpool has any way to check — the threshold exists
-// purely to avoid thrashing a slot that was released moments ago and might
-// be reacquired again immediately (a batch of short-lived `with` calls in
-// quick succession, for instance), not as a safety margin.
-const IdleShutdownThreshold = 5 * time.Minute
-
-// sweepIdleSiblings shuts down every OTHER slot's simulator in groupDir
-// that is genuinely idle and unattached — never a slot number present in
-// claimed (the caller's own, just-acquired slots). This is deliberately
-// wired into AcquireSlots (`with`/`acquire`), not AcquireLease: `lease` is
-// MAV's hot loop (`mav tap`/`mav swipe`/`mav screenshot`, dozens of calls
-// per session with no long-lived process to ride along on), and adding
-// even this now-cheap a scan to every single one of those calls is exactly
-// the kind of hot-path cost an earlier, reverted version of automatic
-// simulator shutdown got wrong (see README) — `with`/`acquire` are the
-// once-per-job, already-group-scanning callers this rides along on for
-// free instead.
-//
-// Each candidate slot's own flock is taken (via claimSlotLock, same lock
-// ordering as take() itself — allocation lock then the slot's own flock,
-// never the other way around) before anything about it is evaluated, and
-// held across the whole eligibility check and the shutdown call itself —
-// so a slot that becomes busy, leased, or poisoned in the window between
-// AcquireSlots' own directory listing and this sweep is simply skipped,
-// never raced. Best-effort throughout: every error here is swallowed,
-// since a failed shutdown attempt must never abort or slow down the
-// acquisition it is riding along with.
-func sweepIdleSiblings(root, groupDir, device, osVersion string, claimed map[int]bool) {
-	for _, n := range ListSlotNumbers(groupDir) {
-		if claimed[n] {
-			continue
-		}
-		dir := SlotDir(groupDir, n)
-		lock, err := claimSlotLock(groupDir, dir)
-		if err != nil || lock == nil {
-			// Busy, or the check itself failed — leave it alone either way;
-			// this is a best-effort tidy-up riding along on someone else's
-			// acquisition, never something worth erroring the caller over.
-			continue
-		}
-		shutdownIfIdleAndUnattached(root, dir, n, device, osVersion)
-		lock.Release()
-	}
-}
-
-// shutdownIfIdleAndUnattached shuts down dir's simulator if — and only
-// if — every one of these holds, all evaluated while the caller already
-// holds this exact slot's own flock (see sweepIdleSiblings):
-//
-//   - no live lease (a lease deliberately never holds the flock, so this is
-//     the one condition claimSlotLock's TryLock success alone can't rule
-//     out — MAV's target_command renews a live lease every ~60s while a
-//     `mav run` step is alive, which is exactly what makes an *expired*
-//     lease here trustworthy evidence of "nobody's using this" rather than
-//     "someone is mid-build and just hasn't called back yet")
-//   - not poisoned — PoisonedByCheckFailure included: "couldn't verify"
-//     must never be read as "confirmed free" here any more than it is
-//     anywhere else in this package. A poisoned slot is AttemptRecovery's
-//     job (its own kill-then-maybe-shut-down sequence elsewhere), never
-//     this function's.
-//   - idle past IdleShutdownThreshold
-//   - the UDID's actual device-set entry both exists and is named exactly
-//     what this slot (root, device, osVersion, n) is supposed to own — see
-//     deviceBelongsToSlot in poison.go, the same guard
-//     AttemptRecovery's own Shutdown call now requires, so a stale or
-//     corrupt meta.json can never make this sweep shut down some other
-//     slot's (or a developer's own) simulator
-//   - actually booted (shutting down an already-shut-down device is a
-//     harmless no-op either way, but there is nothing to gain by asking)
-func shutdownIfIdleAndUnattached(root, dir string, n int, device, osVersion string) {
-	if lease := ReadLease(dir); lease.Alive() {
-		return
-	}
-	meta := ReadMeta(dir)
-	if poison := CheckPoison(meta); poison.Poisoned() {
-		return
-	}
-	if meta.UDID == "" || meta.LastUsed.IsZero() {
-		return
-	}
-	if time.Since(meta.LastUsed) < IdleShutdownThreshold {
-		return
-	}
-	// One simctl.Find covers both the identity guard (deviceBelongsToSlot's
-	// own check, inlined here to avoid a second `simctl list devices` round
-	// trip for the State check right after it) and whether there is
-	// anything booted worth shutting down at all.
-	entry, found, err := simctl.Find(meta.UDID)
-	if err != nil || !found {
-		return
-	}
-	if entry.Name != DeviceName(root, device, osVersion, n) {
-		// Not this slot's device — see deviceBelongsToSlot's doc comment in
-		// poison.go for why meta.UDID alone is never enough.
-		return
-	}
-	if entry.State != "Booted" {
-		return
-	}
-	_ = simctl.Shutdown(meta.UDID)
 }
 
 // RemoveSlotDir deletes a slot directory in its entirety. Callers (reap)

@@ -120,7 +120,7 @@ func TestAttemptRecovery_SuccessfulReclaim(t *testing.T) {
 		t.Fatalf("expected PoisonedByConsumerPGID, got %v", poison.Reason)
 	}
 
-	if !AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+	if !AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery should have succeeded with a correct fingerprint")
 	}
 	if meta.ConsumerPGID != 0 || meta.ConsumerStartedAt != "" {
@@ -158,7 +158,7 @@ func TestAttemptRecovery_RefusesOnRecycledPidFingerprint(t *testing.T) {
 		t.Fatal("test setup broken: expected poisoned")
 	}
 
-	if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must refuse when the recorded fingerprint doesn't match — the pid may have been recycled")
 	}
 	if syscall.Kill(pgid, 0) != nil {
@@ -187,7 +187,7 @@ func TestAttemptRecovery_RefusesWhenNoFingerprintRecorded(t *testing.T) {
 	if !poison.Poisoned() {
 		t.Fatal("test setup broken: expected poisoned")
 	}
-	if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must refuse when no fingerprint was ever recorded")
 	}
 	if syscall.Kill(pgid, 0) != nil {
@@ -256,7 +256,7 @@ exit 0
 		t.Fatalf("expected PoisonedByConsumerPGID (group still alive via grandchild), got %v", poison.Reason)
 	}
 
-	if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must refuse to act when the recorded leader has already exited, even though its group survives — this is the documented scope limit, not a bug to route around")
 	}
 	if !procs.PGIDAlive(pgid) {
@@ -294,7 +294,7 @@ func TestAttemptRecovery_NeverKillsOnLiveConsumersSignal(t *testing.T) {
 			t.Fatalf("mode=%q: expected PoisonedByLiveConsumers, got %v", mode, poison.Reason)
 		}
 
-		if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+		if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 			t.Fatalf("mode=%q: AttemptRecovery must never act on a LiveConsumers-only signal", mode)
 		}
 	}
@@ -324,7 +324,7 @@ func TestAttemptRecovery_NeverActsOnCheckFailure(t *testing.T) {
 	// CheckPoison — PoisonedByConsumerPGID would otherwise win first.
 	poison := Poison{Reason: PoisonedByCheckFailure}
 
-	if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must never act when the poison determination itself failed")
 	}
 	if syscall.Kill(pgid, 0) != nil {
@@ -354,7 +354,7 @@ func TestAttemptRecovery_RefusesNonWithMode(t *testing.T) {
 		if poison.Reason != PoisonedByConsumerPGID {
 			t.Fatalf("mode=%q: expected PoisonedByConsumerPGID, got %v", mode, poison.Reason)
 		}
-		if AttemptRecovery(testRoot, dir, testSlotN, testSlotDev, testSlotOSVer, &meta, poison) {
+		if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 			t.Fatalf("mode=%q: AttemptRecovery must refuse a non-with mode even with a verified ConsumerPGID", mode)
 		}
 	}

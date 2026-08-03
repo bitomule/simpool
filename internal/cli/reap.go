@@ -133,7 +133,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery\n", label, meta.UDID, poison)
 			return
 		}
-		if pool.AttemptRecovery(root, dir, n, meta.Device, meta.OSVersion, &meta, poison) {
+		if pool.AttemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison) {
 			// Only ever true for a verified `with`-spawned orphan (see
 			// AttemptRecovery) — never for a LiveConsumers-only signal,
 			// which for a leased slot is the healthy case, not an orphan,
@@ -182,7 +182,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		fmt.Fprintf(stdout, "IDLE  %s  free, meta references missing device %s\n", label, meta.UDID)
 		return
 	}
-	if want := pool.DeviceName(root, meta.Device, meta.OSVersion, n); entry.Name != want {
+	if want := pool.DeviceNameForGroup(root, filepath.Base(groupDir), n); entry.Name != want {
 		// meta.json points at a real, pool-owned-or-not device that exists,
 		// but isn't the one this exact slot is supposed to own — this
 		// should never happen (see EnsureProvisioned's exact-name check),

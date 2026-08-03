@@ -233,7 +233,7 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 
 	meta := ReadMeta(dir)
 	if poison := CheckPoison(meta); poison.Poisoned() {
-		if !AttemptRecovery(root, dir, n, device, osVersion, &meta, poison) {
+		if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, poison) {
 			return false, nil
 		}
 	}

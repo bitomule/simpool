@@ -11,10 +11,12 @@ package simctl
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Runtime describes one entry from `simctl list runtimes -j`.
@@ -101,12 +103,69 @@ func Create(name, deviceTypeID, runtimeID string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Boot starts udid. "Already booted" is not an error.
+// Boot starts udid and returns as soon as the boot has been requested.
+// "Already booted" is not an error. Deliberately does NOT wait for the
+// device to finish booting — see BootAndWait for a caller that needs udid
+// provably ready before it hands the device to someone else. Kept only for
+// callers (tests standing up a device outside a slot) that just need
+// *a* boot underway and manage their own waiting.
 func Boot(udid string) error {
 	_, err := run("boot", udid)
 	if err != nil && !strings.Contains(err.Error(), "Unable to boot device in current state: Booted") {
 		return err
 	}
+	return nil
+}
+
+// BootSettleMargin is slept after `xcrun simctl bootstatus -b` itself
+// reports a simulator has finished booting. bootstatus's own "done" signal
+// is not sufficient by itself: rules_apple hits the exact same gap
+// independently (bazelbuild/rules_apple,
+// apple/testing/default_runner/simulator_creator.py's _boot_simulator runs
+// the identical `bootstatus <udid> -b` call and then still does
+// `time.sleep(3)`, commented "Even bootstatus doesn't wait long enough and
+// tests can still fail because the simulator isn't ready"). Adopted
+// verbatim rather than re-derived from scratch: it's the same underlying
+// symptom — springboard/backboardd answering simctl's own status query
+// before the device is actually ready for UI automation — observed by a
+// wholly independent, widely-used consumer of the same simctl API on the
+// same platform.
+const BootSettleMargin = 3 * time.Second
+
+// BootAndWait boots udid if it isn't already booted and blocks until
+// `xcrun simctl bootstatus -b` reports it has finished, plus
+// BootSettleMargin. Unlike Boot, a nil return here means udid is safe to
+// hand to a caller that will immediately try to talk to it (axe, an
+// install) — that is the whole point of this function existing instead of
+// Boot: Boot only fires the boot and returns immediately, which is exactly
+// the gap that let a still-booting simulator's UDID reach a caller that
+// then failed to reach it.
+//
+// timeout bounds the wait: a wedged simulator produces a clear, actionable
+// error instead of hanging the caller indefinitely, and a timeout is never
+// mistaken for success.
+func BootAndWait(udid string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "xcrun", "simctl", "bootstatus", udid, "-b")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("simulator %s did not finish booting within %s (xcrun simctl bootstatus -b timed out) — it may be wedged; try `xcrun simctl shutdown %s`, or run `xcrun simctl diagnose` if this keeps happening", udid, timeout, udid)
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		return fmt.Errorf("xcrun simctl bootstatus %s -b: %w: %s", udid, err, msg)
+	}
+
+	time.Sleep(BootSettleMargin)
 	return nil
 }
 

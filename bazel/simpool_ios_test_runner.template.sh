@@ -638,6 +638,15 @@ runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-" + os_version.replace(".",
 
 device = find_by_name(name, runtime_id) if reuse else None
 if device is not None:
+    # For a simpool slot (is_simpool_slot), this `!= "booted"` branch should
+    # be unreachable by the time we get here: the outer `simpool with` that
+    # re-exec'd this whole script already called EnsureProvisioned, which
+    # blocks on `xcrun simctl bootstatus -b` (plus the same settle margin
+    # `boot()` below applies) before ever handing the slot over — see
+    # internal/pool/provision.go. Kept anyway as defense-in-depth and as the
+    # actual boot path for the non-simpool, reuse-by-name fallback (when
+    # `simpool` isn't installed at all, see the file header), where nothing
+    # upstream of this script has booted anything yet.
     if device["state"].lower() != "booted":
         boot(device["udid"])
     print(device["udid"])

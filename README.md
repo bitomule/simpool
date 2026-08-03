@@ -122,6 +122,34 @@ simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
 ```
 
+### Provisioning: a UDID is only handed out once it's usable
+
+Every path that hands out a slot (`with`, `acquire`, `lease`) routes through
+the same provisioning step before returning: it makes sure the slot's
+simulator exists, then blocks until `xcrun simctl bootstatus <udid> -b`
+reports the device finished booting, plus a fixed 3s settle margin —
+bootstatus's own "done" signal isn't quite enough by itself (rules_apple's
+`simulator_creator.py`, the runner Bazel's own `apple_test` rules use, hits
+the identical gap independently and works around it the same way). A
+simulator that's slow to start makes the caller **wait**, it never fails
+and it never hands back a UDID for a device that isn't actually ready yet —
+this used to be a real, reproduced bug (`simpool lease` returning a UDID
+whose simulator was still mid-boot, so the very next command against it
+failed).
+
+That wait is bounded: a device that never finishes booting fails with a
+clear, actionable error instead of hanging forever (default 3 minutes,
+override with `SIMPOOL_BOOT_TIMEOUT`, e.g. `SIMPOOL_BOOT_TIMEOUT=5m`). It's
+also free when it can be: a slot whose simulator is already booted (the
+common case for `lease` in a hot loop, or `with`/`acquire` reusing a warm
+slot) skips the wait entirely instead of re-confirming a device that's
+already known-ready.
+
+This never holds the pool's group-wide allocation lock while it waits —
+only the one slot being provisioned is affected, so a slow cold boot for
+one slot never blocks acquisition attempts for any other slot, in this
+group or any other.
+
 ### Capacity
 
 Each device+OS group is capped at `--max` resident slots (default 3,

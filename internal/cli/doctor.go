@@ -90,15 +90,14 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 			}
 
 			if free {
-				if poison := pool.CheckPoison(meta); poison.Poisoned() {
-					// Not necessarily stuck forever: the next acquisition
-					// (with/acquire/lease) or `simpool reap` will reclaim
-					// this automatically if the old consumer's identity can
-					// still be verified (see pool.AttemptRecovery) — but
-					// that isn't guaranteed (an unverifiable fingerprint, or
-					// a kill that doesn't stick, leaves it quarantined), so
-					// this is still worth flagging either way.
-					note("%s: lock is free but its consumer is still alive (device %s, %s) — will be reclaimed automatically on the next acquisition or `simpool reap` if its identity can still be verified", label, meta.UDID, poison)
+				poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
+				if !poisoned && meta.UDID != "" {
+					if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
+						poisoned = true
+					}
+				}
+				if poisoned {
+					note("%s: lock is free but its consumer is still alive (device %s) — run `simpool reap`", label, meta.UDID)
 				}
 				continue
 			}

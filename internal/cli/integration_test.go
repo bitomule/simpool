@@ -212,20 +212,14 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	}
 }
 
-// TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled reproduces
-// the specific failure window the design accepts as the price of the
+// TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled reproduces the
+// specific failure window the design accepts as the price of the
 // parent-holds-the-lock architecture (§4): SIGKILL to `simpool` itself
-// (not its child) releases the flock immediately while the consumer (here
-// standing in for MAV's `log stream`) keeps running.
-//
-// The contract changed from "reap only refuses to touch it" to "reap
-// recovers it": `simpool with` now fingerprints its child's process start
-// time and the machine's boot time right after launching it (see with.go),
-// so a later `reap` (or the next acquisition) can prove the still-live
-// process under the recorded pgid is genuinely the one it launched — not
-// some unrelated process that has since reused the same numeric pgid — and
-// safely kill it, then shut down the device for reuse.
-func TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled(t *testing.T) {
+// (not its child) releases the flock immediately while the consumer
+// (here standing in for MAV's `log stream`) keeps running. `reap` must
+// detect the still-live process referencing the device and refuse to
+// recycle the slot.
+func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 	requireIntegration(t)
 	bin := buildSimpool(t)
 	home := t.TempDir()
@@ -308,91 +302,31 @@ func TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled(t *testing.T
 		t.Fatal("consumer should still be alive after simpool (not its group) was killed — the scenario this test exists to reproduce didn't happen")
 	}
 
-	// Now the actual assertion: reap must see the lock is free, verify the
-	// live process's identity against the fingerprint `with` recorded, and
-	// reclaim it — kill the process group and shut down the device.
+	// Now the actual assertion: reap must see the lock is free AND the
+	// device still has a live process attached, and must refuse to touch
+	// it.
 	reapCmd := exec.Command(bin, "reap", "--cold", "0")
 	reapCmd.Env = env
 	reapOut, err := reapCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("simpool reap failed: %v\n%s", err, reapOut)
 	}
-	if !strings.Contains(string(reapOut), "RECOVER") {
-		t.Fatalf("reap should report RECOVER for the verified orphan, got:\n%s", reapOut)
-	}
-
-	for _, p := range livePIDs {
-		if procs.Alive(p) {
-			t.Fatalf("reap's recovery should have killed the verified orphan pid %d, but it is still alive", p)
-		}
+	if !strings.Contains(string(reapOut), "SKIP") {
+		t.Fatalf("reap should report SKIP for the slot with a live orphan, got:\n%s", reapOut)
 	}
 
 	state, found, err := simctl.State(udid)
 	if err != nil || !found {
 		t.Fatalf("device disappeared after reap: found=%v err=%v", found, err)
 	}
-	if state != "Shutdown" {
-		t.Fatalf("reap's recovery should have shut down the device, got state=%q", state)
-	}
-}
-
-// TestIntegration_ExitSweepShutsDownColdButNotWarm proves pool.ExitSweep —
-// wired into `simpool with`'s and `simpool release`'s exit paths — shuts
-// down a free slot idle past pool.SweepIdleThreshold while leaving a
-// just-used one booted. This is what closes the memory loop the design
-// exists to fix (§3, ~1.75GB resident per booted slot) continuously, as a
-// side effect of ordinary `with`/`release` calls, instead of depending on a
-// human or cron running `simpool reap`.
-func TestIntegration_ExitSweepShutsDownColdButNotWarm(t *testing.T) {
-	requireIntegration(t)
-	bin := buildSimpool(t)
-	home := t.TempDir()
-	t.Cleanup(func() { cleanupPool(t, home) })
-	env := append(os.Environ(), "SIMPOOL_HOME="+home)
-
-	// Provision + boot both slots via one `with` call, then let it release
-	// them normally — at that point ExitSweep will already have run once
-	// (wired into with.go), but both slots are freshly used, so neither is
-	// old enough to be touched yet.
-	warm := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "2", "--max", "2", "--", "true")
-	warm.Env = env
-	if out, err := warm.CombinedOutput(); err != nil {
-		t.Fatalf("warm-up simpool with failed: %v\n%s", err, out)
+	if state != "Booted" {
+		t.Fatalf("reap shut down a device that still had a live process attached to it: state=%q", state)
 	}
 
-	groupDir := pool.GroupDir(home, testDevice, testOS)
-	coldDir := pool.SlotDir(groupDir, 0)
-	warmDir := pool.SlotDir(groupDir, 1)
-
-	coldMeta := pool.ReadMeta(coldDir)
-	warmMeta := pool.ReadMeta(warmDir)
-	if coldMeta.UDID == "" || warmMeta.UDID == "" {
-		t.Fatal("both slots should be provisioned after warm-up")
-	}
-
-	// Back-date slot-0's LastUsed well past the idle threshold; slot-1
-	// stays as freshly used.
-	coldMeta.LastUsed = time.Now().Add(-2 * pool.SweepIdleThreshold)
-	if err := pool.WriteMeta(coldDir, coldMeta); err != nil {
-		t.Fatal(err)
-	}
-
-	pool.ExitSweep(home, testDevice, testOS)
-
-	coldState, found, err := simctl.State(coldMeta.UDID)
-	if err != nil || !found {
-		t.Fatalf("cold device disappeared: found=%v err=%v", found, err)
-	}
-	if coldState != "Shutdown" {
-		t.Fatalf("ExitSweep should have shut down the idle slot, got state=%q", coldState)
-	}
-
-	warmState, found, err := simctl.State(warmMeta.UDID)
-	if err != nil || !found {
-		t.Fatalf("warm device disappeared: found=%v err=%v", found, err)
-	}
-	if warmState != "Booted" {
-		t.Fatalf("ExitSweep must not touch a recently-used slot, got state=%q", warmState)
+	// Clean up the orphan ourselves; t.Cleanup will shut down/delete the
+	// device afterward.
+	for _, p := range livePIDs {
+		_ = procs.KillProcessGroup(p, 9)
 	}
 }
 

@@ -113,18 +113,5 @@ func EnsureProvisioned(s *Slot, ownerCmd, mode string) error {
 	s.Meta.OwnerPID = os.Getpid()
 	s.Meta.OwnerCmd = ownerCmd
 	s.Meta.Mode = mode
-	// Always clear the previous consumer's identity here, regardless of
-	// mode: `with` records its own child's ConsumerPGID/fingerprint AFTER
-	// this call returns (see with.go, right after cmd.Start()), so this
-	// never clobbers a value the current invocation is about to set — but
-	// without it, a slot that moves from `with` to `acquire`/`lease` (which
-	// never set these fields themselves) would otherwise carry a stale
-	// pgid/fingerprint forever. Stale beyond "incorrect": if that old pgid
-	// number is ever reused by an unrelated process group after this slot
-	// has moved on, a poison check would misidentify it as a still-live
-	// consumer of a `with` session that is long gone.
-	s.Meta.ConsumerPGID = 0
-	s.Meta.ConsumerStartedAt = ""
-	s.Meta.ConsumerBootID = ""
 	return s.SaveMeta()
 }

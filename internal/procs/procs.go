@@ -5,7 +5,6 @@ package procs
 
 import (
 	"bytes"
-	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -205,46 +204,4 @@ func CommandLine(pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
-}
-
-// ProcessStartTime returns pid's start time (`ps -o lstart=`), for identity
-// verification before a poisoned slot's recovery is allowed to kill
-// anything: macOS recycles pids, so a live process under a recorded pgid is
-// not by itself proof it's the same process that was recorded — this must
-// match exactly first. The returned string is opaque: it is never parsed,
-// only ever compared for equality against a value recorded earlier the same
-// way (see Meta.ConsumerStartedAt). Errors (no such process) are returned,
-// not swallowed — the caller must treat "can't verify" as "don't kill".
-func ProcessStartTime(pid int) (string, error) {
-	if pid <= 0 {
-		return "", fmt.Errorf("invalid pid %d", pid)
-	}
-	out, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return "", err
-	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return "", fmt.Errorf("no such process %d", pid)
-	}
-	return s, nil
-}
-
-// MachineBootTime returns a stable, opaque fingerprint of the current boot
-// (`sysctl kern.boottime`). Compared for equality only (see
-// Meta.ConsumerBootID): if it no longer matches a value recorded earlier,
-// the machine has rebooted since, and nothing could have survived that —
-// which lets a poisoned slot's recovery skip signaling anyone at all in
-// that case, since any live process now sharing the recorded pgid number is
-// necessarily unrelated.
-func MachineBootTime() (string, error) {
-	out, err := exec.Command("sysctl", "kern.boottime").Output()
-	if err != nil {
-		return "", err
-	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return "", fmt.Errorf("sysctl kern.boottime returned no output")
-	}
-	return s, nil
 }

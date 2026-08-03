@@ -109,21 +109,23 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	pruneRunDirs(dir, label, pruneRunsAfter, dryRun, stdout, stderr)
 
 	meta := pool.ReadMeta(dir)
-	if poison := pool.CheckPoison(meta); poison.Poisoned() {
-		if dryRun {
-			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery\n", label, meta.UDID, poison)
-			return
+	if meta.UDID != "" {
+		poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
+		if !poisoned {
+			if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
+				poisoned = true
+			}
 		}
-		if pool.AttemptRecovery(dir, &meta, poison) {
-			// Only ever true for a verified `with`-spawned orphan (see
-			// AttemptRecovery) — never for a LiveConsumers-only signal,
-			// which for a leased slot is the healthy case, not an orphan.
-			fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
-			// Fall through: the slot is now genuinely free and cold, so
-			// this same pass's idle/cold/purge accounting below can act on
-			// it immediately instead of waiting for the next `reap`.
-		} else {
-			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — could not verify its identity, not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, meta.UDID, poison)
+		if poisoned {
+			// meta.ConsumerPGID (checked first) catches a consumer whose
+			// only trace is an environment variable (MAV_TARGET_UDID,
+			// SIMPOOL_UDID_N) rather than anything in its own argv — which
+			// is exactly how simpool hands off a simulator (§5), and
+			// exactly what a pgrep-based check on the UDID alone cannot
+			// see. LiveConsumers remains as a second signal for slots with
+			// no recorded PGID (e.g. `acquire` mode, or meta.json
+			// predating this field).
+			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s) — not touching\n", label, meta.UDID)
 			return
 		}
 	}

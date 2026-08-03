@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/bitomule/simpool/internal/procs"
 )
 
 // DefaultLeaseTTL is how long `simpool lease` reserves a slot for its key
@@ -200,11 +202,8 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 // if — dir is currently free for handout: its flock is uncontended, it
 // carries no live lease for a different key, and (mirroring
 // AcquireSlots' take()) its previous consumer isn't a poisoned orphan
-// left behind by a SIGKILL to `simpool` itself — or, if it was, that it can
-// be reclaimed (see AttemptRecovery). Must be called from inside the group
-// allocation lock (see AcquireLease): that lock, plus the IsSlotFree check
-// just above, is what guarantees no concurrent recovery attempt on this
-// same slot, since claimSlotForLease never takes the slot's own flock.
+// left behind by a SIGKILL to `simpool` itself. Must be called from
+// inside the group allocation lock (see AcquireLease).
 func claimSlotForLease(dir, key string, ttl time.Duration) (bool, error) {
 	free, err := IsSlotFree(dir)
 	if err != nil {
@@ -218,8 +217,14 @@ func claimSlotForLease(dir, key string, ttl time.Duration) (bool, error) {
 	}
 
 	meta := ReadMeta(dir)
-	if poison := CheckPoison(meta); poison.Poisoned() {
-		if !AttemptRecovery(dir, &meta, poison) {
+	if meta.UDID != "" {
+		poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
+		if !poisoned {
+			if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
+				poisoned = true
+			}
+		}
+		if poisoned {
 			return false, nil
 		}
 	}

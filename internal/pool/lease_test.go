@@ -41,7 +41,11 @@ func TestAcquireLease_StickyByKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first lease: %v", err)
 	}
-	firstExpiry := ReadLease(first.Dir).ExpiresAt
+	firstLease, err := ReadLease(first.Dir)
+	if err != nil {
+		t.Fatalf("reading first lease: %v", err)
+	}
+	firstExpiry := firstLease.ExpiresAt
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -52,7 +56,11 @@ func TestAcquireLease_StickyByKey(t *testing.T) {
 	if second.Number != first.Number {
 		t.Fatalf("same key landed on different slots: %d then %d", first.Number, second.Number)
 	}
-	secondExpiry := ReadLease(second.Dir).ExpiresAt
+	secondLease, err := ReadLease(second.Dir)
+	if err != nil {
+		t.Fatalf("reading second lease: %v", err)
+	}
+	secondExpiry := secondLease.ExpiresAt
 	if !secondExpiry.After(firstExpiry) {
 		t.Fatalf("renewal did not push ExpiresAt forward: first=%v second=%v", firstExpiry, secondExpiry)
 	}
@@ -97,7 +105,10 @@ func TestAcquireLease_ExpiredLeaseIsReusable(t *testing.T) {
 	if slot.Number != 0 {
 		t.Fatalf("expected the expired lease's slot-0 to be reused, got slot-%d", slot.Number)
 	}
-	lease := ReadLease(slot.Dir)
+	lease, err := ReadLease(slot.Dir)
+	if err != nil {
+		t.Fatalf("reading lease: %v", err)
+	}
 	if lease.Key != "new-repo" {
 		t.Fatalf("expected slot-0's lease to now belong to new-repo, got %q", lease.Key)
 	}
@@ -254,8 +265,8 @@ func TestReleaseLease(t *testing.T) {
 	if len(released) != 1 || released[0] != a.Dir {
 		t.Fatalf("expected release to report repo-a's slot dir %s, got %v", a.Dir, released)
 	}
-	if ReadLease(a.Dir).Key != "" {
-		t.Fatalf("repo-a's lease.json should be gone after release, got %+v", ReadLease(a.Dir))
+	if lease, _ := ReadLease(a.Dir); lease.Key != "" {
+		t.Fatalf("repo-a's lease.json should be gone after release, got %+v", lease)
 	}
 
 	// repo-a's slot must now be immediately reusable at max=2 (it was
@@ -321,7 +332,7 @@ func TestAcquireLease_RecoversVerifiedOrphanLeftByWith(t *testing.T) {
 	if slot.Number != 0 {
 		t.Fatalf("expected the recovered slot-0 to be reused, got slot-%d", slot.Number)
 	}
-	if lease := ReadLease(slot.Dir); lease.Key != "repo-a" {
+	if lease, _ := ReadLease(slot.Dir); lease.Key != "repo-a" {
 		t.Fatalf("expected slot-0's lease to belong to repo-a, got %+v", lease)
 	}
 
@@ -388,5 +399,178 @@ func TestClaimSlotForLease_NeverRacesConcurrentFlockAcquire(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+	}
+}
+
+// TestReadLease_MissingFileIsFreeNotError proves the genuinely-free case:
+// no lease.json at all yields a zero Lease and no error — the only case
+// that may ever be read as "no lease".
+func TestReadLease_MissingFileIsFreeNotError(t *testing.T) {
+	dir := t.TempDir()
+	lease, err := ReadLease(dir)
+	if err != nil {
+		t.Fatalf("a missing lease.json must not be an error, got %v", err)
+	}
+	if lease.Key != "" || lease.Alive() {
+		t.Fatalf("a missing lease.json must read as no lease, got %+v", lease)
+	}
+}
+
+// TestReadLease_UnreadableFileIsErrorNotFree is the regression test for the
+// class of bug that hit v0.6.0: reading "I couldn't check" as "confirmed
+// free". A directory sitting where lease.json should be forces os.ReadFile
+// to fail deterministically (no platform-specific permission bits needed,
+// and root-proof) — standing in for EMFILE/permission/I-O failures in
+// production. ReadLease must report this as an error, never silently as a
+// zero (i.e. "no lease") Lease.
+func TestReadLease_UnreadableFileIsErrorNotFree(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(leasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := ReadLease(dir)
+	if err == nil {
+		t.Fatalf("expected an error reading an unreadable lease.json, got lease=%+v, nil error", lease)
+	}
+	if lease.Key != "" || lease.Alive() {
+		t.Fatalf("an unreadable lease.json must never read as an alive or claimable lease, got %+v", lease)
+	}
+}
+
+// TestReadLease_CorruptFileIsErrorNotFree proves truncated/corrupt JSON is
+// reported as an error too — the old code silently discarded
+// json.Unmarshal's error and returned a zero Lease exactly as if the file
+// had never existed.
+func TestReadLease_CorruptFileIsErrorNotFree(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leasePath(dir), []byte("{not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := ReadLease(dir)
+	if err == nil {
+		t.Fatalf("expected an error reading corrupt lease.json, got lease=%+v, nil error", lease)
+	}
+	if lease.Key != "" {
+		t.Fatalf("corrupt lease.json must never read as a valid lease, got %+v", lease)
+	}
+}
+
+// TestAcquireSlots_SkipsSlotWithUnreadableLease proves the fix reaches
+// with/acquire's own caller: a slot whose lease.json cannot be read must
+// never be handed out just because it "looked" free by every other measure
+// (flock free, no poison). Mirrors TestAcquireSlots_SkipsSlotWithLiveLease.
+func TestAcquireSlots_SkipsSlotWithUnreadableLease(t *testing.T) {
+	root := t.TempDir()
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	dir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(leasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// max=1 and slot-0's lease can't be verified — must not be treated as
+	// free, and must not create a second slot beyond --max either.
+	start := time.Now()
+	_, err := AcquireSlots(root, "TestDevice", "1.0", 1, 1, 0)
+	if !errors.Is(err, ErrAtCapacity) {
+		t.Fatalf("with/acquire against a slot with unreadable lease.json at max=1: want ErrAtCapacity, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("AcquireSlots must fail immediately at capacity, not wait")
+	}
+
+	// max=2 must skip slot-0 and land on a fresh slot-1 instead of trusting
+	// the unreadable lease as "free".
+	slots, err := AcquireSlots(root, "TestDevice", "1.0", 1, 2, 0)
+	if err != nil {
+		t.Fatalf("with/acquire against a slot with unreadable lease.json at max=2: %v", err)
+	}
+	defer slots[0].Release()
+	if slots[0].Number != 1 {
+		t.Fatalf("expected with/acquire to land on a fresh slot-1 (slot-0's lease.json is unreadable), got slot-%d", slots[0].Number)
+	}
+}
+
+// TestAcquireLease_SkipsSlotWithUnreadableLease is the lease-claiming
+// side's counterpart: claimSlotForLease must apply the same "can't verify
+// means busy" rule to a slot whose OWN prior lease.json cannot be read.
+func TestAcquireLease_SkipsSlotWithUnreadableLease(t *testing.T) {
+	root := t.TempDir()
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	dir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(leasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", time.Hour, 1)
+	if !errors.Is(err, ErrAtCapacity) {
+		t.Fatalf("lease against a slot with unreadable lease.json at max=1: want ErrAtCapacity, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("AcquireLease must fail immediately at capacity, not wait")
+	}
+
+	slot, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", time.Hour, 2)
+	if err != nil {
+		t.Fatalf("lease at max=2 should land on a fresh slot instead of the unreadable one: %v", err)
+	}
+	if slot.Number != 1 {
+		t.Fatalf("expected a fresh slot-1 (slot-0's lease.json is unreadable), got slot-%d", slot.Number)
+	}
+}
+
+// TestCleanupExpiredLease_UnreadableFileReturnsError proves reap's own
+// pruning path can't silently no-op past a lease.json it can no longer
+// read: it must return an error, never removed=false-with-nil-error (which
+// reap.go would otherwise misreport as an ordinary "renewed just in time"
+// and, worse, without this fix could fall through to idle/cold/purge
+// accounting on a slot it never actually verified as unleased).
+func TestCleanupExpiredLease_UnreadableFileReturnsError(t *testing.T) {
+	groupDir := t.TempDir()
+	dir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(leasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := CleanupExpiredLease(groupDir, dir)
+	if err == nil {
+		t.Fatalf("expected an error, got removed=%v, nil error", removed)
+	}
+	if removed {
+		t.Fatalf("must never report removed=true when the lease could not even be read")
+	}
+}
+
+// TestReleaseLease_UnreadableSlotDoesNotBlockOthers proves a transient read
+// failure on one unrelated slot's lease.json never stops repo-a's own,
+// perfectly readable lease from being released elsewhere — but is still
+// surfaced as an error so the caller (`simpool release`) knows the sweep
+// was incomplete, rather than silently treating the unreadable slot as "not
+// mine, nothing to do".
+func TestReleaseLease_UnreadableSlotDoesNotBlockOthers(t *testing.T) {
+	root := t.TempDir()
+
+	a, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", time.Hour, 2)
+	if err != nil {
+		t.Fatalf("lease repo-a: %v", err)
+	}
+
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	badDir := SlotDir(groupDir, 5)
+	if err := os.MkdirAll(leasePath(badDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	released, err := ReleaseLease(root, "repo-a")
+	if err == nil {
+		t.Fatalf("expected ReleaseLease to report the unreadable slot's read failure")
+	}
+	if len(released) != 1 || released[0] != a.Dir {
+		t.Fatalf("repo-a's own lease should still be released despite the unrelated unreadable slot, got %v", released)
+	}
+	if lease, _ := ReadLease(a.Dir); lease.Key != "" {
+		t.Fatalf("repo-a's lease.json should be gone after release, got %+v", lease)
 	}
 }

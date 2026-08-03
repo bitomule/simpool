@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -54,6 +55,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	purgeMinutes := fs.Int("purge", 0, "minutes a slot must have been shut down (already cold) before its simulator is deleted outright, reclaiming disk; 0 disables purging")
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
+	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify (a recycled pid, or a process group owned by another user): forget this slot's identity and delete its device, WITHOUT signaling the process that poisoned it — that process, if actually still alive, is left running untouched. Only ever affects a `with` slot whose poison is an unverifiable process-group fingerprint; never a live lease/acquire consumer or a check that merely failed to run. Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -72,13 +74,13 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	for _, groupDir := range groups {
 		for _, n := range pool.ListSlotNumbers(groupDir) {
 			dir := pool.SlotDir(groupDir, n)
-			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, stdout, stderr)
+			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, stdout, stderr)
 		}
 	}
 	return 0
 }
 
-func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun bool, stdout, stderr io.Writer) {
+func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, stdout, stderr io.Writer) {
 	groupDir := filepath.Dir(dir)
 	label := filepath.Base(groupDir) + "/" + filepath.Base(dir)
 	lock, err := pool.TryLock(pool.LockPath(dir))
@@ -97,7 +99,18 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	// see lease.go), so without this check reap would treat an actively
 	// hot-looped MAV slot exactly like any other idle free slot and could
 	// shut down or purge its simulator out from under the lease holder.
-	if lease := pool.ReadLease(dir); lease.Alive() {
+	lease, err := pool.ReadLease(dir)
+	if err != nil {
+		// Could not tell whether this slot is under an active lease
+		// (EMFILE, a permission error, a truncated lease.json) — never
+		// read that as "no lease". Treat it exactly like a live one: leave
+		// the slot alone rather than falling through to idle/poison/
+		// --cold/--purge accounting on the strength of a check that never
+		// actually completed.
+		fmt.Fprintf(stdout, "SKIP  %s  could not read lease.json (%v) — treating as occupied, not touching\n", label, err)
+		return
+	}
+	if lease.Alive() {
 		fmt.Fprintf(stdout, "SKIP  %s  active lease (key=%q, expires in %s) — not touching\n", label, lease.Key, time.Until(lease.ExpiresAt).Round(time.Second))
 		return
 	} else if lease.Key != "" {
@@ -106,7 +119,12 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		} else {
 			removed, err := pool.CleanupExpiredLease(groupDir, dir)
 			if err != nil {
-				fmt.Fprintf(stderr, "reap %s: removing expired lease: %v\n", label, err)
+				// Same "unreadable means occupied" rule applies to
+				// CleanupExpiredLease's own re-check: bail out rather than
+				// falling through, exactly like the "still alive" and
+				// "renewed just now" branches below.
+				fmt.Fprintf(stderr, "reap %s: removing expired lease: %v — treating as occupied, not touching\n", label, err)
+				return
 			} else if removed {
 				fmt.Fprintf(stdout, "PRUNE %s  removed expired lease (key=%q)\n", label, lease.Key)
 			} else {
@@ -130,7 +148,11 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	meta := pool.ReadMeta(dir)
 	if poison := pool.CheckPoison(meta); poison.Poisoned() {
 		if dryRun {
-			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery\n", label, meta.UDID, poison)
+			msg := fmt.Sprintf("SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery", label, meta.UDID, poison)
+			if disownPoisoned && meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID {
+				msg += fmt.Sprintf("; if recovery still can't verify identity on a real run, --disown-poisoned would then forget pgid %d's fingerprint and delete device %s (pgid itself left completely untouched, not killed)", meta.ConsumerPGID, meta.UDID)
+			}
+			fmt.Fprintln(stdout, msg)
 			return
 		}
 		if pool.AttemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison) {
@@ -139,23 +161,39 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			// which for a leased slot is the healthy case, not an orphan,
 			// and never for a failed liveness check.
 			fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
-			// Return immediately: AttemptRecovery's simctl.Shutdown call is
-			// asynchronous (CoreSimulator does not tear a device down
-			// instantly), so the device may still report "Booted" — or be
-			// mid-teardown — for up to roughly a second afterward. Falling
-			// through to this same pass's idle/cold/--purge accounting
-			// below (a real, reverted regression: it once called
-			// simctl.Delete on a device only ~0.8s past its shutdown
-			// request) is exactly the catastrophic failure mode
-			// cleanupPool's test-cleanup comment documents — deleting a
-			// simulator before its process tree has finished tearing down
-			// orphans hundreds of runtime processes. A later `reap` run
-			// will see the device's actual settled state (Booted, still
+			// Return immediately rather than falling through to this same
+			// pass's idle/cold/--purge accounting: AttemptRecovery's
+			// simctl.Shutdown call is measured SYNCHRONOUS (5-7.5s wall
+			// time to return the device's own reported state — see
+			// internal/simctl — not the async, returns-before-it's-really-
+			// down call an earlier version of this comment assumed), so the
+			// device's state is already accurate by the time it returns.
+			// What can still lag a beat behind that state flip is
+			// CoreSimulator's own teardown of the device's underlying
+			// process tree — deleting a simulator on the heels of an
+			// already-synchronous shutdown has still been reproduced (a
+			// real, reverted regression) to orphan hundreds of runtime
+			// processes, exactly the catastrophic failure mode
+			// cleanupPool's test-cleanup comment documents. A later `reap`
+			// run will see the device's actual settled state (still
 			// mid-teardown, or genuinely Shutdown) and act on it then,
 			// exactly like the ordinary SHUT case above.
 			return
 		}
-		fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — could not verify its identity, not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, meta.UDID, poison)
+		if disownPoisoned {
+			pgid, udid := meta.ConsumerPGID, meta.UDID
+			if err := pool.DisownPoisonedSlot(root, dir, n, filepath.Base(groupDir), &meta, poison); err != nil {
+				if errors.Is(err, pool.ErrNotDisownable) {
+					fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — not eligible for --disown-poisoned (only an unverifiable `with`-holder process-group fingerprint qualifies; a live lease/acquire consumer or a failed check never does), not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, meta.UDID, poison)
+				} else {
+					fmt.Fprintf(stderr, "reap %s: --disown-poisoned: %v\n", label, err)
+				}
+				return
+			}
+			fmt.Fprintf(stdout, "DISOWN %s  could not verify pgid %d's identity (device %s, %s) — forgot this slot's fingerprint and deleted that device on your explicit --disown-poisoned request; if pgid %d is still alive, it is left running untouched, just no longer tracked by simpool\n", label, pgid, udid, poison, pgid)
+			return
+		}
+		fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — could not verify its identity, not touching; the next acquisition (with/acquire/lease) will retry automatically, or rerun `simpool reap --disown-poisoned` to forget this slot's identity (without signaling anything) and free it for reuse\n", label, meta.UDID, poison)
 		return
 	}
 

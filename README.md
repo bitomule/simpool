@@ -84,7 +84,7 @@ simpool status
     List every slot: lock state, holder (best-effort), lease, device
     boot state.
 
-simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
+simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -101,6 +101,22 @@ simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--
     doesn't do this on its own exit. Never touches a device whose name
     doesn't start with `SIMPOOL_`, no matter what meta.json says: the
     default device set also holds the user's own simulators.
+
+    --disown-poisoned is the manual, explicit-only escape from a
+    *permanent* quarantine: a slot whose recorded consumer keeps testing
+    "alive" forever because its pid was recycled by an unrelated process,
+    or because it belongs to another user entirely (`kill(-pgid, 0)` fails
+    with EPERM) — neither of which the identity fingerprint can ever
+    resolve, so ordinary `reap`/the next acquisition would SKIP it forever.
+    It never signals the process behind that pgid — if it's still alive,
+    it is left running, untouched, just no longer tracked by simpool — it
+    only forgets this slot's identity and deletes its device (verified
+    first to really be this slot's own) so the next acquisition provisions
+    a genuinely new simulator. Only ever eligible for a `with` slot whose
+    poison reason is the unverifiable process-group fingerprint itself —
+    never a live lease/`acquire` consumer, never a liveness check that
+    merely failed to run. See "Architecture" for the full reasoning,
+    including why this forgets rather than force-kills.
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
@@ -322,7 +338,15 @@ The lock file is the single source of truth. `meta.json` can be lost,
 corrupted, or stale without the pool becoming incorrect. `lease.json` sits
 one level further down the trust chain still: an *absent* lease never
 blocks anything, but a *live* one is honored by `with`/`acquire`/`reap`
-exactly like a real reservation, right up until it expires.
+exactly like a real reservation, right up until it expires. Unlike
+`meta.json`, though, a lease is the sole authority for whether a slot is
+available in `lease`'s flock-free reservation path, so it does not get
+`meta.json`'s tolerant treatment of a read failure: an *unreadable*
+`lease.json` (a permission error, a truncated file, `EMFILE` under load —
+as opposed to one that's simply absent) is never read as "no lease" by
+anything that hands a slot out. It's treated as busy until it can actually
+be read, so a transient I/O error can never let a second consumer steal an
+active reservation.
 
 Override the pool root with `SIMPOOL_HOME` (used by the test suite to
 avoid touching the real pool).
@@ -391,6 +415,21 @@ otherwise-idle simulator stays `reap`'s job — schedule it (cron/launchd) if
 you want that automatic; nothing about acquisition-time recovery depends
 on it.
 
+A second, separate attempt at automatic idle cleanup was tried and cut
+too: acquiring a slot briefly shut down *other*, idle sibling slots in the
+same group as a side effect, on the theory that an expired lease reliably
+proves nobody's using that sibling. That theory was false exactly where it
+mattered — the TTL keepalive it leaned on only runs on MAV's `run` path,
+never on the one-shot `tap`/`swipe`/`ui-tree` commands the sweep actually
+had to reason about (see "MAV in the hot loop" above) — so an expired
+lease only proved no command had run in the last few minutes, which is
+routine in an agent's tool loop, not evidence of absence. With several
+repos sharing one group, an ordinary Bazel test action could shut down a
+live session's simulator this way, costing the next command a ~110s cold
+boot and its app's installed state. Removed for the same reason as the
+exit-time sweep above: `simpool reap --cold N`, run explicitly, is the
+only path that ever shuts down an idle simulator.
+
 **One further, deliberate scope limit** on recovery itself:
 `VerifyConsumerIdentity` only ever re-identifies the process-group
 *leader* — the exact pid `simpool with` launched and fingerprinted. The
@@ -415,6 +454,60 @@ slot in particular, that is the *healthy* state (a legitimate
 A check that itself fails to complete (e.g. `pgrep` failing to fork under
 load) is treated the same as "still alive" — never as "confirmed free" —
 and is likewise never a kill candidate.
+
+**Every shutdown or delete validates device identity from the slot's own
+directory, never from `meta.json`.** `pool.deviceBelongsToSlot` computes
+the *expected* device name from `(root, groupName, n)` — the slot's actual
+directory location, the one thing that can't be corrupted independently of
+where the file sits on disk — and only ever shuts down or deletes a UDID
+once the real device's name in the default set matches that computed name
+exactly. `meta.json`'s own `Device`/`OSVersion` fields are deliberately
+never consulted for this: they live in the same file whose `UDID` is what's
+being validated, so comparing meta against meta detects only an
+*incoherent* corruption (fields that don't even agree with each other),
+never a *coherent* one — a `meta.json` that consistently, believably
+claims to be some other slot's, or another user's own, live simulator.
+Deriving the expected name from the directory instead means a slot's
+identity is never asked to be its own witness.
+
+**`simpool reap --disown-poisoned`** is the deliberate, explicit-only way
+out of a poisoned slot that can *never* self-resolve: `meta.ConsumerPGID`
+tests "alive" forever because either its pid has been recycled by an
+unrelated process that happens to share the same number, or the process
+group belongs to a different user outright (`kill(-pgid, 0)` returns
+`EPERM`). `VerifyConsumerIdentity`'s start-time fingerprint can't clear
+either case — a bare pgid match was never trusted for exactly this reason
+— so without an operator's override, `DefaultMaxSlotsPerGroup = 3` means
+losing a slot like this is losing a third of the pool, permanently.
+
+A `--force`-style flag that just sends `SIGKILL` despite the failed
+identity check was considered and rejected — deliberately, not for lack of
+trying:
+
+- It cannot even work for one of the two motivating cases. `EPERM` means
+  the kernel itself refuses to let simpool signal that process group; a
+  kill-based override would fail on precisely the scenario that most needs
+  one.
+- For the recycled-pid case, it would reintroduce the exact failure mode
+  `VerifyConsumerIdentity` exists to rule out — a bare numeric pgid match
+  is never sufficient evidence of identity — just with a human's finger on
+  the trigger instead of `AttemptRecovery`'s automatic one.
+
+`--disown-poisoned` never signals anything. It only **forgets**: it clears
+this slot's recorded fingerprint and, once `deviceBelongsToSlot` confirms
+the device really is this slot's own, shuts it down and deletes it outright
+so the next acquisition provisions a genuinely fresh simulator rather than
+risking two consumers sharing one whatever-it-is is still poking at. If
+that something is in fact still running, it keeps running — it's simply no
+longer simpool's problem, and no longer standing between the slot and
+reuse. Scoped exactly like `AttemptRecovery`'s own kill gate (`meta.Mode ==
+"with"` and `poison.Reason == PoisonedByConsumerPGID` only): a live
+lease/`acquire` consumer (`PoisonedByLiveConsumers`) is the healthy case and
+must never have its device pulled out from under it, and a liveness check
+that merely failed to run (`PoisonedByCheckFailure`) proves nothing is
+actually wrong, so disowning on the strength of it would be reckless, not
+an escape hatch. Respects `--dry-run` (reports what it would forget without
+touching anything).
 
 ## Testing
 
@@ -480,11 +573,15 @@ releases the lock on SIGKILL with no cleanup step":
   and `TestReapSlot_RecoveryNeverFallsThroughToSamePassPurge` — the
   regression test for a real bug this feature had before it shipped: a
   successful recovery must return immediately, not fall through to the
-  same pass's idle/cold/`--purge` accounting, since `AttemptRecovery`'s
-  `simctl.Shutdown` call is asynchronous and a device can still read as
-  "Booted" for a moment afterward — falling through risked `--purge`
-  deleting a simulator before its process tree finished tearing down,
-  which orphans hundreds of runtime processes (see `cleanupPool` below).
+  same pass's idle/cold/`--purge` accounting. `AttemptRecovery`'s
+  `simctl.Shutdown` call is measured **synchronous** — it blocks until the
+  device's own reported state is genuinely "Shutdown" (5-7.5s wall time
+  observed), not an async call that returns before the device is really
+  down — but CoreSimulator's own teardown of the device's underlying
+  process tree can still be settling for a beat after that state flip;
+  falling through risked `--purge` deleting a simulator before its process
+  tree finished tearing down, which orphans hundreds of runtime processes
+  (see `cleanupPool` below).
 - `internal/pool/lease_test.go` covers `lease`'s own contract — sticky by
   key, two keys never share a slot, an expired lease is reusable, `--max`
   is a real cap and fails immediately (no polling) — and, symmetrically,
@@ -502,6 +599,30 @@ releases the lock on SIGKILL with no cleanup step":
   CLI-facing half: reap skips an actively leased slot and cleans up an
   expired one, and doctor flags the one invariant that must never hold —
   a slot with both a busy flock and a live lease at once.
+- `ReadLease`'s own tests (`internal/pool/lease_test.go`) prove the
+  three-way read it returns: no `lease.json` at all is genuinely free
+  (`nil` error), a valid one parses normally, and one that exists but
+  can't be read or parsed (simulated with a directory sitting where the
+  file should be, and with truncated JSON) is reported as an *error* —
+  never silently as "no lease". `TestAcquireSlots_SkipsSlotWithUnreadableLease`
+  / `TestAcquireLease_SkipsSlotWithUnreadableLease` prove that error
+  propagates all the way to both handout paths (a slot with an unreadable
+  lease is skipped, not treated as free), and `TestReapSlot_UnreadableLeaseIsTreatedAsBusy`
+  / `TestRunDoctor_FlagsUnreadableLease` cover reap and doctor doing the
+  same. `TestReleaseLease_UnreadableSlotDoesNotBlockOthers` proves a read
+  failure on one unrelated slot never stops a different, readable lease
+  from being released.
+- `internal/pool/poison_test.go`'s `DisownPoisonedSlot` tests cover
+  `--disown-poisoned`: a with-mode slot with an unverifiable fingerprint is
+  forgotten (meta cleared) *without* ever signaling the process behind it
+  (`TestDisownPoisonedSlot_ForgetsFingerprintWithoutKilling`), and it's
+  refused outright — `ErrNotDisownable`, meta untouched — for a live
+  lease/`acquire` consumer, a failed liveness check, or any non-`with`
+  mode, mirroring `AttemptRecovery`'s own gates exactly.
+  `internal/cli/reap_test.go`'s `TestReapSlot_DisownPoisoned*` tests cover
+  the CLI end to end: an unverifiable orphan is reclaimed without being
+  killed, `--dry-run` never mutates anything, and a live lease consumer is
+  never touched even when `--disown-poisoned` is explicitly requested.
 
 ```
 SIMPOOL_RUN_INTEGRATION=1 go test ./internal/cli/... -run Integration -v

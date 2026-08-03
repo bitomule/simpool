@@ -137,17 +137,20 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// ReleaseLease can return a non-empty released alongside a non-nil err:
+	// some slots' lease.json could not be verified (never guess-removed —
+	// see ReleaseLease's doc comment), but that must not hide whatever was
+	// successfully released elsewhere.
 	released, err := pool.ReleaseLease(root, k)
+	for _, dir := range released {
+		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
+	}
 	if err != nil {
 		fmt.Fprintln(stderr, "simpool release:", err)
 		return 1
 	}
 	if len(released) == 0 {
 		fmt.Fprintf(stdout, "no active lease for key %q\n", k)
-		return 0
-	}
-	for _, dir := range released {
-		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
 	}
 	return 0
 }

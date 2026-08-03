@@ -76,7 +76,9 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 			}
 
 			leaseCol := "-"
-			if lease := pool.ReadLease(dir); lease.Key != "" {
+			if lease, err := pool.ReadLease(dir); err != nil {
+				leaseCol = fmt.Sprintf("unreadable: %v", err)
+			} else if lease.Key != "" {
 				if lease.Alive() {
 					leaseCol = fmt.Sprintf("%s (expires in %s)", lease.Key, time.Until(lease.ExpiresAt).Round(time.Second))
 				} else {

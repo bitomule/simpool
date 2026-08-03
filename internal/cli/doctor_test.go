@@ -107,3 +107,33 @@ func TestRunDoctor_FlagsLiveLeaseWithBusyFlock(t *testing.T) {
 		t.Fatalf("doctor should name the conflicting lease key, got:\n%s", stdout.String())
 	}
 }
+
+// TestRunDoctor_FlagsUnreadableLease proves doctor surfaces a lease.json it
+// cannot read as a problem — read-only and diagnostic, so it never gates
+// anything, but a check that didn't actually complete must not be silently
+// dropped either (see pool.ReadLease's doc comment).
+func TestRunDoctor_FlagsUnreadableLease(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	groupDir := pool.GroupDir(home, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A directory sitting where lease.json should be forces os.ReadFile to
+	// fail deterministically, standing in for EMFILE/permission/I-O
+	// failures in production.
+	if err := os.MkdirAll(pool.LeasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunDoctor(nil, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doctor should report a problem for an unreadable lease.json, got exit 0:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("lease.json")) {
+		t.Fatalf("doctor should mention the unreadable lease.json, got:\n%s", stdout.String())
+	}
+}

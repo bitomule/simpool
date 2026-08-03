@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -356,6 +357,140 @@ func TestAttemptRecovery_RefusesNonWithMode(t *testing.T) {
 		}
 		if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 			t.Fatalf("mode=%q: AttemptRecovery must refuse a non-with mode even with a verified ConsumerPGID", mode)
+		}
+	}
+	if syscall.Kill(pgid, 0) != nil {
+		t.Fatal("process must still be alive")
+	}
+}
+
+// TestDisownPoisonedSlot_ForgetsFingerprintWithoutKilling proves the manual
+// escape hatch's core promise (`simpool reap --disown-poisoned`): it clears
+// a with-mode slot's poisoned ConsumerPGID fingerprint, UDID, and Mode
+// WITHOUT ever sending the process behind it any signal. Unlike
+// AttemptRecovery it must never require — or even attempt — identity
+// verification: the entire reason this exists is for the case where
+// identity can never be verified (a recycled pid, or a process group EPERM
+// makes unkillable outright), so the deliberately wrong fingerprint below
+// stands in for exactly that permanently-unverifiable case.
+func TestDisownPoisonedSlot_ForgetsFingerprintWithoutKilling(t *testing.T) {
+	dir := t.TempDir()
+	pgid, cleanup := spawnRealOrphan(t)
+	defer cleanup()
+
+	meta := Meta{
+		UDID:              "simpool-test-udid-disown",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: "Mon Jan  1 00:00:00 1999", // deliberately wrong/unverifiable
+	}
+	poison := CheckPoison(meta)
+	if poison.Reason != PoisonedByConsumerPGID {
+		t.Fatalf("test setup broken: expected PoisonedByConsumerPGID, got %v", poison.Reason)
+	}
+
+	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); err != nil {
+		t.Fatalf("DisownPoisonedSlot: %v", err)
+	}
+	if meta.ConsumerPGID != 0 || meta.ConsumerStartedAt != "" || meta.UDID != "" || meta.Mode != "" {
+		t.Errorf("expected fully forgotten meta, got %+v", meta)
+	}
+	if syscall.Kill(pgid, 0) != nil {
+		t.Fatal("disown must never signal the process — it should still be alive")
+	}
+
+	persisted := ReadMeta(dir)
+	if persisted.ConsumerPGID != 0 || persisted.UDID != "" {
+		t.Errorf("disown should have persisted the forgotten identity, got %+v", persisted)
+	}
+}
+
+// TestDisownPoisonedSlot_RefusesLiveConsumersReason proves disown enforces
+// the same restraint as AttemptRecovery: a live process referencing the
+// slot's UDID on its own command line is the healthy case for a leased
+// slot, never something to disown (which would delete its device) out from
+// under it.
+func TestDisownPoisonedSlot_RefusesLiveConsumersReason(t *testing.T) {
+	dir := t.TempDir()
+	token := "simpool-test-udid-disown-live-consumer"
+	pid, cleanup := spawnLiveConsumerWithToken(t, token)
+	defer cleanup()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		live, _ := procs.LiveConsumers(token)
+		if len(live) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live consumer process never became visible to LiveConsumers")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	meta := Meta{UDID: token, Mode: "with"}
+	poison := CheckPoison(meta)
+	if poison.Reason != PoisonedByLiveConsumers {
+		t.Fatalf("expected PoisonedByLiveConsumers, got %v", poison.Reason)
+	}
+
+	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); !errors.Is(err, ErrNotDisownable) {
+		t.Fatalf("expected ErrNotDisownable for a LiveConsumers-only signal, got %v", err)
+	}
+	if meta.UDID != token {
+		t.Errorf("a refused disown must never mutate meta, got %+v", meta)
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the live consumer process must never be touched")
+	}
+}
+
+// TestDisownPoisonedSlot_RefusesCheckFailureReason proves an incomplete
+// liveness check is never grounds to disown a slot either — a check that
+// didn't run has proven nothing is actually wrong.
+func TestDisownPoisonedSlot_RefusesCheckFailureReason(t *testing.T) {
+	dir := t.TempDir()
+	pgid, cleanup := spawnRealOrphan(t)
+	defer cleanup()
+
+	meta := Meta{
+		UDID:              "simpool-test-udid-disown-check-failure",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: fingerprint(t, pgid),
+	}
+	poison := Poison{Reason: PoisonedByCheckFailure}
+
+	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); !errors.Is(err, ErrNotDisownable) {
+		t.Fatalf("expected ErrNotDisownable when the check itself failed, got %v", err)
+	}
+	if syscall.Kill(pgid, 0) != nil {
+		t.Fatal("process must still be alive")
+	}
+}
+
+// TestDisownPoisonedSlot_RefusesNonWithMode proves disown, like
+// AttemptRecovery, only ever applies to a `with`-launched slot: `acquire`
+// never spawns a child and a `lease`'s whole point is that a live process
+// is the healthy case, never something simpool spawned and may disown.
+func TestDisownPoisonedSlot_RefusesNonWithMode(t *testing.T) {
+	dir := t.TempDir()
+	pgid, cleanup := spawnRealOrphan(t)
+	defer cleanup()
+
+	for _, mode := range []string{"acquire", "lease", ""} {
+		meta := Meta{
+			UDID:              "simpool-test-udid-disown-nonwith-" + mode,
+			Mode:              mode,
+			ConsumerPGID:      pgid,
+			ConsumerStartedAt: fingerprint(t, pgid),
+		}
+		poison := CheckPoison(meta)
+		if poison.Reason != PoisonedByConsumerPGID {
+			t.Fatalf("mode=%q: expected PoisonedByConsumerPGID, got %v", mode, poison.Reason)
+		}
+		if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); !errors.Is(err, ErrNotDisownable) {
+			t.Fatalf("mode=%q: expected ErrNotDisownable, got %v", mode, err)
 		}
 	}
 	if syscall.Kill(pgid, 0) != nil {

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,17 +49,40 @@ func leasePath(slotDir string) string { return filepath.Join(slotDir, "lease.jso
 // have a slot directory path, not a live *Slot.
 func LeasePath(slotDir string) string { return leasePath(slotDir) }
 
-// ReadLease loads lease.json for a slot. A missing or corrupt file yields
-// a zero-value Lease (Alive() == false) and no error — same tolerance
-// contract as ReadMeta.
-func ReadLease(slotDir string) Lease {
-	var l Lease
+// ReadLease loads lease.json for a slot, distinguishing three outcomes a
+// caller deciding whether to hand this slot to a new consumer must not
+// conflate:
+//
+//   - no lease.json at all: (Lease{}, nil) — genuinely free. Never leased,
+//     or its lease was cleanly removed (ReleaseLease/CleanupExpiredLease).
+//   - lease.json exists and parses: (Lease{...}, nil) — check Alive().
+//   - lease.json exists but could not be read or parsed — EMFILE under
+//     load, a permission error, a truncated file: (Lease{}, err).
+//
+// Unlike ReadMeta (advisory, never authoritative — a stale/corrupt
+// meta.json can never make a slot look free or busy on its own), a live
+// Lease IS the sole authority that a slot is unavailable in `simpool
+// lease`'s flock-free reservation path. Collapsing the third case into
+// the first — as this used to do — let an unreadable lease.json read as
+// "no lease", which is exactly the class of bug CheckPoison's
+// PoisonedByCheckFailure exists to rule out for the flock-adjacent
+// liveness check: an incomplete check must never be read as "confirmed
+// free". Every caller here must treat err != nil as "can't tell, so
+// don't hand this slot out" — status/doctor, which only report, may
+// surface err as information instead.
+func ReadLease(slotDir string) (Lease, error) {
 	data, err := os.ReadFile(leasePath(slotDir))
 	if err != nil {
-		return l
+		if os.IsNotExist(err) {
+			return Lease{}, nil
+		}
+		return Lease{}, fmt.Errorf("reading %s: %w", leasePath(slotDir), err)
 	}
-	_ = json.Unmarshal(data, &l)
-	return l
+	var l Lease
+	if err := json.Unmarshal(data, &l); err != nil {
+		return Lease{}, fmt.Errorf("parsing %s: %w", leasePath(slotDir), err)
+	}
+	return l, nil
 }
 
 // WriteLease persists lease.json via write-to-temp + rename, so a crash
@@ -144,7 +168,16 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 	// rewrites a lease.json this exact key already owns.
 	for _, n := range existing {
 		dir := SlotDir(groupDir, n)
-		lease := ReadLease(dir)
+		lease, err := ReadLease(dir)
+		if err != nil {
+			// Can't tell whether this is our own sticky slot — never guess.
+			// Worst case we fall through to the normal claim loop below and
+			// wander to a different slot; claimSlotForLease applies the same
+			// "unreadable means busy" rule to this exact file, so this can
+			// never result in two keys sharing one slot, only (rarely) in
+			// losing stickiness for one renewal.
+			continue
+		}
 		if lease.Key == key && lease.Alive() {
 			if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
 				return nil, err
@@ -227,7 +260,11 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 	}
 	defer lock.Release()
 
-	if lease := ReadLease(dir); lease.Alive() {
+	if lease, err := ReadLease(dir); err != nil {
+		// Could not verify whether this slot already carries a live lease
+		// for someone else — never treat an incomplete check as "free".
+		return false, nil
+	} else if lease.Alive() {
 		return false, nil
 	}
 
@@ -260,18 +297,32 @@ func leaseSlotView(root, groupDir, dir string, n int, device, osVersion string) 
 // device+OS group under root, returning the slot directories it cleared.
 // Guarded by each group's allocation lock so a release can never race a
 // concurrent claim/renewal for the same slot.
+//
+// A slot whose lease.json cannot be read is never guess-removed — we
+// cannot tell whether it is key's own lease or someone else's — but nor
+// does it abort the whole sweep: it is recorded and the scan continues
+// to every other slot, so a transient read failure on one unrelated slot
+// never stops key's lease from being released wherever else it's found.
+// If any such failures occurred, they're returned (joined) alongside
+// whatever was successfully released, so a caller (`simpool release`)
+// can tell the release may be incomplete rather than assuming success.
 func ReleaseLease(root, key string) ([]string, error) {
 	groups, err := ListGroupDirs(root)
 	if err != nil {
 		return nil, err
 	}
 	var released []string
+	var readErrs []error
 	for _, groupDir := range groups {
 		for _, n := range ListSlotNumbers(groupDir) {
 			dir := SlotDir(groupDir, n)
 			var did bool
 			err := withGroupAllocLock(groupDir, func() error {
-				lease := ReadLease(dir)
+				lease, err := ReadLease(dir)
+				if err != nil {
+					readErrs = append(readErrs, fmt.Errorf("%s: %w", dir, err))
+					return nil
+				}
 				if lease.Key != key {
 					return nil
 				}
@@ -286,6 +337,9 @@ func ReleaseLease(root, key string) ([]string, error) {
 			}
 		}
 	}
+	if len(readErrs) > 0 {
+		return released, fmt.Errorf("could not verify %d slot(s)' leases, key %q may still be held there: %w", len(readErrs), key, errors.Join(readErrs...))
+	}
 	return released, nil
 }
 
@@ -299,9 +353,17 @@ func ReleaseLease(root, key string) ([]string, error) {
 // key's claim — IsSlotFree would already report busy — but a same-key
 // renewal never checks the flock at all (see AcquireLease's sticky path),
 // so this is what actually closes that race.
+// A lease.json that fails to re-read here (as opposed to at the caller's
+// earlier check) is reported as an error rather than treated as "gone" or
+// "still expired": the caller (reap) must treat that the same as an alive
+// lease — leave the slot alone — never fall through to idle/cold/purge
+// accounting on the strength of a check that didn't actually complete.
 func CleanupExpiredLease(groupDir, dir string) (removed bool, err error) {
 	err = withGroupAllocLock(groupDir, func() error {
-		lease := ReadLease(dir)
+		lease, rerr := ReadLease(dir)
+		if rerr != nil {
+			return rerr
+		}
 		if lease.Key == "" || lease.Alive() {
 			return nil
 		}

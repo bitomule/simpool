@@ -154,7 +154,15 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			return false, nil // busy
 		}
 
-		if lease := ReadLease(dir); lease.Alive() {
+		if lease, err := ReadLease(dir); err != nil {
+			// Could not verify whether this slot carries a live lease for
+			// someone else (EMFILE, a permission error, a truncated file)
+			// — never read that as "no lease". Quarantine this slot for
+			// this attempt exactly like the poisoned-unverifiable path
+			// below and try the next candidate instead.
+			lock.Release()
+			return false, nil
+		} else if lease.Alive() {
 			// The flock was free, but the slot is currently reserved by a
 			// `simpool lease` holder (see lease.go) — a lease deliberately
 			// never holds the flock, so `with`/`acquire` must consult

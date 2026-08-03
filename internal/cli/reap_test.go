@@ -54,7 +54,7 @@ func TestReapSlot_RemovesDeadNeverProvisionedSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("slot directory %s should have been removed, stat err = %v\nstdout:\n%s\nstderr:\n%s", dir, err, stdout.String(), stderr.String())
@@ -74,7 +74,7 @@ func TestReapSlot_KeepsFreshNeverProvisionedSlotDir(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("fresh slot directory should survive reap, stat err = %v\nstdout:\n%s", err, stdout.String())
@@ -90,7 +90,7 @@ func TestReapSlot_PurgeDisabledKeepsDeadSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("slot directory should survive with --purge disabled, stat err = %v", err)
@@ -106,7 +106,7 @@ func TestReapSlot_DryRunNeverDeletes(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, false, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("--dry-run must not remove the slot directory, stat err = %v", err)
@@ -188,7 +188,7 @@ func TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, &stdout, &stderr)
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, false, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("RECOVER")) {
 		t.Fatalf("reap should RECOVER a slot whose consumer is alive only via a verified ConsumerPGID (no UDID anywhere in argv), got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -236,7 +236,7 @@ func TestReapSlot_SkipsOrphanWithUnverifiableIdentity(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP a slot it cannot verify the identity of, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -246,13 +246,169 @@ func TestReapSlot_SkipsOrphanWithUnverifiableIdentity(t *testing.T) {
 	}
 }
 
+// TestReapSlot_DisownPoisonedFreesAnUnverifiableSlotWithoutKilling is the
+// end-to-end regression test for the "no way out of a permanent
+// quarantine" finding: a `with` slot whose identity can never be verified
+// (here: no fingerprint was ever recorded, mirroring a meta.json predating
+// the feature, or macOS having recycled the pid) stays SKIPped by ordinary
+// `reap` forever — --disown-poisoned is the operator's explicit way out. It
+// must reclaim the slot (meta forgotten) WITHOUT ever signaling the process
+// that poisoned it.
+func TestReapSlot_DisownPoisonedFreesAnUnverifiableSlotWithoutKilling(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+
+	fakeUDID := "simpool-test-udid-disown-cli"
+	if err := pool.WriteMeta(dir, pool.Meta{
+		UDID:         fakeUDID,
+		Mode:         "with",
+		ConsumerPGID: pgid,
+		// Deliberately no ConsumerStartedAt: unverifiable, exactly the
+		// permanent-quarantine case --disown-poisoned exists for.
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
+		t.Fatalf("reap --disown-poisoned should report reclaiming the slot, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !procs.PGIDAlive(pgid) {
+		t.Fatal("--disown-poisoned must never signal the process it disowns — it should still be alive")
+	}
+
+	persisted := pool.ReadMeta(dir)
+	if persisted.ConsumerPGID != 0 || persisted.UDID != "" || persisted.Mode != "" {
+		t.Fatalf("expected the slot's identity to be fully forgotten, got %+v", persisted)
+	}
+}
+
+// TestReapSlot_DisownPoisonedDryRunNeverMutates proves --dry-run still
+// applies to --disown-poisoned: it may report what it would do, but must
+// never actually forget the slot's identity or touch anything.
+func TestReapSlot_DisownPoisonedDryRunNeverMutates(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+
+	fakeUDID := "simpool-test-udid-disown-dry-run"
+	if err := pool.WriteMeta(dir, pool.Meta{
+		UDID:         fakeUDID,
+		Mode:         "with",
+		ConsumerPGID: pgid,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+
+	persisted := pool.ReadMeta(dir)
+	if persisted.ConsumerPGID != pgid || persisted.UDID != fakeUDID {
+		t.Fatalf("--dry-run must never mutate meta, got %+v", persisted)
+	}
+	if !procs.PGIDAlive(pgid) {
+		t.Fatal("process must still be alive")
+	}
+}
+
+// TestReapSlot_DisownPoisonedNeverTouchesLiveLeaseConsumer proves
+// --disown-poisoned respects the exact same restraint as AttemptRecovery: a
+// live process referencing a (TTL-expired) lease's UDID on its own command
+// line is the healthy case, not an orphan, and must never be disowned out
+// from under it even when the caller explicitly asked for
+// --disown-poisoned.
+func TestReapSlot_DisownPoisonedNeverTouchesLiveLeaseConsumer(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The lease itself has already expired (reap must be allowed past the
+	// lease check), but a live process still references the device — the
+	// realistic "hot loop went idle for a bit" case, not an orphan.
+	if err := pool.WriteLease(dir, pool.Lease{Key: "repo-a", ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	token := "simpool-test-udid-disown-live-lease"
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "live_consumer.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\nsleep 300\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	consumer := exec.Command(scriptPath, token)
+	if err := consumer.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := consumer.Process.Pid
+	defer func() { _ = syscall.Kill(pid, syscall.SIGKILL) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		live, _ := procs.LiveConsumers(token)
+		if len(live) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live consumer process never became visible")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := pool.WriteMeta(dir, pool.Meta{UDID: token, Mode: "lease"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, true /*disownPoisoned*/, &stdout, &stderr)
+
+	if bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
+		t.Fatalf("--disown-poisoned must never act on a live lease consumer, got:\n%s", stdout.String())
+	}
+	persisted := pool.ReadMeta(dir)
+	if persisted.UDID != token {
+		t.Fatalf("meta must be untouched, got %+v", persisted)
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the live consumer process must never be touched")
+	}
+}
+
 // TestReapSlot_RecoveryNeverFallsThroughToSamePassPurge is the regression
 // test for the HIGH finding that reapSlot, on a successful recovery, used
 // to fall through into the same pass's idle/cold/--purge accounting instead
 // of returning immediately. AttemptRecovery's simctl.Shutdown call is
-// asynchronous — CoreSimulator does not tear a device down instantly — so
-// a device recovered a fraction of a second earlier can still report
-// "Booted" (or be mid-teardown) when checked again in the same pass; the
+// measured SYNCHRONOUS (5-7.5s wall time to return the device's own
+// reported state, not an async call that returns before the device is
+// really down), but CoreSimulator's own teardown of the device's
+// underlying process tree can still lag a beat behind that state flip; the
 // reverted version of this feature called simctl.Delete on exactly that
 // window, which is the documented catastrophic failure mode (see
 // integration_test.go's cleanupPool and the README): deleting a simulator
@@ -300,7 +456,7 @@ func TestReapSlot_RecoveryNeverFallsThroughToSamePassPurge(t *testing.T) {
 	// --purge 1 (minute): eligible immediately given the backdated LastUsed
 	// above, if reapSlot were to (incorrectly) fall through to that
 	// accounting in this same pass.
-	reapSlot(root, dir, 0, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	out := stdout.String()
 	if !strings.Contains(out, "RECOVER") {
@@ -333,7 +489,7 @@ func TestReapSlot_SkipsSlotWithActiveLease(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP a slot with an active lease, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -341,7 +497,8 @@ func TestReapSlot_SkipsSlotWithActiveLease(t *testing.T) {
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("slot directory with an active lease must survive reap, stat err = %v", err)
 	}
-	if lease := pool.ReadLease(dir); lease.Key != "hot-repo" {
+	lease, _ := pool.ReadLease(dir)
+	if lease.Key != "hot-repo" {
 		t.Fatalf("active lease must be left untouched, got %+v", lease)
 	}
 }
@@ -363,9 +520,10 @@ func TestReapSlot_RemovesExpiredLeaseFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	// purgeMinutes=0 (disabled) so the never-provisioned-slot path leaves
 	// the directory itself alone — this test is only about the lease file.
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
 
-	if lease := pool.ReadLease(dir); lease.Key != "" {
+	lease, _ := pool.ReadLease(dir)
+	if lease.Key != "" {
 		t.Fatalf("expired lease.json should have been removed, got %+v\nstdout:\n%s", lease, stdout.String())
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("expired lease")) {
@@ -387,13 +545,44 @@ func TestReapSlot_DryRunNeverRemovesExpiredLease(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, false, &stdout, &stderr)
 
-	if lease := pool.ReadLease(dir); lease.Key != "old-repo" {
+	lease, _ := pool.ReadLease(dir)
+	if lease.Key != "old-repo" {
 		t.Fatalf("--dry-run must not remove the expired lease, got %+v", lease)
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("would remove expired lease")) {
 		t.Errorf("--dry-run should still report the expired lease it would clean up, got:\n%s", stdout.String())
+	}
+}
+
+// TestReapSlot_UnreadableLeaseIsTreatedAsBusy is the regression test for
+// the "can't verify a lease means busy, not free" fix: reap must never
+// treat an unreadable lease.json as "no lease" and fall through to its
+// idle/poison/--cold/--purge accounting. purgeMinutes and coldMinutes are
+// both wide open here (the slot is old and never-provisioned) — the only
+// thing standing between reap and deleting this slot's directory is that
+// unreadable lease.json, so a regression here would actually purge it.
+func TestReapSlot_UnreadableLeaseIsTreatedAsBusy(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
+	// A directory sitting where lease.json should be forces os.ReadFile to
+	// fail deterministically, standing in for EMFILE/permission/I-O
+	// failures in production.
+	if err := os.MkdirAll(pool.LeasePath(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
+		t.Fatalf("reap should SKIP a slot whose lease.json cannot be read, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("a slot with an unreadable lease.json must survive reap untouched, stat err = %v", err)
 	}
 }
 

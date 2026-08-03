@@ -99,7 +99,7 @@ func TestRunRelease_DropsLeaseImmediately(t *testing.T) {
 	if !bytes.Contains(stdout.Bytes(), []byte("released")) {
 		t.Errorf("expected a \"released\" confirmation, got:\n%s", stdout.String())
 	}
-	if lease := pool.ReadLease(slot.Dir); lease.Key != "" {
+	if lease, _ := pool.ReadLease(slot.Dir); lease.Key != "" {
 		t.Fatalf("lease should be gone after release, got %+v", lease)
 	}
 }

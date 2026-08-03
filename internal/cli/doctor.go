@@ -62,7 +62,14 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 				continue
 			}
 
-			if lease := pool.ReadLease(dir); lease.Alive() && !free {
+			if lease, err := pool.ReadLease(dir); err != nil {
+				// doctor is read-only and diagnostic, not a gate on
+				// handout — surface the failure instead of silently
+				// dropping it (see ReadLease's doc comment on why this
+				// must never be read as "no lease" by a caller that hands
+				// slots out).
+				note("%s: could not read lease.json: %v — treat as occupied until this is resolved", label, err)
+			} else if lease.Alive() && !free {
 				// Should never happen: `with`/`acquire` refuse a slot with
 				// a live lease (see AcquireSlots' take()), and a lease
 				// claim refuses a slot whose flock is held (see

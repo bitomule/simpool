@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -245,13 +246,18 @@ func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 	}
 
 	if meta.UDID != "" && deviceBelongsToSlot(root, meta.UDID, groupName, n) {
-		// Best-effort, and deliberately asynchronous (not waited on here):
-		// EnsureProvisioned boots a fresh device for the next holder
-		// regardless of exactly what state this one is in when handed
-		// over. Callers must never treat a just-recovered slot's device as
-		// already fully "Shutdown" in the same pass — see reap.go's RECOVER
-		// handling, which returns immediately rather than falling through
-		// to same-pass --purge accounting for exactly this reason.
+		// Best-effort: simctl.Shutdown itself is measured SYNCHRONOUS (it
+		// blocks until the device's reported state is genuinely "Shutdown"
+		// — 5-7.5s wall time observed — not the async, returns-immediately
+		// call an earlier version of this comment assumed), so by the time
+		// this line returns the state is already accurate. What is not
+		// waited on here is CoreSimulator's own teardown of the device's
+		// underlying process tree, which can still be settling for a beat
+		// after that state flip. Callers must still never chain an
+		// immediate --purge/delete onto a just-recovered slot in the same
+		// pass — see reap.go's RECOVER handling, which returns immediately
+		// rather than falling through to same-pass --purge accounting for
+		// exactly this reason.
 		//
 		// Gated on deviceBelongsToSlot: see this function's own doc comment
 		// for why meta.UDID alone is never enough grounds to shut anything
@@ -264,4 +270,79 @@ func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 	meta.ConsumerStartedAt = ""
 	_ = WriteMeta(dir, *meta)
 	return true
+}
+
+// ErrNotDisownable is returned by DisownPoisonedSlot when asked to act on a
+// poison reason it must never touch — see DisownPoisonedSlot's own gate.
+var ErrNotDisownable = errors.New("simpool: not eligible for --disown-poisoned")
+
+// DisownPoisonedSlot is the manual, explicit-only escape hatch for a slot
+// that CANNOT be recovered by AttemptRecovery and never will be: meta.
+// ConsumerPGID keeps testing "alive" forever, either because the pid has
+// since been recycled by some unrelated process macOS happened to assign
+// the very same pgid, or because kill(-pgid, 0) fails with EPERM outright —
+// that process group belongs to a different user entirely. Neither case is
+// something VerifyConsumerIdentity's start-time fingerprint can ever
+// resolve (see its own doc comment), so with DefaultMaxSlotsPerGroup a
+// small number, a slot stuck like this is lost for good without some
+// explicit way out.
+//
+// Why forget instead of force-kill: a "--force" flag that just sends
+// SIGKILL despite a failed identity check was considered and rejected.
+// First, it cannot even work for one of the two motivating cases — EPERM
+// means the kernel itself refuses to let us signal that process group, so
+// a kill-based escape hatch would fail on exactly the scenario that most
+// needs one. Second, for the pid-recycle case, VerifyConsumerIdentity's
+// whole reason to exist is that a bare numeric pgid match is never
+// sufficient evidence of identity; a "--force" override would reintroduce
+// precisely the failure mode that check was built to rule out, just with
+// an operator's finger on the trigger instead of AttemptRecovery's. Forgetting
+// — clearing this slot's recorded fingerprint and, if the device is
+// verifiably its own, deleting that device outright so the next
+// acquisition provisions a genuinely new one — recovers the slot without
+// ever gambling on whether the thing behind ConsumerPGID is safe to kill.
+// If it is in fact still running, it is left running, untouched: it is
+// simply no longer simpool's problem, and no longer standing between this
+// slot and reuse. Deleting the old device (not just forgetting its UDID)
+// matters for the same reason EnsureProvisioned's name-based reuse exists:
+// leaving the old device around but unreferenced would either leak it
+// forever (nothing else in simpool inspects device-set contents to find
+// it) or, worse, get silently picked back up by EnsureProvisioned's
+// by-name lookup — right back to a fresh consumer sharing a device with
+// whatever might still be poking at it.
+//
+// Gated exactly like AttemptRecovery's own kill decision (never a kill
+// here, but the same restraint applies to what may be deleted): only a
+// `with`-launched slot (meta.Mode == "with") whose poison reason is
+// PoisonedByConsumerPGID is eligible. PoisonedByLiveConsumers is
+// EXPLICITLY the healthy case for `lease`/`acquire` (a live user session
+// against the device) and must never have its device pulled out from
+// under it; PoisonedByCheckFailure means the liveness check itself never
+// completed, which proves nothing is actually wrong — disowning on the
+// strength of a check that didn't run would be reckless, not an escape
+// hatch. Returns ErrNotDisownable, unchanged, for either.
+//
+// Must only ever be invoked on the caller's explicit, opt-in request
+// (`simpool reap --disown-poisoned`), never automatically — this is not a
+// "we're confident this is safe" recovery like AttemptRecovery, it is a
+// deliberate override an operator reaches for after watching a slot stay
+// quarantined across repeated `reap`/`doctor` runs. Callers must already
+// hold this slot's own flock, exactly like AttemptRecovery's callers.
+func DisownPoisonedSlot(root, dir string, n int, groupName string, meta *Meta, poison Poison) error {
+	if meta.Mode != "with" || poison.Reason != PoisonedByConsumerPGID {
+		return ErrNotDisownable
+	}
+	if meta.UDID != "" && deviceBelongsToSlot(root, meta.UDID, groupName, n) {
+		// Best-effort: shut down then delete outright, verified first
+		// exactly like AttemptRecovery's own shutdown — meta.UDID is
+		// advisory and can be stale or corrupt, so nothing is ever deleted
+		// without deviceBelongsToSlot's exact-name confirmation first.
+		_ = simctl.Shutdown(meta.UDID)
+		_ = simctl.Delete(meta.UDID)
+	}
+	meta.UDID = ""
+	meta.ConsumerPGID = 0
+	meta.ConsumerStartedAt = ""
+	meta.Mode = ""
+	return WriteMeta(dir, *meta)
 }

@@ -55,14 +55,18 @@ set -euo pipefail
 # a stale/corrupt meta.json pointing at a different slot's live simulator is
 # refused (see `deviceBelongsToSlot` in poison.go).
 #
-# This same `simpool with` call also sweeps its whole group for OTHER slots
-# that are idle, unattached, and past a threshold, shutting their simulators
-# down as a side effect of this one's acquisition (see `sweepIdleSiblings`
-# in internal/pool/slot.go) — riding along on the group scan this call
-# already pays for rather than a separate always-on background sweep. A
-# live `simpool lease` (MAV's hot loop) always protects its slot from this,
-# regardless of idle time. `simpool reap --cold N` remains the only path
-# that can shut down THIS run's own slot once it's freed again.
+# There is no automatic idle-simulator sweep anywhere in simpool. An
+# earlier version of this feature shut down OTHER, idle sibling slots as a
+# side effect of this same acquisition, on the assumption that an expired
+# lease reliably proves nobody's using that slot. That assumption was false
+# exactly where it mattered: the TTL keepalive it relied on only runs on
+# MAV's `run` path, never on the one-shot tap/swipe/ui-tree commands the
+# sweep actually had to reason about, so an expired lease only proves no
+# command has run in the last few minutes — routine in an agent's tool
+# loop, not evidence of absence. It was removed. `simpool reap --cold N`,
+# run by a human, cron, or CI, is the only path that shuts down an
+# otherwise-idle slot's simulator — never a side effect of this script's
+# own acquisition.
 if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
   simpool_bin=""
   for candidate in "${SIMPOOL_BIN:-}" /opt/homebrew/bin/simpool /usr/local/bin/simpool; do

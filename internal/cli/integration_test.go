@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -404,6 +405,254 @@ func TestIntegration_ReapRefusesCrossSlotDevice(t *testing.T) {
 	}
 	if entry.Name != name {
 		t.Fatalf("slot-0's device was renamed/altered by reap: got %q, want %q", entry.Name, name)
+	}
+}
+
+// TestIntegration_AcquireRecoveryRefusesCrossSlotShutdown is the mandatory
+// regression test for the HIGH finding that poison.go's AttemptRecovery
+// called simctl.Shutdown(meta.UDID) unconditionally, with no simctl.Find,
+// pool.IsPoolName, or pool.DeviceName check anywhere in the file — reachable
+// from take() (`with`/`acquire`) and claimSlotForLease (`lease`), not just
+// reap's already-guarded RunReap path (see
+// TestIntegration_ReapRefusesCrossSlotDevice above, which covers reap's own,
+// separate guard but never boots a device, so it can't distinguish "never
+// booted" from "correctly left alone").
+//
+// A stale or corrupt meta.json (tolerated by design, §6) whose UDID names a
+// DIFFERENT slot's live, booted device, combined with a genuinely
+// verifiable ConsumerPGID fingerprint for THIS slot, used to kill the
+// verified orphan (correct) AND unconditionally shut down the other slot's
+// simulator out from under whoever was using it (not correct — this is the
+// exact scenario a stale UDID plus a real orphan produces). Reproduced here
+// by planting slot-1's meta.json with a genuine, verified orphan pgid but
+// slot-0's real, booted device UDID, then acquiring through the actual
+// `with` binary (not just calling AttemptRecovery directly) so the whole
+// take() -> AttemptRecovery -> EnsureProvisioned path is exercised.
+func TestIntegration_AcquireRecoveryRefusesCrossSlotShutdown(t *testing.T) {
+	requireIntegration(t)
+	bin := buildSimpool(t)
+	home := t.TempDir()
+	t.Cleanup(func() { cleanupPool(t, home) })
+	env := append(os.Environ(), "SIMPOOL_HOME="+home)
+
+	// Slot-0's device: created and booted directly via simctl, never through
+	// a slot-0 directory simpool itself knows about — standing in for
+	// "another slot's live simulator, or one of a developer's own" that a
+	// corrupt meta.json in a different slot happens to reference.
+	runtimeID, deviceTypeID, err := simctl.ResolveRuntime(testDevice, testOS)
+	if err != nil {
+		t.Fatalf("resolving runtime: %v", err)
+	}
+	slot0Name := pool.DeviceName(home, testDevice, testOS, 0)
+	slot0UDID, err := simctl.Create(slot0Name, deviceTypeID, runtimeID)
+	if err != nil {
+		t.Fatalf("creating slot-0's device: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = simctl.Shutdown(slot0UDID)
+		waitForShutdown(slot0UDID, 10*time.Second)
+		_ = simctl.Delete(slot0UDID)
+	})
+	if err := simctl.Boot(slot0UDID); err != nil {
+		t.Fatalf("booting slot-0's device: %v", err)
+	}
+
+	// A real, verified orphan for slot-1: a process in its own group,
+	// fingerprinted exactly the way `simpool with` fingerprints its own
+	// child (see with.go) — genuinely killable, so recovery succeeds for the
+	// right reason (the process, not the device check) and this test can
+	// isolate the device-identity guard specifically.
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+	go func() { _ = orphan.Wait() }()
+	startedAt, err := procs.ProcessStartTime(pgid)
+	if err != nil {
+		t.Fatalf("fingerprinting orphan: %v", err)
+	}
+
+	groupDir := pool.GroupDir(home, testDevice, testOS)
+	slot1Dir := pool.SlotDir(groupDir, 1)
+	if err := os.MkdirAll(slot1Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(slot1Dir, pool.Meta{
+		Device:            testDevice,
+		OSVersion:         testOS,
+		UDID:              slot0UDID, // slot-0's device, not slot-1's — the corruption
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: startedAt,
+		LastUsed:          time.Now().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only slot-1's directory exists, so `with --count 1` tries (and must
+	// recover) exactly that slot.
+	acquire := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "true")
+	acquire.Env = env
+	if out, err := acquire.CombinedOutput(); err != nil {
+		t.Fatalf("simpool with failed: %v\n%s", err, out)
+	}
+
+	// The verified orphan must have been killed — recovery happened.
+	deadline := time.Now().Add(2 * time.Second)
+	for procs.PGIDAlive(pgid) {
+		if time.Now().After(deadline) {
+			t.Fatal("the verified orphan should have been killed by recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Slot-0's device — cross-slot, only nominally referenced by slot-1's
+	// corrupt meta.json — must be completely untouched: still booted, still
+	// named exactly what it was created as.
+	entry, found, err := simctl.Find(slot0UDID)
+	if err != nil || !found {
+		t.Fatalf("slot-0's device should still exist: found=%v err=%v", found, err)
+	}
+	if entry.Name != slot0Name {
+		t.Fatalf("slot-0's device was renamed/altered: got %q, want %q", entry.Name, slot0Name)
+	}
+	if entry.State != "Booted" {
+		t.Fatalf("recovering slot-1's orphan must never shut down slot-0's device — got state=%q, want Booted", entry.State)
+	}
+}
+
+// TestIntegration_AcquireSweepsIdleSiblingSimulator is the positive case for
+// idle-shutdown-on-acquire (simpool.go TRABAJO 2): acquiring a slot rides
+// along on the group scan `with`/`acquire` already pays for to shut down any
+// OTHER slot's simulator in the same group that is genuinely idle and
+// unattached — free flock, no live lease, not poisoned, idle past
+// IdleShutdownThreshold. meta.LastUsed is backdated directly (not a real
+// 5-minute wait) since the mechanism's safety never depends on the exact
+// threshold value, only on everything else genuinely being true.
+func TestIntegration_AcquireSweepsIdleSiblingSimulator(t *testing.T) {
+	requireIntegration(t)
+	bin := buildSimpool(t)
+	home := t.TempDir()
+	t.Cleanup(func() { cleanupPool(t, home) })
+	env := append(os.Environ(), "SIMPOOL_HOME="+home)
+
+	// Provision + boot slot-0 via a throwaway `with`, then let it sit idle.
+	warm := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "true")
+	warm.Env = env
+	if out, err := warm.CombinedOutput(); err != nil {
+		t.Fatalf("warm-up simpool with failed: %v\n%s", err, out)
+	}
+
+	groupDir := pool.GroupDir(home, testDevice, testOS)
+	slot0Dir := pool.SlotDir(groupDir, 0)
+	meta0 := pool.ReadMeta(slot0Dir)
+	if meta0.UDID == "" {
+		t.Fatal("warm-up did not leave slot-0 provisioned")
+	}
+	meta0.LastUsed = time.Now().Add(-2 * pool.IdleShutdownThreshold)
+	if err := pool.WriteMeta(slot0Dir, meta0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-create slot-1 with a fresher LastUsed so the next acquisition's
+	// most-recently-used-first ordering lands THERE, not on slot-0 — slot-0
+	// must remain free and untouched by the acquisition itself, a true
+	// sibling for the sweep to act on.
+	slot1Dir := pool.SlotDir(groupDir, 1)
+	if err := os.MkdirAll(slot1Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(slot1Dir, pool.Meta{Device: testDevice, OSVersion: testOS, LastUsed: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	acquire := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "true")
+	acquire.Env = env
+	if out, err := acquire.CombinedOutput(); err != nil {
+		t.Fatalf("simpool with (idle sweep target) failed: %v\n%s", err, out)
+	}
+
+	// Confirm the acquisition actually landed on slot-1 — otherwise this
+	// test isn't exercising the sibling-sweep path at all, only a no-op.
+	meta1 := pool.ReadMeta(slot1Dir)
+	if meta1.UDID == "" {
+		t.Fatal("test setup broken: acquisition did not land on slot-1")
+	}
+
+	waitForShutdown(meta0.UDID, 10*time.Second)
+	state, found, err := simctl.State(meta0.UDID)
+	if err != nil || !found {
+		t.Fatalf("slot-0's device disappeared: found=%v err=%v", found, err)
+	}
+	if state != "Shutdown" {
+		t.Fatalf("acquiring slot-1 should have shut down idle, unattached slot-0's simulator as a side effect; got state=%q", state)
+	}
+}
+
+// TestIntegration_AcquireNeverSweepsLeasedSibling is the critical negative
+// case for idle-shutdown-on-acquire: a slot held by a live `simpool lease`
+// never holds the flock (see lease.go), so without an explicit lease check
+// the sweep would treat an actively hot-looped MAV session exactly like any
+// other idle free slot and shut down its simulator out from under it — this
+// is precisely the failure mode that sank an earlier attempt at automatic
+// shutdown (see README). meta.LastUsed is backdated past
+// IdleShutdownThreshold to prove the lease alone — not idleness — is what's
+// protecting the device.
+func TestIntegration_AcquireNeverSweepsLeasedSibling(t *testing.T) {
+	requireIntegration(t)
+	bin := buildSimpool(t)
+	home := t.TempDir()
+	t.Cleanup(func() { cleanupPool(t, home) })
+	env := append(os.Environ(), "SIMPOOL_HOME="+home)
+
+	warm := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "true")
+	warm.Env = env
+	if out, err := warm.CombinedOutput(); err != nil {
+		t.Fatalf("warm-up simpool with failed: %v\n%s", err, out)
+	}
+
+	groupDir := pool.GroupDir(home, testDevice, testOS)
+	slot0Dir := pool.SlotDir(groupDir, 0)
+	meta0 := pool.ReadMeta(slot0Dir)
+	if meta0.UDID == "" {
+		t.Fatal("warm-up did not leave slot-0 provisioned")
+	}
+	meta0.LastUsed = time.Now().Add(-2 * pool.IdleShutdownThreshold)
+	if err := pool.WriteMeta(slot0Dir, meta0); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(slot0Dir, pool.Lease{Key: "hot-repo", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	slot1Dir := pool.SlotDir(groupDir, 1)
+	if err := os.MkdirAll(slot1Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(slot1Dir, pool.Meta{Device: testDevice, OSVersion: testOS, LastUsed: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	acquire := exec.Command(bin, "with", "--device", testDevice, "--os", testOS, "--count", "1", "--", "true")
+	acquire.Env = env
+	if out, err := acquire.CombinedOutput(); err != nil {
+		t.Fatalf("simpool with (idle sweep target) failed: %v\n%s", err, out)
+	}
+
+	meta1 := pool.ReadMeta(slot1Dir)
+	if meta1.UDID == "" {
+		t.Fatal("test setup broken: acquisition did not land on slot-1")
+	}
+
+	state, found, err := simctl.State(meta0.UDID)
+	if err != nil || !found {
+		t.Fatalf("slot-0's device disappeared: found=%v err=%v", found, err)
+	}
+	if state != "Booted" {
+		t.Fatalf("a slot with a live lease must never be swept even if idle past the threshold — got state=%q, want Booted", state)
 	}
 }
 

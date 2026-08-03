@@ -305,6 +305,40 @@ func TestDescendants_SingleSnapshotCall(t *testing.T) {
 	}
 }
 
+// TestDescendants_CyclicSnapshotDoesNotOverflow is the regression test for
+// the finding that Descendants' walk had no visited-set: a well-formed
+// process tree can never contain a cycle (nothing is its own ancestor), but
+// this snapshot comes from parsing `ps` output, not from a source that
+// enforces that invariant — a malformed or racily-read snapshot must not be
+// able to turn a bounded exclusion-set walk into unbounded recursion.
+// Reproduced directly with the exact two-line snapshot that crashed the
+// process with an uncatchable stack overflow before the seen-map guard
+// existed: "10 20\n20 10\n" (pid 10's parent is 20, and pid 20's parent is
+// 10). Without the guard, `go test -run TestDescendants_CyclicSnapshotDoesNotOverflow`
+// itself never returns — it crashes the whole test binary.
+func TestDescendants_CyclicSnapshotDoesNotOverflow(t *testing.T) {
+	orig := processSnapshotFunc
+	defer func() { processSnapshotFunc = orig }()
+
+	processSnapshotFunc = func() ([]byte, error) {
+		return []byte("10 20\n20 10\n"), nil
+	}
+
+	done := make(chan []int, 1)
+	go func() { done <- Descendants(10) }()
+
+	select {
+	case got := <-done:
+		// tree[10] = [20], tree[20] = [10]; walking from 10 visits 20 once,
+		// then refuses to revisit 10 (already seen) — exactly one descendant.
+		if len(got) != 1 || got[0] != 20 {
+			t.Fatalf("Descendants(10) on a 2-cycle = %v, want exactly [20]", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Descendants did not return within 3s on a cyclic snapshot — the visited-set guard regressed")
+	}
+}
+
 // TestProcessStartTime_StableAcrossAmbientLocaleAndTZ is the regression
 // test for the CRITICAL finding: an earlier, reverted version of this
 // feature fingerprinted a process via a rendering (`sysctl kern.boottime`'s
@@ -346,6 +380,57 @@ func TestProcessStartTime_StableAcrossAmbientLocaleAndTZ(t *testing.T) {
 		if got != first {
 			t.Fatalf("ProcessStartTime is sensitive to the calling process's ambient TZ/LC_ALL: TZ=%s LC_ALL=%s got %q, want %q (same instant as the first call)", e.tz, e.lc, got, first)
 		}
+	}
+}
+
+// TestProcessStartTime_IgnoresAmbientPATH is the regression test for the
+// finding that ProcessStartTime set PATH=/bin:/usr/bin in cmd.Env but still
+// invoked the bare name "ps" — exec.Command resolves a bare name against
+// the *calling* process's own ambient $PATH (via exec.LookPath) before
+// cmd.Env is ever consulted, so cmd.Env's PATH only ever hardens what the
+// child sees, never which binary actually gets resolved and executed. A
+// malicious or merely careless ambient PATH with an earlier "ps" could
+// substitute a fake binary that fabricates whatever start-time string it
+// likes, defeating the exact fingerprint this function exists to produce
+// trustworthy output for. Reproduced directly here: a fake "ps" placed
+// first on the test's own ambient PATH always prints a fixed, wrong lstart
+// string regardless of which pid it's asked about — if ProcessStartTime
+// ever resolved against ambient PATH instead of the hardcoded /bin/ps, this
+// test would observe that wrong string instead of the real one.
+func TestProcessStartTime_IgnoresAmbientPATH(t *testing.T) {
+	cmd := exec.Command("sleep", "10")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	go func() { _ = cmd.Wait() }()
+	pid := cmd.Process.Pid
+	waitUntil(t, 3*time.Second, func() bool { return Alive(pid) })
+
+	want, err := ProcessStartTime(pid)
+	if err != nil {
+		t.Fatalf("ProcessStartTime under the real PATH: %v", err)
+	}
+
+	fakeDir := t.TempDir()
+	fakePS := writeScript(t, fakeDir, "ps", `echo "Thu Jan  1 00:00:00 1970"`)
+	if err := os.Chmod(fakePS, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Sanity check the fake actually shadows "ps" for a bare exec.Command
+	// lookup — otherwise this test would pass for the wrong reason.
+	if out, err := exec.Command("ps").Output(); err != nil || strings.TrimSpace(string(out)) != "Thu Jan  1 00:00:00 1970" {
+		t.Fatalf("test setup broken: fake ps did not shadow the real one on PATH, got %q err=%v", out, err)
+	}
+
+	got, err := ProcessStartTime(pid)
+	if err != nil {
+		t.Fatalf("ProcessStartTime with a fake ps shadowing PATH: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ProcessStartTime resolved against ambient PATH instead of /bin/ps: got %q, want %q (the real /bin/ps output)", got, want)
 	}
 }
 

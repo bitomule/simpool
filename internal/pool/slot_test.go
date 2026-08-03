@@ -8,21 +8,33 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/bitomule/simpool/internal/procs"
 )
 
-// TestHelperAcquire is the re-exec'd helper for TestAcquireSlotsTwoRealProcesses.
-// It calls the real allocation path (AcquireSlots) — no simctl involved —
-// and reports which slot number it landed on, then blocks holding the
-// lock until killed.
+// TestHelperAcquire is the re-exec'd helper for TestAcquireSlotsTwoRealProcesses
+// and TestAcquireSlots_RecoversPoisonedSlotExactlyOnce. It calls the real
+// allocation path (AcquireSlots) — no simctl involved — and reports which
+// slot number it landed on, then blocks holding the lock until killed.
+// SIMPOOL_HELPER_MAX optionally overrides --max (default
+// DefaultMaxSlotsPerGroup) so a test can force two helpers to actually
+// contend for the same slot instead of each landing on its own free one.
 func TestHelperAcquire(t *testing.T) {
 	if os.Getenv("SIMPOOL_HELPER_ACQUIRE") != "1" {
 		return
 	}
 	root := os.Getenv("SIMPOOL_HELPER_ROOT")
-	slots, err := AcquireSlots(root, "TestDevice", "1.0", 1, DefaultMaxSlotsPerGroup, 0)
+	max := DefaultMaxSlotsPerGroup
+	if v := os.Getenv("SIMPOOL_HELPER_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			max = n
+		}
+	}
+	slots, err := AcquireSlots(root, "TestDevice", "1.0", 1, max, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stdout, "ERROR %v\n", err)
 		os.Exit(1)
@@ -335,5 +347,170 @@ func TestAcquirePrefersMostRecentlyUsedSlot(t *testing.T) {
 
 	if slots[0].Number != 1 {
 		t.Fatalf("expected the most recently used slot (1), got slot-%d", slots[0].Number)
+	}
+}
+
+// TestAcquireSlots_RecoversVerifiedOrphanInstead is the regression test for
+// AcquireSlots' take() now reclaiming a poisoned slot instead of only ever
+// quarantining it: a real orphan process (mirroring with.go's Setpgid
+// child), fingerprinted the way `simpool with` fingerprints its own child,
+// must be killed and the slot handed to the new acquirer at max=1 — where,
+// before this feature existed, this would deterministically return
+// ErrAtCapacity (see TestAcquireSlots_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv
+// above, which still proves the unverifiable-identity case still refuses).
+func TestAcquireSlots_RecoversVerifiedOrphanInstead(t *testing.T) {
+	root := t.TempDir()
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	slotDir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+	go func() { _ = orphan.Wait() }() // see poison_test.go's spawnRealOrphan
+
+	startedAt, err := procs.ProcessStartTime(pgid)
+	if err != nil {
+		t.Fatalf("capturing orphan's start time: %v", err)
+	}
+	if err := WriteMeta(slotDir, Meta{
+		UDID:              "simpool-test-udid-recover-instead",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: startedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	slots, err := AcquireSlots(root, "TestDevice", "1.0", 1, 1, 0)
+	if err != nil {
+		t.Fatalf("acquire with a verified, recoverable orphan at max=1: want success, got %v", err)
+	}
+	defer slots[0].Release()
+	if slots[0].Number != 0 {
+		t.Fatalf("expected the recovered slot-0 to be reused, got slot-%d", slots[0].Number)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if !procs.PGIDAlive(pgid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the orphan process group should have been killed by recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAcquireSlots_RecoversPoisonedSlotExactlyOnce extends the
+// TestHelperAcquire real-process pattern (see TestAcquireSlotsTwoRealProcesses
+// above) with a poisoned slot: two independent OS processes race
+// AcquireSlots against a group with exactly one slot, already poisoned by a
+// verifiably-identified SIGKILL orphan (a real process, correct fingerprint,
+// Mode "with"). Recovery must happen exactly once — the winner reclaims the
+// slot and the loser fails with ErrAtCapacity — never both succeeding (two
+// consumers on one simulator) and never both failing (a recoverable slot
+// going unclaimed). max=1 via SIMPOOL_HELPER_MAX forces real contention over
+// the same slot number instead of each helper landing on its own free one.
+func TestAcquireSlots_RecoversPoisonedSlotExactlyOnce(t *testing.T) {
+	root := t.TempDir()
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	slotDir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+	go func() { _ = orphan.Wait() }() // reap on death — see poison_test.go's spawnRealOrphan
+
+	startedAt, err := procs.ProcessStartTime(pgid)
+	if err != nil {
+		t.Fatalf("capturing orphan's start time: %v", err)
+	}
+	if err := WriteMeta(slotDir, Meta{
+		UDID:              "simpool-test-udid-concurrency",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: startedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	spawn := func() (*exec.Cmd, *bufio.Scanner) {
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperAcquire")
+		cmd.Env = append(os.Environ(),
+			"SIMPOOL_HELPER_ACQUIRE=1",
+			"SIMPOOL_HELPER_ROOT="+root,
+			"SIMPOOL_HELPER_MAX=1",
+		)
+		cmd.Stderr = os.Stderr
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return cmd, bufio.NewScanner(stdout)
+	}
+
+	procA, scanA := spawn()
+	procB, scanB := spawn()
+
+	readLine := func(t *testing.T, sc *bufio.Scanner) string {
+		t.Helper()
+		if !sc.Scan() {
+			t.Fatalf("helper produced no output: %v", sc.Err())
+		}
+		return sc.Text()
+	}
+
+	resA := readLine(t, scanA)
+	resB := readLine(t, scanB)
+
+	slotWinners, errWinners := 0, 0
+	for _, res := range []string{resA, resB} {
+		switch {
+		case strings.HasPrefix(res, "SLOT "):
+			slotWinners++
+		case strings.HasPrefix(res, "ERROR "):
+			errWinners++
+		default:
+			t.Fatalf("unexpected helper output %q", res)
+		}
+	}
+	if slotWinners != 1 || errWinners != 1 {
+		t.Fatalf("expected exactly one winner and one ErrAtCapacity loser, got A=%q B=%q", resA, resB)
+	}
+
+	// Clean up whichever process won and is now holding the lock; the loser
+	// already exited on its own.
+	_ = procA.Process.Kill()
+	_ = procA.Wait()
+	_ = procB.Process.Kill()
+	_ = procB.Wait()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if !procs.PGIDAlive(pgid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the original orphan process group should have been killed by whichever process recovered the slot")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

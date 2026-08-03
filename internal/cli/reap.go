@@ -20,8 +20,12 @@ import (
 // free and idle, bidirectionally:
 //
 //  1. lock free, but the simulator still has a live external process
-//     attached (e.g. simpool was SIGKILLed but its child survived) -> leave
-//     alone, never touch a simulator that might be in active use.
+//     attached (e.g. simpool was SIGKILLed but its child survived) -> if
+//     that process is a verified `with`-spawned orphan (its recorded
+//     start-time fingerprint still matches — see pool.AttemptRecovery),
+//     kill it and shut down the simulator, reclaiming the slot; otherwise
+//     (unverifiable identity, or a kill that doesn't stick) leave it alone
+//     and let a later `reap` or the next acquisition retry.
 //  2. lock held, but only by a residual `simpool with` whose actual
 //     consumer already exited out from under it -> kill that one process;
 //     the kernel releases the flock on its own. `simpool acquire` holders
@@ -109,25 +113,35 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	pruneRunDirs(dir, label, pruneRunsAfter, dryRun, stdout, stderr)
 
 	meta := pool.ReadMeta(dir)
-	if meta.UDID != "" {
-		poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
-		if !poisoned {
-			if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
-				poisoned = true
-			}
-		}
-		if poisoned {
-			// meta.ConsumerPGID (checked first) catches a consumer whose
-			// only trace is an environment variable (MAV_TARGET_UDID,
-			// SIMPOOL_UDID_N) rather than anything in its own argv — which
-			// is exactly how simpool hands off a simulator (§5), and
-			// exactly what a pgrep-based check on the UDID alone cannot
-			// see. LiveConsumers remains as a second signal for slots with
-			// no recorded PGID (e.g. `acquire` mode, or meta.json
-			// predating this field).
-			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s) — not touching\n", label, meta.UDID)
+	if poison := pool.CheckPoison(meta); poison.Poisoned() {
+		if dryRun {
+			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery\n", label, meta.UDID, poison)
 			return
 		}
+		if pool.AttemptRecovery(dir, &meta, poison) {
+			// Only ever true for a verified `with`-spawned orphan (see
+			// AttemptRecovery) — never for a LiveConsumers-only signal,
+			// which for a leased slot is the healthy case, not an orphan,
+			// and never for a failed liveness check.
+			fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
+			// Return immediately: AttemptRecovery's simctl.Shutdown call is
+			// asynchronous (CoreSimulator does not tear a device down
+			// instantly), so the device may still report "Booted" — or be
+			// mid-teardown — for up to roughly a second afterward. Falling
+			// through to this same pass's idle/cold/--purge accounting
+			// below (a real, reverted regression: it once called
+			// simctl.Delete on a device only ~0.8s past its shutdown
+			// request) is exactly the catastrophic failure mode
+			// cleanupPool's test-cleanup comment documents — deleting a
+			// simulator before its process tree has finished tearing down
+			// orphans hundreds of runtime processes. A later `reap` run
+			// will see the device's actual settled state (Booted, still
+			// mid-teardown, or genuinely Shutdown) and act on it then,
+			// exactly like the ordinary SHUT case above.
+			return
+		}
+		fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — could not verify its identity, not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, meta.UDID, poison)
+		return
 	}
 
 	idle := 999999 * time.Hour

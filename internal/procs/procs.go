@@ -4,7 +4,9 @@
 package procs
 
 import (
+	"bufio"
 	"bytes"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -20,11 +22,24 @@ func Alive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+// pgrepFunc runs `pgrep -f needle` and returns its raw stdout. A package
+// variable, not a hardcoded exec.Command call, so tests can deterministically
+// simulate the kind of failure a loaded machine can genuinely produce (pgrep
+// itself failing to fork under memory/process-table pressure) — something
+// otherwise close to impossible to reproduce on demand.
+var pgrepFunc = func(needle string) ([]byte, error) {
+	return exec.Command("pgrep", "-f", needle).Output()
+}
+
 // MatchingPIDs returns the PIDs of live processes whose command line
 // contains needle (via `pgrep -f`). Used to detect orphaned consumers
 // (e.g. `simctl spawn <udid> log stream`) referencing a simulator's UDID.
+// An error here is a genuine "could not check" (pgrep itself failed to
+// run), not "no matches" (exit code 1, which pgrep uses for that and is
+// deliberately not an error) — callers (see pool.CheckPoison) must treat
+// it as "assume busy", never as "assume free".
 func MatchingPIDs(needle string) ([]int, error) {
-	out, err := exec.Command("pgrep", "-f", needle).Output()
+	out, err := pgrepFunc(needle)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return nil, nil // pgrep: no matches
@@ -102,22 +117,71 @@ func Kill(pid int, sig syscall.Signal) error {
 	return nil
 }
 
+// processSnapshotFunc fetches every live process's (pid, ppid) pair in one
+// call. A package variable so tests can inject a synthetic tree without
+// spawning hundreds of real child processes to prove the traversal logic.
+var processSnapshotFunc = func() ([]byte, error) {
+	return exec.Command("ps", "-axo", "pid=,ppid=").Output()
+}
+
+// processTree parses `ps -axo pid=,ppid=` into a parent -> direct-children
+// map for every process on the host, in a single subprocess call regardless
+// of how many processes exist.
+//
+// Descendants used to recurse via ChildPIDs, forking one `pgrep -P` per
+// process in the subtree — measured at ~8.5s wall time for a single
+// LiveConsumers call against a booted iOS 26.3 simulator (281 direct
+// children of launchd_sim, each triggering its own recursive pgrep), pure
+// fork/exec overhead rather than CPU work. A single snapshot plus an
+// in-memory walk turns that into one subprocess call total; the same
+// snapshot benchmark after this change measures well under 100ms.
+func processTree() (map[int][]int, error) {
+	out, err := processSnapshotFunc()
+	if err != nil {
+		return nil, err
+	}
+	tree := map[int][]int{}
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) != 2 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		tree[ppid] = append(tree[ppid], pid)
+	}
+	return tree, sc.Err()
+}
+
 // Descendants returns every PID transitively spawned by pid (children,
-// grandchildren, ...), best-effort: a pgrep failure partway through just
-// truncates the results rather than failing the whole call, since this is
+// grandchildren, ...), best-effort: a snapshot failure just yields nil (an
+// empty exclusion set) rather than failing the whole call, since this is
 // only ever used to build an exclusion set, not a safety-critical list.
 func Descendants(pid int) []int {
-	var out []int
-	children, err := ChildPIDs(pid)
+	tree, err := processTree()
 	if err != nil {
-		return out
+		return nil
 	}
-	for _, c := range children {
-		out = append(out, c)
-		out = append(out, Descendants(c)...)
+	var out []int
+	var walk func(int)
+	walk = func(p int) {
+		for _, c := range tree[p] {
+			out = append(out, c)
+			walk(c)
+		}
 	}
+	walk(pid)
 	return out
 }
+
+// killFunc wraps syscall.Kill so tests can deterministically simulate a
+// signal-delivery failure (EPERM: the process group exists but isn't ours
+// to signal) that is otherwise not reliably reproducible on demand.
+var killFunc = syscall.Kill
 
 // PGIDAlive reports whether any process still belongs to process group pgid,
 // via kill(-pgid, 0): the kernel delivers a null signal to every member of
@@ -127,11 +191,23 @@ func Descendants(pid int) []int {
 // variable (MAV_TARGET_UDID, SIMPOOL_UDID_N) rather than anything visible in
 // `ps`, which is exactly how simpool hands off a simulator (see design doc
 // §5) and therefore exactly the case a pgrep-based check cannot see.
+//
+// Any error other than ESRCH (most notably EPERM: the group exists but the
+// caller lacks permission to signal it) is treated as "still alive" — a
+// check that could not positively confirm the group is gone must fail
+// toward "busy, don't touch", never toward "free, hand it out".
 func PGIDAlive(pgid int) bool {
 	if pgid <= 0 {
 		return false
 	}
-	return syscall.Kill(-pgid, 0) == nil
+	err := killFunc(-pgid, 0)
+	if err == nil {
+		return true
+	}
+	if err == syscall.ESRCH {
+		return false
+	}
+	return true
 }
 
 // LiveConsumers returns the PIDs of live host processes that reference udid
@@ -204,4 +280,53 @@ func CommandLine(pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// startTimeEnv is the fixed, locale/timezone-independent environment
+// ProcessStartTime always runs `ps` under — never the caller's ambient
+// environment.
+//
+// This exists to fix a critical bug in an earlier, reverted version of
+// this feature: it fingerprinted a process via the *whole line* of
+// `sysctl kern.boottime`, which macOS renders as a date in whatever TZ
+// (and formatted per whatever LC_ALL/LANG) the invoking process happens to
+// have — measured directly: the exact same boot produced
+// "... Fri Jul 31 09:51:34 2026" under TZ=UTC and
+// "... Fri Jul 31 18:51:34 2026" under TZ=Asia/Tokyo. A strict string
+// comparison of two renderings of the same instant, captured under two
+// different ambient environments, reads as "these differ" — and in that
+// design, the differing branch was the destructive one. `ps -o lstart=`
+// (used here) has the exact same weakness — confirmed separately: it is
+// sensitive to both TZ and LC_ALL (LC_ALL=es_ES renders a Spanish month
+// name). Forcing one fixed environment on every invocation — not just
+// recording "whatever the ambient environment happened to be" — is what
+// makes the output stable and comparable by plain string equality,
+// regardless of what TZ/LC_ALL/LANG look like wherever this is called
+// from, at either the recording end or the verifying end.
+var startTimeEnv = []string{"TZ=UTC0", "LC_ALL=C", "LANG=C", "PATH=/bin:/usr/bin"}
+
+// ProcessStartTime returns pid's start time (`ps -o lstart=`, rendered
+// under a fixed environment — see startTimeEnv), for identity verification
+// before a poisoned slot's recovery is allowed to kill anything: macOS
+// recycles pids, so a live process under a recorded pgid is not by itself
+// proof it's the same process that was recorded — this must match exactly
+// first. The returned string is opaque: it is never parsed, only ever
+// compared for equality against a value recorded earlier the same way (see
+// pool.Meta.ConsumerStartedAt). Errors (no such process) are returned, not
+// swallowed — the caller must treat "can't verify" as "don't kill".
+func ProcessStartTime(pid int) (string, error) {
+	if pid <= 0 {
+		return "", fmt.Errorf("invalid pid %d", pid)
+	}
+	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	cmd.Env = startTimeEnv
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return "", fmt.Errorf("no such process %d", pid)
+	}
+	return s, nil
 }

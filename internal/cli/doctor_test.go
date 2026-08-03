@@ -14,11 +14,12 @@ import (
 
 // TestRunDoctor_FlagsSlotWithLivePGIDEvenWithoutUDIDInArgv is the doctor-side
 // counterpart to reap_test.go's
-// TestReapSlot_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv: doctor.go
-// duplicates the exact same poisoned-slot check (meta.ConsumerPGID via
+// TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv: doctor.go uses
+// the same pool.CheckPoison predicate (meta.ConsumerPGID via
 // procs.PGIDAlive, falling back to procs.LiveConsumers's pgrep-based scan
 // only when there's no recorded pgid) and must not silently diverge from
-// it. A consumer that only ever receives its UDID by environment variable
+// it — though unlike reap, doctor never attempts recovery, only reports.
+// A consumer that only ever receives its UDID by environment variable
 // (MAV_TARGET_UDID, SIMPOOL_UDID_N — simpool's own handoff contract, design
 // doc §5, and exactly how `mav run` receives it) must still be flagged by
 // `simpool doctor`, not just missed.

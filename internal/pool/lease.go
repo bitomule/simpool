@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
-
-	"github.com/bitomule/simpool/internal/procs"
 )
 
 // DefaultLeaseTTL is how long `simpool lease` reserves a slot for its key
@@ -200,31 +198,44 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 
 // claimSlotForLease writes a fresh lease for key into dir if — and only
 // if — dir is currently free for handout: its flock is uncontended, it
-// carries no live lease for a different key, and (mirroring
-// AcquireSlots' take()) its previous consumer isn't a poisoned orphan
-// left behind by a SIGKILL to `simpool` itself. Must be called from
-// inside the group allocation lock (see AcquireLease).
+// carries no live lease for a different key, and (mirroring AcquireSlots'
+// take()) its previous consumer isn't a poisoned orphan left behind by a
+// SIGKILL to `simpool` itself — or, if it was, that it can be verified and
+// reclaimed (see AttemptRecovery). Must be called from inside the group
+// allocation lock (see AcquireLease): that lock already serializes this
+// function's whole scan-and-claim sequence against a concurrent take()
+// (which itself re-acquires the very same allocation lock, once per
+// candidate slot, for its own mkdir+TryLock step — see tryAcquireSlots),
+// so the two can never interleave inside either one's critical section.
+//
+// This additionally takes the slot's own flock across the whole
+// free-check + poison-check + possible-recovery + lease-write sequence
+// (released again before returning, since a live lease deliberately never
+// holds it long-term — see the Lease doc comment), mirroring take()'s own
+// lock-then-mutate pattern exactly. The allocation lock above is already
+// sufficient exclusion against take() specifically; holding the flock too
+// is what additionally makes this safe against any *other* caller that
+// only takes the slot's own flock without the allocation lock — which is
+// deliberately how AttemptRecovery's callers are documented to serialize
+// against each other (see poison.go) — rather than leaving this the one
+// caller of AttemptRecovery that doesn't.
 func claimSlotForLease(dir, key string, ttl time.Duration) (bool, error) {
-	free, err := IsSlotFree(dir)
+	lock, err := TryLock(lockPath(dir))
 	if err != nil {
+		if err == ErrBusy {
+			return false, nil
+		}
 		return false, err
 	}
-	if !free {
-		return false, nil
-	}
+	defer lock.Release()
+
 	if lease := ReadLease(dir); lease.Alive() {
 		return false, nil
 	}
 
 	meta := ReadMeta(dir)
-	if meta.UDID != "" {
-		poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
-		if !poisoned {
-			if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
-				poisoned = true
-			}
-		}
-		if poisoned {
+	if poison := CheckPoison(meta); poison.Poisoned() {
+		if !AttemptRecovery(dir, &meta, poison) {
 			return false, nil
 		}
 	}

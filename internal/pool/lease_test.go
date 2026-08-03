@@ -3,9 +3,13 @@ package pool
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/bitomule/simpool/internal/procs"
 )
 
 // TestDefaultLeaseTTL_IsShortEnoughToRotateASmallPool pins DefaultLeaseTTL
@@ -271,5 +275,118 @@ func TestReleaseLease(t *testing.T) {
 	}
 	if len(released) != 0 {
 		t.Fatalf("release of an unknown key should report nothing released, got %v", released)
+	}
+}
+
+// TestAcquireLease_RecoversVerifiedOrphanLeftByWith proves `simpool lease`
+// can reclaim a slot left poisoned by a `with` session that got SIGKILLed —
+// not just `with`/`acquire`'s own take(): whichever caller happens to be
+// the next one to touch a poisoned slot must be able to recover it, cross-
+// mode. AttemptRecovery still gates on the *previous* consumer's own
+// recorded Mode ("with"), never on which command is doing the reclaiming.
+func TestAcquireLease_RecoversVerifiedOrphanLeftByWith(t *testing.T) {
+	root := t.TempDir()
+	groupDir := GroupDir(root, "TestDevice", "1.0")
+	slotDir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+	go func() { _ = orphan.Wait() }() // see poison_test.go's spawnRealOrphan
+
+	startedAt, err := procs.ProcessStartTime(pgid)
+	if err != nil {
+		t.Fatalf("capturing orphan's start time: %v", err)
+	}
+	if err := WriteMeta(slotDir, Meta{
+		UDID:              "simpool-test-udid-lease-recovers-with",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: startedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	slot, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", time.Hour, 1)
+	if err != nil {
+		t.Fatalf("lease against a verified, recoverable `with` orphan at max=1: want success, got %v", err)
+	}
+	if slot.Number != 0 {
+		t.Fatalf("expected the recovered slot-0 to be reused, got slot-%d", slot.Number)
+	}
+	if lease := ReadLease(slot.Dir); lease.Key != "repo-a" {
+		t.Fatalf("expected slot-0's lease to belong to repo-a, got %+v", lease)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if !procs.PGIDAlive(pgid) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the with-mode orphan should have been killed by lease's recovery")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClaimSlotForLease_NeverRacesConcurrentFlockAcquire proves
+// AcquireSlots (`with`/`acquire`) and AcquireLease (`simpool lease`) racing
+// for the very same, single-slot group never both win: the group
+// allocation lock already serializes claimSlotForLease's whole scan against
+// take()'s per-slot mkdir+TryLock step (see claimSlotForLease's doc
+// comment), and claimSlotForLease additionally takes the slot's own flock
+// across its own check-and-mutate sequence — the same discipline
+// AttemptRecovery's other callers (take(), reap) already follow. Hammered
+// many times: a lock-ordering bug of this shape does not necessarily
+// reproduce on every single attempt.
+func TestClaimSlotForLease_NeverRacesConcurrentFlockAcquire(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		root := t.TempDir()
+
+		var wg sync.WaitGroup
+		var withSlots []*Slot
+		var withErr error
+		var leaseSlot *Slot
+		var leaseErr error
+
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			withSlots, withErr = AcquireSlots(root, "TestDevice", "1.0", 1, 1, 0)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			leaseSlot, leaseErr = AcquireLease(root, "TestDevice", "1.0", "repo-a", time.Hour, 1)
+		}()
+		close(start)
+		wg.Wait()
+
+		withWon := withErr == nil
+		leaseWon := leaseErr == nil
+		if withWon && leaseWon && withSlots[0].Number == leaseSlot.Number {
+			t.Fatalf("iteration %d: with/acquire and lease both won slot-%d at max=1 — two consumers on one simulator", i, withSlots[0].Number)
+		}
+		if !withWon && !leaseWon {
+			t.Fatalf("iteration %d: both with/acquire and lease failed at max=1 with one slot available: withErr=%v leaseErr=%v", i, withErr, leaseErr)
+		}
+		if withWon {
+			withSlots[0].Release()
+		}
+		if leaseWon {
+			if _, err := ReleaseLease(root, "repo-a"); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }

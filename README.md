@@ -10,10 +10,18 @@ live process, not a PID-file heuristic or a central daemon: the kernel
 always releases it the instant its holder dies, with no cleanup step of
 its own required. The one gap that leaves is a SIGKILL to `simpool` itself
 (not its whole process group) — the lock frees but the child survives as
-an orphan — and that is not silently unsafe: `reap` refuses to hand a
-lock-free slot to a new consumer while its old one is still alive, so the
-slot is quarantined, not corrupted; recovering it takes an explicit
-`simpool reap` (see "Architecture" below).
+an orphan — and that is not silently unsafe: nothing hands a lock-free slot
+to a new consumer while its old one is provably still alive, so at worst
+the slot sits quarantined, never corrupted. Recovery is automatic where it
+can be proven safe: `simpool with`/`acquire`/`lease` reclaim a poisoned
+slot the moment anything next tries to acquire it, and `simpool reap` does
+the same for anything it walks — all provided the old consumer's identity
+(its process-group leader's own start time, fingerprinted under a fixed,
+locale/timezone-independent environment when it was launched) can still be
+verified, which is what makes killing it safe despite macOS recycling pids
+(see "Architecture" below). There is no automatic idle-simulator sweep —
+shutting one down is still `simpool reap --cold N`'s job, run by a human,
+cron, or CI; see "Architecture" for why that boundary is deliberate.
 
 Isolation by private device set was the original design (see git history)
 and was dropped after implementing and running it: `Simulator.app` is
@@ -77,16 +85,22 @@ simpool status
     boot state.
 
 simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
-    Recycle free+cold slots. Bidirectional: never shuts down a simulator
-    that still has a live process attached even if its lock is free, and
-    kills a stuck `with` holder that has no live work left under it
-    (never an `acquire` holder — see "Capacity" below). Also prunes old
-    run directories, clears expired lease files, and, with --purge,
-    deletes long-cold simulators outright *and their slot directory* to
-    reclaim disk — the only subcommand that actually deletes anything, by
-    design. Never touches a device whose name doesn't start with
-    `SIMPOOL_`, no matter what meta.json says: the default device set
-    also holds the user's own simulators.
+    Recycle free+cold slots. A free slot whose previous consumer still has
+    a live process attached is reclaimed — killed and shut down — if its
+    recorded identity (the process-group leader's own start time) still
+    checks out, and left alone (quarantined) otherwise; never based on a
+    bare UDID-in-argv match alone (see "Architecture" below). Also kills a
+    stuck `with` holder that has no live work left under it (never an
+    `acquire` holder — see "Capacity" below), prunes old run directories,
+    clears expired lease files, and, with --purge, deletes long-cold
+    simulators outright *and their slot directory* to reclaim disk — the
+    only subcommand that actually deletes anything, by design. This is
+    also the only command that ever shuts down an otherwise-idle simulator
+    (`--cold N`) — schedule it (cron/launchd) if you want that to happen
+    without a human running it by hand; see "Architecture" for why `with`
+    doesn't do this on its own exit. Never touches a device whose name
+    doesn't start with `SIMPOOL_`, no matter what meta.json says: the
+    default device set also holds the user's own simulators.
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
@@ -333,13 +347,74 @@ immediately, but the child — and anything it spawned — survives as an
 orphan, because the process-group sweep that normally reclaims them
 (`simpool` catches SIGTERM/SIGINT and kills the child's whole process
 group on every exit path it's alive to run) never gets to execute; a dead
-process can't run its own cleanup. This is **not** silently unsafe: `reap`
-refuses to recycle a free-looking slot that still has a live process
-attached, so the slot is quarantined rather than handed to a second
-consumer — but quarantined is not the same as recovered. Nothing on the
-`with`/Bazel path calls `reap` automatically, so an orphaned slot stays
-stuck until something (a human, a cron job, CI) runs `simpool reap`
-itself.
+process can't run its own cleanup.
+
+This is **not** silently unsafe, and not permanently stuck either, as long
+as the orphan's identity can be verified. `simpool with` fingerprints its
+child right after launching it — `ps -o lstart=` for the child's own pid
+(which, thanks to `Setpgid`, is also its process-group id), rendered under
+a fixed, locale/timezone-independent environment (`TZ=UTC0 LC_ALL=C
+LANG=C`) rather than whatever the ambient environment happens to be — and
+records it alongside its pgid in meta.json.
+
+Recovery happens in two places:
+
+1. **On-demand, at the next acquisition.** `with`/`acquire`/`lease` all
+   check a free-looking slot's previous consumer before handing it out; if
+   it's still alive (`pool.CheckPoison`), they verify the recorded
+   fingerprint against reality (`pool.VerifyConsumerIdentity`) and — only
+   on an exact match — kill the process group, shut down the simulator, and
+   take the slot for themselves (`pool.AttemptRecovery`). If identity can't
+   be verified (no fingerprint recorded, a mismatch, or the kill doesn't
+   stick — e.g. the process is stuck in an uninterruptible sleep inside
+   CoreSimulator), the slot is quarantined exactly as before this existed,
+   and left for a human or a later `simpool reap` to sort out.
+2. **`simpool reap`**, run by a human or CI, does the same verified
+   recovery for every slot it walks, on top of its other jobs (stuck-`with`
+   cleanup, lease expiry, `--cold`/`--purge`).
+
+**Deliberately out of scope: no automatic exit-time sweep.** An earlier
+version of this feature also wired a group-wide sweep into `with`'s and
+`release`'s exit paths, to reclaim other orphans and shut down long-idle
+simulators as a side effect of ordinary usage. It was cut before shipping:
+checking whether a slot is safe to shut down cheaply (`kill(-pgid, 0)`,
+microseconds) is not the same question as checking whether it's safe by
+the fuller `LiveConsumers` scan (a live process referencing the UDID with
+no recorded pgid — the healthy state for an actively-leased slot, not an
+orphan), and that fuller scan is expensive enough (~8.5s measured against
+one booted iOS 26.3 simulator on this machine, all fork/exec overhead —
+see `internal/procs.Descendants`) that fanning it out across a whole group
+on every single `with`/Bazel test action's exit is the wrong trade: real
+cost on the hot path for a benefit (idle-simulator shutdown) `simpool reap
+--cold N` already provides on its own schedule. Shutting down an
+otherwise-idle simulator stays `reap`'s job — schedule it (cron/launchd) if
+you want that automatic; nothing about acquisition-time recovery depends
+on it.
+
+**One further, deliberate scope limit** on recovery itself:
+`VerifyConsumerIdentity` only ever re-identifies the process-group
+*leader* — the exact pid `simpool with` launched and fingerprinted. The
+dominant real orphan case is that leader still running (`simpool` died
+while its direct child was actively working, e.g. mid-`mav run`), which
+this handles. If the leader itself has already exited but a descendant it
+spawned survives under the same pgid — `PGIDAlive` still reports the group
+as poisoned, but there is no live leader left to re-identify — recovery
+refuses rather than trusting bare pgid membership alone (the same class of
+evidence `PGIDAlive` already provides, which this mechanism exists
+specifically not to trust for a kill decision). That slot stays
+quarantined for a human or `simpool reap` to inspect by hand; see
+`pool.VerifyConsumerIdentity`'s doc comment for the reasoning.
+
+A live process referencing a slot's UDID on its own command line
+(`procs.LiveConsumers`, `pgrep -f <udid>`-based) is a second, purely
+diagnostic signal, never a kill candidate under any mode — for a `lease`d
+slot in particular, that is the *healthy* state (a legitimate
+`axe`/`simctl`/MAV session against the leased device, not an orphan). Only
+`ConsumerPGID` (a process group `simpool with` itself created via
+`Setpgid`) is ever a kill candidate, and only when `meta.Mode == "with"`.
+A check that itself fails to complete (e.g. `pgrep` failing to fork under
+load) is treated the same as "still alive" — never as "confirmed free" —
+and is likewise never a kill candidate.
 
 ## Testing
 
@@ -361,19 +436,55 @@ releases the lock on SIGKILL with no cleanup step":
 - `TestAcquireSlotsTwoRealProcesses` — two processes racing the actual
   slot-allocation logic land on two different slot numbers, both held
   simultaneously; killing one frees only that one.
-- `TestAcquireSlots_RefusesCapacityAboveMax` / `_SkipsSlotWithLiveOrphanConsumer`
+- `TestAcquireSlots_RefusesCapacityAboveMax` / `_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv`
   — `--max` is a real cap, not a suggestion, and a slot poisoned by a live
-  orphan (flock free, consumer still alive) is skipped rather than handed
-  to a second consumer.
-- `internal/procs`'s tests spawn real child processes too, to prove
-  `LiveConsumers` tells the simulator's own runtime (`launchd_sim` and
-  everything under it) apart from a genuine external orphan, and that
-  `IsSimpoolHolder` only trusts a lock "holder" `lsof` reports if its
-  command line actually looks like `simpool <subcommand>`.
+  orphan with an unverifiable identity (no fingerprint recorded) is skipped
+  rather than handed to a second consumer.
+- `TestAcquireSlots_RecoversVerifiedOrphanInstead` /
+  `_RecoversPoisonedSlotExactlyOnce` — the positive case: a poisoned slot
+  whose recorded fingerprint matches its still-alive process-group leader
+  is reclaimed instead of quarantined, and two processes racing a single
+  such slot resolve to exactly one winner (never both, never neither).
+- `internal/pool/poison_test.go` covers `AttemptRecovery`/
+  `VerifyConsumerIdentity` directly against real processes: a verified
+  orphan is killed and the slot reclaimed; a deliberately wrong recorded
+  start time (standing in for a recycled pid) is never killed; a missing
+  fingerprint is never killed; a live process referencing a UDID on its
+  own command line is never a kill candidate in any mode; a failed
+  liveness check is never a kill candidate either; and — the deliberate
+  scope limit — a process-group leader that has already exited while a
+  descendant of it survives under the same pgid is left quarantined
+  rather than trusted on bare pgid membership alone.
+- `internal/procs/procs_test.go` proves `ProcessStartTime` produces the
+  *same* string for the same instant regardless of the calling process's
+  ambient `TZ`/`LC_ALL`/`LANG` (`TestProcessStartTime_StableAcrossAmbientLocaleAndTZ`)
+  — the regression test for the critical finding an earlier, reverted
+  version of this feature got wrong: fingerprinting via a rendering that
+  is sensitive to the invoking process's environment, so the exact same
+  instant could produce two different strings depending on what happened
+  to be set elsewhere. It also proves `PGIDAlive` treats any signal-check
+  failure other than "genuinely gone" (`ESRCH`) as still-alive — most
+  notably `EPERM` — never as "confirmed free", and that `MatchingPIDs`/
+  `LiveConsumers` propagate a `pgrep` execution failure as an error rather
+  than silently reading it as "no live consumer". Also, real child
+  processes spawned to prove `LiveConsumers` tells the simulator's own
+  runtime (`launchd_sim` and everything under it) apart from a genuine
+  external orphan, and that `IsSimpoolHolder` only trusts a lock "holder"
+  `lsof` reports if its command line actually looks like
+  `simpool <subcommand>`.
 - `internal/cli`'s `reap_test.go` covers the dead-slot-directory path
   (`--purge`'s deletion of an abandoned, never-provisioned slot) purely
   against the filesystem — no simulators needed since that path never
-  touches `simctl`.
+  touches `simctl` — plus `TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv`
+  (reap now reclaims, not just detects), `_SkipsOrphanWithUnverifiableIdentity`,
+  and `TestReapSlot_RecoveryNeverFallsThroughToSamePassPurge` — the
+  regression test for a real bug this feature had before it shipped: a
+  successful recovery must return immediately, not fall through to the
+  same pass's idle/cold/`--purge` accounting, since `AttemptRecovery`'s
+  `simctl.Shutdown` call is asynchronous and a device can still read as
+  "Booted" for a moment afterward — falling through risked `--purge`
+  deleting a simulator before its process tree finished tearing down,
+  which orphans hundreds of runtime processes (see `cleanupPool` below).
 - `internal/pool/lease_test.go` covers `lease`'s own contract — sticky by
   key, two keys never share a slot, an expired lease is reusable, `--max`
   is a real cap and fails immediately (no polling) — and, symmetrically,
@@ -384,11 +495,13 @@ releases the lock on SIGKILL with no cleanup step":
   concurrency, not a simulation, since BSD `flock()` (what the shared
   allocation lock is built on) is scoped to the open file description, so
   goroutines racing in one process exercise the same kernel exclusion
-  separate `simpool` processes would. `internal/cli/reap_test.go` and
-  `doctor_test.go` cover the CLI-facing half: reap skips an actively
-  leased slot and cleans up an expired one, and doctor flags the one
-  invariant that must never hold — a slot with both a busy flock and a
-  live lease at once.
+  separate `simpool` processes would. `TestAcquireLease_RecoversVerifiedOrphanLeftByWith`
+  proves recovery is cross-mode: whichever command next touches a slot a
+  `with` session left poisoned can reclaim it, not just `with`/`acquire`'s
+  own path. `internal/cli/reap_test.go` and `doctor_test.go` cover the
+  CLI-facing half: reap skips an actively leased slot and cleans up an
+  expired one, and doctor flags the one invariant that must never hold —
+  a slot with both a busy flock and a live lease at once.
 
 ```
 SIMPOOL_RUN_INTEGRATION=1 go test ./internal/cli/... -run Integration -v
@@ -411,10 +524,11 @@ these tests were last validated on.
   point of the default-device-set migration is that none of this needs a
   `--set`), plus proof that a grandchild the command backgrounds and
   forgets about does not survive `with` exiting.
-- `TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled` — reproduces
-  the one accepted failure window from §4 (SIGKILL to `simpool` itself,
-  not its group) and proves `reap` detects the still-live consumer and
-  refuses to shut down its simulator.
+- `TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled` —
+  reproduces the one accepted failure window from §4 (SIGKILL to `simpool`
+  itself, not its group) and proves `reap` verifies the still-live
+  consumer's identity against its recorded fingerprint and recovers it:
+  kills the process, shuts down the simulator.
 
 ## What's out of scope here
 

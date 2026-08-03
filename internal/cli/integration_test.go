@@ -212,14 +212,20 @@ func TestIntegration_WithHappyPathAndOrphanSweep(t *testing.T) {
 	}
 }
 
-// TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled reproduces the
-// specific failure window the design accepts as the price of the
+// TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled reproduces
+// the specific failure window the design accepts as the price of the
 // parent-holds-the-lock architecture (§4): SIGKILL to `simpool` itself
-// (not its child) releases the flock immediately while the consumer
-// (here standing in for MAV's `log stream`) keeps running. `reap` must
-// detect the still-live process referencing the device and refuse to
-// recycle the slot.
-func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
+// (not its child) releases the flock immediately while the consumer (here
+// standing in for MAV's `log stream`) keeps running.
+//
+// `simpool with` fingerprints its child's process start time (under a
+// fixed, locale/timezone-independent environment — see
+// procs.ProcessStartTime) right after launching it (see with.go), so a
+// later `reap` (or the next acquisition) can prove the still-live process
+// under the recorded pgid is genuinely the one it launched — not some
+// unrelated process that has since reused the same numeric pgid — and
+// safely kill it, then shut down the device for reuse.
+func TestIntegration_ReapRecoversVerifiedOrphanAfterSimpoolIsKilled(t *testing.T) {
 	requireIntegration(t)
 	bin := buildSimpool(t)
 	home := t.TempDir()
@@ -302,31 +308,35 @@ func TestIntegration_ReapProtectsLiveOrphanAfterSimpoolIsKilled(t *testing.T) {
 		t.Fatal("consumer should still be alive after simpool (not its group) was killed — the scenario this test exists to reproduce didn't happen")
 	}
 
-	// Now the actual assertion: reap must see the lock is free AND the
-	// device still has a live process attached, and must refuse to touch
-	// it.
+	// Now the actual assertion: reap must see the lock is free, verify the
+	// live process's identity against the fingerprint `with` recorded, and
+	// reclaim it — kill the process group and shut down the device.
 	reapCmd := exec.Command(bin, "reap", "--cold", "0")
 	reapCmd.Env = env
 	reapOut, err := reapCmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("simpool reap failed: %v\n%s", err, reapOut)
 	}
-	if !strings.Contains(string(reapOut), "SKIP") {
-		t.Fatalf("reap should report SKIP for the slot with a live orphan, got:\n%s", reapOut)
+	if !strings.Contains(string(reapOut), "RECOVER") {
+		t.Fatalf("reap should report RECOVER for the verified orphan, got:\n%s", reapOut)
 	}
 
+	for _, p := range livePIDs {
+		if procs.Alive(p) {
+			t.Fatalf("reap's recovery should have killed the verified orphan pid %d, but it is still alive", p)
+		}
+	}
+
+	// AttemptRecovery's simctl.Shutdown call is asynchronous; give
+	// CoreSimulator a moment to actually settle before asserting on state
+	// (mirrors waitForShutdown's rationale elsewhere in this file).
+	waitForShutdown(udid, 10*time.Second)
 	state, found, err := simctl.State(udid)
 	if err != nil || !found {
 		t.Fatalf("device disappeared after reap: found=%v err=%v", found, err)
 	}
-	if state != "Booted" {
-		t.Fatalf("reap shut down a device that still had a live process attached to it: state=%q", state)
-	}
-
-	// Clean up the orphan ourselves; t.Cleanup will shut down/delete the
-	// device afterward.
-	for _, p := range livePIDs {
-		_ = procs.KillProcessGroup(p, 9)
+	if state != "Shutdown" {
+		t.Fatalf("reap's recovery should have shut down the device, got state=%q", state)
 	}
 }
 

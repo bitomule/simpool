@@ -2,6 +2,7 @@ package procs
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,6 +166,15 @@ func TestPGIDAlive(t *testing.T) {
 	}
 	pgid := cmd.Process.Pid
 	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	// Reap it the instant it exits (by any means): this test binary is its
+	// real parent, and an un-Wait()'d zombie still answers kill(-pgid, 0)
+	// with EPERM — not ESRCH — on Darwin, which PGIDAlive now correctly (see
+	// its doc comment: a non-ESRCH error must fail toward "still alive")
+	// reports as true until the zombie is actually collected. Not an issue
+	// in real usage — an orphan's original parent (`simpool with`) is
+	// already dead by the time recovery runs, so the kernel reparents it to
+	// launchd, which reaps it immediately once killed.
+	go func() { _ = cmd.Wait() }()
 
 	waitUntil(t, 3*time.Second, func() bool { return PGIDAlive(pgid) })
 
@@ -178,6 +188,177 @@ func TestPGIDAlive(t *testing.T) {
 	}
 	if PGIDAlive(-1) {
 		t.Error("PGIDAlive(-1) should be false")
+	}
+}
+
+// TestPGIDAlive_TreatsNonESRCHErrorAsAlive is the regression test for the
+// HIGH finding that a kill(-pgid, 0) failure other than ESRCH (most
+// notably EPERM: the process group exists but the caller lacks permission
+// to signal it — reproducible without any special setup, see the
+// unreaped-zombie case TestPGIDAlive's own Wait() goroutine works around)
+// used to be read as "not alive", handing a poisoned slot's flock check
+// the exact wrong answer: a check that cannot positively confirm a group
+// is gone must fail toward "still alive", never toward "confirmed free".
+// killFunc is overridden here for determinism — EPERM from a real
+// permission conflict requires a process owned by a different user, which
+// a test environment cannot reliably arrange on demand.
+func TestPGIDAlive_TreatsNonESRCHErrorAsAlive(t *testing.T) {
+	orig := killFunc
+	defer func() { killFunc = orig }()
+
+	killFunc = func(pid int, sig syscall.Signal) error { return syscall.EPERM }
+	if !PGIDAlive(42) {
+		t.Error("PGIDAlive should treat EPERM as still alive, not as gone")
+	}
+
+	killFunc = func(pid int, sig syscall.Signal) error { return syscall.EINVAL }
+	if !PGIDAlive(42) {
+		t.Error("PGIDAlive should treat an unexpected errno as still alive, not as gone")
+	}
+
+	killFunc = func(pid int, sig syscall.Signal) error { return syscall.ESRCH }
+	if PGIDAlive(42) {
+		t.Error("PGIDAlive should still treat ESRCH (genuinely gone) as not alive")
+	}
+}
+
+// TestMatchingPIDs_PropagatesCheckFailure and
+// TestLiveConsumers_PropagatesCheckFailure are the regression tests for the
+// HIGH finding that CheckPoison used to discard MatchingPIDs/LiveConsumers'
+// error entirely (`live, _ := procs.LiveConsumers(...)`), so a `pgrep` that
+// failed to even run — reproduced at load 239 during review — was read as
+// "no live consumer", the exact wrong direction: a failed check must be
+// treated as "busy, don't touch", never as "confirmed free". pgrepFunc is
+// overridden here because reliably forcing `pgrep` itself to fail (as
+// opposed to "ran and found nothing") is not something a test can arrange
+// on demand.
+func TestMatchingPIDs_PropagatesCheckFailure(t *testing.T) {
+	orig := pgrepFunc
+	defer func() { pgrepFunc = orig }()
+
+	wantErr := fmt.Errorf("fork: resource temporarily unavailable")
+	pgrepFunc = func(needle string) ([]byte, error) { return nil, wantErr }
+
+	_, err := MatchingPIDs("anything")
+	if err == nil {
+		t.Fatal("MatchingPIDs should propagate a pgrep execution failure, not swallow it")
+	}
+}
+
+func TestLiveConsumers_PropagatesCheckFailure(t *testing.T) {
+	orig := pgrepFunc
+	defer func() { pgrepFunc = orig }()
+
+	calls := 0
+	pgrepFunc = func(needle string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			// The udid lookup itself finds a match...
+			return []byte("12345\n"), nil
+		}
+		// ...but the second pgrep (excluding launchd_sim's own tree) fails.
+		return nil, fmt.Errorf("fork: resource temporarily unavailable")
+	}
+
+	_, err := LiveConsumers("some-udid")
+	if err == nil {
+		t.Fatal("LiveConsumers should propagate a pgrep execution failure, not swallow it")
+	}
+}
+
+// TestDescendants_SingleSnapshotCall proves the fix for the HIGH finding
+// that checking a single booted simulator's live consumers cost ~8-12s wall
+// time — Descendants used to recurse via one `pgrep -P` fork per process in
+// the subtree (281 direct children of launchd_sim on an iOS 26.3
+// simulator). processSnapshotFunc is overridden with a synthetic
+// multi-level tree and an invocation counter: the whole traversal — no
+// matter how deep or wide the tree — must cost exactly one call.
+func TestDescendants_SingleSnapshotCall(t *testing.T) {
+	orig := processSnapshotFunc
+	defer func() { processSnapshotFunc = orig }()
+
+	calls := 0
+	processSnapshotFunc = func() ([]byte, error) {
+		calls++
+		// 1 -> 2,3 ; 2 -> 4,5 ; 4 -> 6 ; plus unrelated noise (100 -> 101).
+		return []byte("2 1\n3 1\n4 2\n5 2\n6 4\n101 100\n"), nil
+	}
+
+	got := Descendants(1)
+	calls1 := calls
+	if calls1 != 1 {
+		t.Fatalf("Descendants should fetch the process snapshot exactly once, got %d calls", calls1)
+	}
+
+	want := map[int]bool{2: true, 3: true, 4: true, 5: true, 6: true}
+	if len(got) != len(want) {
+		t.Fatalf("Descendants(1) = %v, want exactly %v", got, want)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("Descendants(1) included unexpected pid %d", p)
+		}
+		delete(want, p)
+	}
+	if len(want) != 0 {
+		t.Errorf("Descendants(1) missing pids %v", want)
+	}
+}
+
+// TestProcessStartTime_StableAcrossAmbientLocaleAndTZ is the regression
+// test for the CRITICAL finding: an earlier, reverted version of this
+// feature fingerprinted a process via a rendering (`sysctl kern.boottime`'s
+// full line) that is sensitive to the invoking process's ambient TZ and
+// locale, so the exact same instant produced different strings depending
+// on what happened to be set — and the design's one destructive branch
+// fired on any mismatch. `ps -o lstart=` (used here) has the identical
+// weakness on its own; ProcessStartTime must force a fixed environment so
+// its output is stable regardless of the ambient TZ/LC_ALL/LANG at either
+// the recording or the verifying end.
+func TestProcessStartTime_StableAcrossAmbientLocaleAndTZ(t *testing.T) {
+	cmd := exec.Command("sleep", "10")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	go func() { _ = cmd.Wait() }()
+	pid := cmd.Process.Pid
+
+	waitUntil(t, 3*time.Second, func() bool { return Alive(pid) })
+
+	envs := []struct{ tz, lc string }{
+		{"UTC", "C"},
+		{"Asia/Tokyo", "C"},
+		{"America/Argentina/Buenos_Aires", "es_ES.UTF-8"},
+	}
+	var first string
+	for i, e := range envs {
+		t.Setenv("TZ", e.tz)
+		t.Setenv("LC_ALL", e.lc)
+		got, err := ProcessStartTime(pid)
+		if err != nil {
+			t.Fatalf("ProcessStartTime under TZ=%s LC_ALL=%s: %v", e.tz, e.lc, err)
+		}
+		if i == 0 {
+			first = got
+			continue
+		}
+		if got != first {
+			t.Fatalf("ProcessStartTime is sensitive to the calling process's ambient TZ/LC_ALL: TZ=%s LC_ALL=%s got %q, want %q (same instant as the first call)", e.tz, e.lc, got, first)
+		}
+	}
+}
+
+func TestProcessStartTime_ErrorsForInvalidOrDeadPid(t *testing.T) {
+	if _, err := ProcessStartTime(0); err == nil {
+		t.Error("ProcessStartTime(0) should error")
+	}
+	if _, err := ProcessStartTime(-1); err == nil {
+		t.Error("ProcessStartTime(-1) should error")
+	}
+	// A pid extremely unlikely to be in use.
+	if _, err := ProcessStartTime(1_999_999); err == nil {
+		t.Error("ProcessStartTime should error for a pid that doesn't exist")
 	}
 }
 

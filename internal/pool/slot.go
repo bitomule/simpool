@@ -7,8 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"time"
-
-	"github.com/bitomule/simpool/internal/procs"
 )
 
 // DefaultMaxSlotsPerGroup caps how many simulators of the same device+OS
@@ -197,28 +195,24 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		}
 
 		meta := ReadMeta(dir)
-		if meta.UDID != "" {
-			poisoned := meta.ConsumerPGID != 0 && procs.PGIDAlive(meta.ConsumerPGID)
-			if !poisoned {
-				if live, _ := procs.LiveConsumers(meta.UDID); len(live) > 0 {
-					poisoned = true
-				}
-			}
-			if poisoned {
-				// The previous holder died abruptly (SIGKILL to simpool
-				// itself, not its process group — design doc §4's one
-				// accepted failure window) and its consumer is still
-				// running even though the flock is free. Handing this slot
-				// to a new owner would put two consumers on one simulator,
-				// exactly what simpool exists to prevent. `simpool reap`
-				// is what cleans this up; skip to the next candidate slot.
-				// ConsumerPGID is checked first because it catches a
-				// consumer whose only distinguishing trace is an
-				// environment variable (MAV_TARGET_UDID, SIMPOOL_UDID_0)
-				// rather than anything in its argv, which LiveConsumers
-				// (pgrep -f <udid>) cannot see at all; LiveConsumers remains
-				// as a second signal for slots with no recorded PGID (e.g.
-				// `acquire` mode, or meta.json predating this field).
+		if poison := CheckPoison(meta); poison.Poisoned() {
+			// The previous holder died abruptly (SIGKILL to simpool itself,
+			// not its process group — design doc §4's one accepted failure
+			// window) and its consumer may still be running even though the
+			// flock is free. Handing this slot to a new owner as-is would
+			// put two consumers on one simulator, exactly what simpool
+			// exists to prevent — so try to reclaim it first: only ever
+			// kills a `with`-spawned process group whose recorded identity
+			// (its own start time, fingerprinted under a fixed,
+			// locale/timezone-independent environment — see
+			// procs.ProcessStartTime) still matches a currently-alive
+			// leader process (see AttemptRecovery); never based on
+			// LiveConsumers alone, and never when the liveness check itself
+			// failed to complete (PoisonedByCheckFailure).
+			if !AttemptRecovery(dir, &meta, poison) {
+				// Couldn't verify identity (or the kill didn't stick, or
+				// the check itself failed) — quarantine exactly as before
+				// this feature existed and skip to the next candidate slot.
 				lock.Release()
 				return false, nil
 			}

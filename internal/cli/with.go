@@ -64,15 +64,28 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	}
 	pgid := cmd.Process.Pid
 
-	// Record the child's process-group id in every acquired slot's meta.json
-	// so a free-looking slot can be told apart from one whose consumer is
-	// still alive even when that consumer never puts the simulator's UDID
-	// anywhere in its own argv — it gets it by environment (MAV_TARGET_UDID,
-	// SIMPOOL_UDID_N), which a pgrep-based check cannot see at all (design
-	// review CRITICAL finding). Best-effort: a write failure here must not
-	// abort a command that has already started.
+	// Fingerprint the child's own start time right away, alongside its
+	// pgid: it needs to be captured while the process is known-good (we
+	// just started it ourselves), so that a later recovery attempt
+	// (pool.AttemptRecovery, if this `with` dies abruptly and the child
+	// survives as an orphan) can prove the process it's about to kill is
+	// genuinely this one — macOS recycles pids, so a live process under
+	// this numeric pgid later is not proof by itself. Best-effort: a
+	// failure here just means a future recovery attempt can't verify
+	// identity and will quarantine instead of reclaiming.
+	startedAt, _ := procs.ProcessStartTime(pgid)
+
+	// Record the child's process-group id (and fingerprint) in every
+	// acquired slot's meta.json so a free-looking slot can be told apart
+	// from one whose consumer is still alive even when that consumer never
+	// puts the simulator's UDID anywhere in its own argv — it gets it by
+	// environment (MAV_TARGET_UDID, SIMPOOL_UDID_N), which a pgrep-based
+	// check cannot see at all (design review CRITICAL finding). Best-effort:
+	// a write failure here must not abort a command that has already
+	// started.
 	for _, s := range slots {
 		s.Meta.ConsumerPGID = pgid
+		s.Meta.ConsumerStartedAt = startedAt
 		_ = s.SaveMeta()
 	}
 
@@ -110,12 +123,14 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	// design doc §4.
 	_ = procs.KillProcessGroup(pgid, syscall.SIGKILL)
 
-	// The sweep above guarantees pgid is gone, so ConsumerPGID no longer
-	// identifies a live (or even meaningful) process group; clear it before
-	// the deferred releaseAll persists LastUsed, so a slot recycled by reap
-	// while free is never second-guessed against a stale, long-dead pgid.
+	// The sweep above guarantees pgid is gone, so ConsumerPGID (and its
+	// fingerprint) no longer identifies a live (or even meaningful) process
+	// group; clear them before the deferred releaseAll persists LastUsed,
+	// so a slot recycled by reap while free is never second-guessed against
+	// a stale, long-dead pgid.
 	for _, s := range slots {
 		s.Meta.ConsumerPGID = 0
+		s.Meta.ConsumerStartedAt = ""
 	}
 
 	if waitErr == nil {

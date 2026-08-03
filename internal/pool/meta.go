@@ -33,6 +33,16 @@ type Meta struct {
 	// check alone cannot see it. Unset (0) for `acquire`, which never
 	// spawns a child.
 	ConsumerPGID int `json:"consumerPgid,omitempty"`
+	// ConsumerStartedAt is ConsumerPGID's own start time
+	// (procs.ProcessStartTime, captured under a fixed, locale/timezone-
+	// independent environment), recorded by `simpool with` immediately
+	// after it launches its child (see with.go). Recovering a poisoned slot
+	// (pool.AttemptRecovery) refuses to kill anything by pgid alone — macOS
+	// recycles pids, so a live process under that numeric group could be a
+	// completely unrelated one — and instead requires this to match
+	// exactly first. Opaque: never parsed, only ever compared for equality
+	// against a fresh procs.ProcessStartTime of the same pgid.
+	ConsumerStartedAt string `json:"consumerStartedAt,omitempty"`
 }
 
 // ReadMeta loads meta.json for a slot. A missing or corrupt file yields a

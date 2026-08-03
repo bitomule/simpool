@@ -115,13 +115,13 @@ func TestReapSlot_DryRunNeverDeletes(t *testing.T) {
 	}
 }
 
-// TestReapSlot_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv is the regression
-// test for the CRITICAL finding that reap's poisoned-slot check relied
-// entirely on `pgrep -f <udid>` (procs.LiveConsumers), which is blind to a
-// consumer that only ever receives the UDID by environment variable
-// (MAV_TARGET_UDID, SIMPOOL_UDID_N — exactly simpool's own handoff
-// contract, design doc §5, and exactly how `mav run` receives it) rather
-// than anywhere in its own argv.
+// TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv is the
+// regression test for the CRITICAL finding that reap's poisoned-slot check
+// relied entirely on `pgrep -f <udid>` (procs.LiveConsumers), which is
+// blind to a consumer that only ever receives the UDID by environment
+// variable (MAV_TARGET_UDID, SIMPOOL_UDID_N — exactly simpool's own
+// handoff contract, design doc §5, and exactly how `mav run` receives it)
+// rather than anywhere in its own argv.
 //
 // This reproduces the real failure surface, not the sanitized proxy an
 // earlier version of this suite used (`xcrun simctl spawn <udid> log
@@ -132,13 +132,88 @@ func TestReapSlot_DryRunNeverDeletes(t *testing.T) {
 // process group, exactly like with.go's Setpgid child, and has nothing in
 // its command line a UDID-based pgrep could ever match.
 //
-// Confirmed against the pre-fix commit (ef5adeb, before ConsumerPGID/
-// PGIDAlive existed): this test fails there — reap sees no argv match,
-// decides the slot is idle, and would shut down (`--cold 0`) a simulator
-// that still has a live consumer attached to it. `simpool` itself needs no
-// real simulator to reach this decision: the poisoned check runs, and this
-// test asserts on, before reapSlot ever calls simctl.Find.
-func TestReapSlot_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv(t *testing.T) {
+// The contract changed from "reap only diagnoses this" to "reap recovers
+// it": once ConsumerPGID/PGIDAlive existed, reap could at least tell the
+// slot was poisoned; now that a verifiable identity fingerprint
+// (ConsumerStartedAt/ConsumerBootID) exists too, reap can safely kill the
+// orphan itself instead of merely reporting SKIP forever.
+func TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+	// Reap it the instant it exits (by any means): the test binary is its
+	// real parent here, and an un-Wait()'d zombie still answers
+	// kill(pid,0)/kill(-pgid,0) as "alive" on Darwin, which would make a
+	// successful recovery below look like a failed one. Not an issue in
+	// real usage — `simpool with` is already dead by the time this
+	// scenario happens, so the orphan reparents to launchd, which reaps it
+	// immediately once killed.
+	go func() { _ = orphan.Wait() }()
+
+	startedAt, err := procs.ProcessStartTime(pgid)
+	if err != nil {
+		t.Fatalf("capturing orphan's start time: %v", err)
+	}
+	bootID, err := procs.MachineBootTime()
+	if err != nil {
+		t.Fatalf("capturing machine boot time: %v", err)
+	}
+
+	fakeUDID := "simpool-test-udid-not-in-any-argv"
+	if err := pool.WriteMeta(dir, pool.Meta{
+		UDID:              fakeUDID,
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: startedAt,
+		ConsumerBootID:    bootID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Slot-0's lock starts free (never taken): simulates `simpool` itself
+	// being SIGKILLed (design doc §4's one accepted failure window) — the
+	// kernel released its flock immediately, but the child it launched,
+	// recorded by pgid and not by anything pgrep-able, is still running.
+
+	// Sanity check that this really is invisible to the old, pgrep-only
+	// mechanism: if this ever starts matching, the test stops exercising
+	// the bug ConsumerPGID exists to catch.
+	if live, _ := procs.LiveConsumers(fakeUDID); len(live) != 0 {
+		t.Fatalf("test setup broken: fakeUDID must not be visible to a pgrep-based check, got live=%v", live)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("RECOVER")) {
+		t.Fatalf("reap should RECOVER a slot whose consumer is alive only via a verified ConsumerPGID (no UDID anywhere in argv), got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if procs.PGIDAlive(pgid) {
+		t.Fatal("reap's recovery should have killed the verified orphan process group")
+	}
+	if got := pool.ReadMeta(dir).ConsumerPGID; got != 0 {
+		t.Errorf("ConsumerPGID should be cleared on disk after recovery, got %d", got)
+	}
+}
+
+// TestReapSlot_SkipsOrphanWithUnverifiableIdentity proves reap still
+// refuses to kill anything when the recorded consumer fingerprint is
+// missing (meta.json predating ConsumerStartedAt/ConsumerBootID, or
+// otherwise never captured) — macOS recycles pids, so a live process under
+// a recorded pgid is not by itself proof it is the same process reap
+// thinks it is. This preserves the safety property the original version of
+// this test (before recovery existed) was built around.
+func TestReapSlot_SkipsOrphanWithUnverifiableIdentity(t *testing.T) {
 	root := t.TempDir()
 	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
 	dir := pool.SlotDir(groupDir, 0)
@@ -154,33 +229,24 @@ func TestReapSlot_SkipsSlotWithLivePGIDEvenWithoutUDIDInArgv(t *testing.T) {
 	pgid := orphan.Process.Pid
 	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
 
-	fakeUDID := "simpool-test-udid-not-in-any-argv"
+	fakeUDID := "simpool-test-udid-unverifiable"
 	if err := pool.WriteMeta(dir, pool.Meta{
 		UDID:         fakeUDID,
 		Mode:         "with",
 		ConsumerPGID: pgid,
+		// Deliberately no ConsumerStartedAt/ConsumerBootID.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Slot-0's lock starts free (never taken): simulates `simpool` itself
-	// being SIGKILLed (design doc §4's one accepted failure window) — the
-	// kernel released its flock immediately, but the child it launched,
-	// recorded by pgid and not by anything pgrep-able, is still running.
-
-	// Sanity check that this really is invisible to the old mechanism:
-	// if this ever starts matching, the test stops exercising the bug.
-	if live, _ := procs.LiveConsumers(fakeUDID); len(live) != 0 {
-		t.Fatalf("test setup broken: fakeUDID must not be visible to a pgrep-based check, got live=%v", live)
-	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
-		t.Fatalf("reap should SKIP a slot whose consumer is alive only via ConsumerPGID (no UDID anywhere in argv), got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+		t.Fatalf("reap should SKIP a slot it cannot verify the identity of, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
 	if !procs.PGIDAlive(pgid) {
-		t.Fatal("test setup broken: orphan process group should still be alive after reapSlot ran")
+		t.Fatal("an unverifiable orphan must never be killed")
 	}
 }
 

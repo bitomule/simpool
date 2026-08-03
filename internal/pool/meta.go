@@ -33,6 +33,23 @@ type Meta struct {
 	// check alone cannot see it. Unset (0) for `acquire`, which never
 	// spawns a child.
 	ConsumerPGID int `json:"consumerPgid,omitempty"`
+	// ConsumerStartedAt is `ps -o lstart=` for ConsumerPGID, captured by
+	// `simpool with` immediately after it launches its child (see with.go).
+	// Recovering a poisoned slot (AttemptRecovery) refuses to kill anything
+	// by pgid alone — macOS recycles pids, so a live process under that
+	// numeric group could be a completely unrelated one — and instead
+	// requires this to match exactly before sending a signal. Opaque:
+	// never parsed, only ever compared for equality against a fresh
+	// `ps -o lstart=` of the same pgid.
+	ConsumerStartedAt string `json:"consumerStartedAt,omitempty"`
+	// ConsumerBootID is `sysctl kern.boottime`, captured alongside
+	// ConsumerStartedAt, fingerprinting the machine boot the consumer was
+	// launched under. If this no longer matches the current boot, the
+	// machine has rebooted since — nothing survives that, so the slot can
+	// be reclaimed with no signal sent to anyone, regardless of what
+	// ConsumerPGID's number might coincidentally match post-reboot. Opaque,
+	// same equality-only contract as ConsumerStartedAt.
+	ConsumerBootID string `json:"consumerBootId,omitempty"`
 }
 
 // ReadMeta loads meta.json for a slot. A missing or corrupt file yields a

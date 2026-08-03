@@ -43,11 +43,14 @@ set -euo pipefail
 # can ever inherit or fumble the lock. A SIGKILL to `simpool` itself (not
 # its whole process group) is the one case that loses it: the kernel
 # reclaims the flock immediately with no cleanup step of its own required,
-# but this script (and anything it spawned) survives that as an orphan —
-# the slot is not recovered, just quarantined, since `internal/pool/slot.go`
-# refuses to hand a slot with a live but lock-free consumer to anyone else.
-# Recovering it for reuse takes an explicit `simpool reap`; nothing on this
-# path calls that automatically.
+# but this script (and anything it spawned) survives that as an orphan.
+# Recovery is automatic and on-demand from here: `simpool with` fingerprints
+# this script's process (start time + machine boot) right after launching
+# it, so the next `simpool with`/`acquire`/`lease` to try this slot — or a
+# `simpool reap` — verifies that fingerprint and reclaims it (kills the
+# orphan, shuts down the simulator) by itself, no manual step required. It
+# only stays quarantined if that identity can no longer be verified (see
+# `internal/pool/poison.go`'s AttemptRecovery).
 if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
   simpool_bin=""
   for candidate in "${SIMPOOL_BIN:-}" /opt/homebrew/bin/simpool /usr/local/bin/simpool; do

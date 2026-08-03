@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"time"
 
 	"github.com/bitomule/simpool/internal/pool"
@@ -148,6 +149,20 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, dir := range released {
 		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
+	}
+
+	// The user just said "I'm done with this repo" — a group-scoped exit
+	// sweep here is effectively free (the command is about to exit anyway)
+	// and recovers verified orphans / shuts down long-idle slots in the
+	// same group(s), same as `simpool with` does on its own way out.
+	swept := map[string]bool{}
+	for _, dir := range released {
+		groupDir := filepath.Dir(dir)
+		if swept[groupDir] {
+			continue
+		}
+		swept[groupDir] = true
+		pool.ExitSweepGroupDir(root, groupDir)
 	}
 	return 0
 }

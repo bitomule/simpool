@@ -143,6 +143,27 @@ func VerifyConsumerIdentity(meta Meta) bool {
 // takes.
 const recoveryPostKillWait = 50 * time.Millisecond
 
+// deviceBelongsToSlot reports whether udid's actual entry in the default
+// device set is exactly the deterministic device this one slot (root,
+// device, osVersion, n) is supposed to own — see DeviceName. This is the
+// one guard every path that might shut down or delete a simulator based on
+// a UDID pulled from meta.json must pass first: meta.json is advisory and
+// can be stale or outright corrupt (a UDID left over from a previous,
+// unrelated slot, or pointing at one of the *other* ~30 simulators a
+// developer keeps around for their own use) while everything else about it
+// — a verifiable ConsumerPGID fingerprint included — still checks out. A
+// bare `found` is not enough either: the default device set holds every
+// slot's simulator plus the user's own, so only an exact name match proves
+// this UDID is actually this slot's, not merely *a* pool-owned device that
+// happens to still exist.
+func deviceBelongsToSlot(root, udid, device, osVersion string, n int) bool {
+	entry, found, err := simctl.Find(udid)
+	if err != nil || !found {
+		return false
+	}
+	return entry.Name == DeviceName(root, device, osVersion, n)
+}
+
 // AttemptRecovery tries to reclaim dir's slot from a poisoned prior
 // consumer, mutating meta in place and persisting it to disk on success.
 //
@@ -154,14 +175,35 @@ const recoveryPostKillWait = 50 * time.Millisecond
 // same slot regardless of whether the caller is `with`/`acquire` or
 // `lease`.
 //
+// root, n, device, and osVersion identify which exact simulator THIS slot
+// is supposed to own (via DeviceName) — see deviceBelongsToSlot. Killing
+// the poisoned orphan process group never depends on meta.UDID at all (it
+// only ever needs meta.ConsumerPGID, verified against
+// meta.ConsumerStartedAt), but shutting down a simulator does, and
+// meta.UDID is exactly the field the design explicitly tolerates being
+// stale or corrupt. A slot whose meta.json was clobbered to point at a
+// live simulator belonging to another slot — or one of a developer's own,
+// unrelated simulators — combined with a genuinely verifiable
+// ConsumerPGID (the recovery this function performs does not clear that
+// combination) used to still shut down whatever device that stale UDID
+// happened to name, unconditionally. That is fixed here: the orphan is
+// still killed and the slot is still reclaimed either way (killing the
+// process never needed the UDID to be trustworthy), but the simulator is
+// only ever asked to shut down once deviceBelongsToSlot confirms the UDID
+// actually names this slot's own device.
+//
 // Returns true if the slot is now safe to hand to a new consumer: meta has
-// been updated (ConsumerPGID and its fingerprint cleared) and persisted,
-// and the simulator — if any — has been asked to shut down (best-effort;
+// been updated (ConsumerPGID and its fingerprint cleared) and persisted.
+// The simulator, if meta.UDID names one, is asked to shut down
+// (best-effort) only once its identity has been verified this way —
 // EnsureProvisioned boots a clean one for whoever gets it next regardless
-// of the device's exact state when handed over). Returns false to mean
-// "leave this slot exactly as it was": the caller must fall back to its
-// existing quarantine behavior (refuse to hand it out, or leave it alone).
-func AttemptRecovery(dir string, meta *Meta, poison Poison) bool {
+// of the device's exact state when handed over, so skipping the shutdown
+// when identity can't be confirmed never blocks handing the slot out, it
+// only avoids touching a simulator that was never provably this slot's to
+// begin with. Returns false to mean "leave this slot exactly as it was":
+// the caller must fall back to its existing quarantine behavior (refuse to
+// hand it out, or leave it alone).
+func AttemptRecovery(root, dir string, n int, device, osVersion string, meta *Meta, poison Poison) bool {
 	if meta.Mode != "with" {
 		// Only a `with`-launched process group is something simpool itself
 		// spawned (Setpgid) and can therefore safely kill. `acquire` never
@@ -199,7 +241,7 @@ func AttemptRecovery(dir string, meta *Meta, poison Poison) bool {
 		return false
 	}
 
-	if meta.UDID != "" {
+	if meta.UDID != "" && deviceBelongsToSlot(root, meta.UDID, device, osVersion, n) {
 		// Best-effort, and deliberately asynchronous (not waited on here):
 		// EnsureProvisioned boots a fresh device for the next holder
 		// regardless of exactly what state this one is in when handed
@@ -207,6 +249,12 @@ func AttemptRecovery(dir string, meta *Meta, poison Poison) bool {
 		// already fully "Shutdown" in the same pass — see reap.go's RECOVER
 		// handling, which returns immediately rather than falling through
 		// to same-pass --purge accounting for exactly this reason.
+		//
+		// Gated on deviceBelongsToSlot: see this function's own doc comment
+		// for why meta.UDID alone is never enough grounds to shut anything
+		// down. If the check fails, this branch simply does nothing to the
+		// device — the orphan is still killed and the slot still reclaimed
+		// below regardless.
 		_ = simctl.Shutdown(meta.UDID)
 	}
 	meta.ConsumerPGID = 0

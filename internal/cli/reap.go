@@ -103,10 +103,25 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	} else if lease.Key != "" {
 		if dryRun {
 			fmt.Fprintf(stdout, "PRUNE %s  would remove expired lease (key=%q)\n", label, lease.Key)
-		} else if removed, err := pool.CleanupExpiredLease(groupDir, dir); err != nil {
-			fmt.Fprintf(stderr, "reap %s: removing expired lease: %v\n", label, err)
-		} else if removed {
-			fmt.Fprintf(stdout, "PRUNE %s  removed expired lease (key=%q)\n", label, lease.Key)
+		} else {
+			removed, err := pool.CleanupExpiredLease(groupDir, dir)
+			if err != nil {
+				fmt.Fprintf(stderr, "reap %s: removing expired lease: %v\n", label, err)
+			} else if removed {
+				fmt.Fprintf(stdout, "PRUNE %s  removed expired lease (key=%q)\n", label, lease.Key)
+			} else {
+				// CleanupExpiredLease re-checked under the group allocation
+				// lock and found the lease alive after all — some other
+				// `simpool lease` call renewed it in the narrow window
+				// between our lock-free ReadLease above and this call. Bail
+				// out exactly like the "still alive" branch above: falling
+				// through to the idle/poison/--cold/--purge accounting below
+				// would otherwise treat a slot re-leased moments ago as an
+				// ordinary idle free slot and could shut down or purge its
+				// simulator out from under the new holder.
+				fmt.Fprintf(stdout, "SKIP  %s  lease was renewed for key %q just as reap was about to prune it — not touching\n", label, lease.Key)
+				return
+			}
 		}
 	}
 
@@ -118,7 +133,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery\n", label, meta.UDID, poison)
 			return
 		}
-		if pool.AttemptRecovery(dir, &meta, poison) {
+		if pool.AttemptRecovery(root, dir, n, meta.Device, meta.OSVersion, &meta, poison) {
 			// Only ever true for a verified `with`-spawned orphan (see
 			// AttemptRecovery) — never for a LiveConsumers-only signal,
 			// which for a leased slot is the healthy case, not an orphan,

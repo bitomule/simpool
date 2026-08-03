@@ -96,14 +96,28 @@ func RemoveLease(slotDir string) error {
 // lease, matching the interactive, one-shot nature of the caller (MAV's
 // `target_command`).
 //
-// This shares the exact same critical section — the group's allocation
-// lock (see withGroupAllocLock) — that AcquireSlots' take() uses for its
-// own mkdir+open+flock-attempt. That is what makes a lease claim and a
-// `with`/`acquire` flock-attempt on the same slot number mutually
-// exclusive: whichever call's state-mutating step (TryLock succeeding, or
-// WriteLease) runs first inside the lock is guaranteed visible to
-// whichever call inspects that state next, so neither ever mistakes a
-// slot the other has just claimed for being free.
+// Claiming a slot number — whether an existing one or a brand-new one —
+// goes through claimSlotLock exactly like AcquireSlots' take() does: the
+// group's allocation lock is only ever held for the brief mkdir+TryLock
+// step, not across this function's own free-check/poison-check/possible-
+// recovery/lease-write sequence. That sequence is instead guarded by the
+// slot's own flock alone (acquired by claimSlotLock, released again before
+// returning — see claimSlotForLease). This is what makes a lease claim and
+// a `with`/`acquire` flock-attempt on the same slot number mutually
+// exclusive without the group allocation lock ever being held across a
+// caller's own, potentially slow follow-up work: a poisoned-slot
+// recovery's synchronous `simctl shutdown` call (~1s measured) used to run
+// with the WHOLE group's allocation lock held (this function's entire
+// scan-and-claim loop ran inside one withGroupAllocLock closure), which
+// blocked every *other* acquisition attempt anywhere in the same group —
+// not just for the slot being recovered, but the mkdir+TryLock step of any
+// concurrent take()/claimSlotForLease call for any slot number, since they
+// all funnel through the same allocation lock file. Narrowing each
+// claimSlotLock call to just its own structural step, exactly like take()
+// already did, closes that window: a slow shutdown here now only ever
+// blocks another claimant of that one specific slot (and even then, only
+// as long as its non-blocking TryLock attempt, which fails instantly
+// rather than waiting).
 func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max int) (*Slot, error) {
 	if key == "" {
 		return nil, fmt.Errorf("lease key must not be empty")
@@ -120,80 +134,68 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 		return nil, err
 	}
 
-	var found *Slot
-	err := withGroupAllocLock(groupDir, func() error {
-		existing := ListSlotNumbers(groupDir)
+	existing := ListSlotNumbers(groupDir)
 
-		// Sticky renewal: this key already holds a live lease somewhere in
-		// the group. Refresh its TTL in place and return the same slot —
-		// checked before anything else so a key's own repeated calls never
-		// wander to a different slot just because another slot happened to
-		// sort first.
-		for _, n := range existing {
-			dir := SlotDir(groupDir, n)
-			lease := ReadLease(dir)
-			if lease.Key == key && lease.Alive() {
-				if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
-					return err
-				}
-				found = leaseSlotView(root, groupDir, dir, n, device, osVersion)
-				return nil
+	// Sticky renewal: this key already holds a live lease somewhere in the
+	// group. Refresh its TTL in place and return the same slot — checked
+	// before anything else so a key's own repeated calls never wander to a
+	// different slot just because another slot happened to sort first.
+	// Never touches the flock or the allocation lock at all: it only
+	// rewrites a lease.json this exact key already owns.
+	for _, n := range existing {
+		dir := SlotDir(groupDir, n)
+		lease := ReadLease(dir)
+		if lease.Key == key && lease.Alive() {
+			if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
+				return nil, err
 			}
+			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
 		}
+	}
 
-		resident := make(map[int]bool, len(existing))
-		for _, n := range existing {
-			resident[n] = true
+	resident := make(map[int]bool, len(existing))
+	for _, n := range existing {
+		resident[n] = true
+	}
+
+	// Most-recently-used first, same rationale as AcquireSlots: a warm
+	// slot's simulator is already booted, so handing it out first skips a
+	// ~30s cold boot.
+	sort.SliceStable(existing, func(i, j int) bool {
+		return ReadMeta(SlotDir(groupDir, existing[i])).LastUsed.
+			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
+	})
+
+	for _, n := range existing {
+		dir := SlotDir(groupDir, n)
+		ok, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl)
+		if err != nil {
+			return nil, err
 		}
-
-		// Most-recently-used first, same rationale as AcquireSlots: a warm
-		// slot's simulator is already booted, so handing it out first skips
-		// a ~30s cold boot.
-		sort.SliceStable(existing, func(i, j int) bool {
-			return ReadMeta(SlotDir(groupDir, existing[i])).LastUsed.
-				After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
-		})
-
-		for _, n := range existing {
-			dir := SlotDir(groupDir, n)
-			ok, err := claimSlotForLease(dir, key, ttl)
-			if err != nil {
-				return err
-			}
-			if ok {
-				found = leaseSlotView(root, groupDir, dir, n, device, osVersion)
-				return nil
-			}
+		if ok {
+			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
 		}
+	}
 
-		next := 0
-		for {
-			for resident[next] {
-				next++
-			}
-			if len(resident) >= max {
-				return ErrAtCapacity
-			}
-			dir := SlotDir(groupDir, next)
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return err
-			}
-			resident[next] = true
-			ok, err := claimSlotForLease(dir, key, ttl)
-			if err != nil {
-				return err
-			}
-			if ok {
-				found = leaseSlotView(root, groupDir, dir, next, device, osVersion)
-				return nil
-			}
+	next := 0
+	for {
+		for resident[next] {
 			next++
 		}
-	})
-	if err != nil {
-		return nil, err
+		if len(resident) >= max {
+			return nil, ErrAtCapacity
+		}
+		dir := SlotDir(groupDir, next)
+		resident[next] = true
+		ok, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return leaseSlotView(root, groupDir, dir, next, device, osVersion), nil
+		}
+		next++
 	}
-	return found, nil
 }
 
 // claimSlotForLease writes a fresh lease for key into dir if — and only
@@ -201,31 +203,27 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 // carries no live lease for a different key, and (mirroring AcquireSlots'
 // take()) its previous consumer isn't a poisoned orphan left behind by a
 // SIGKILL to `simpool` itself — or, if it was, that it can be verified and
-// reclaimed (see AttemptRecovery). Must be called from inside the group
-// allocation lock (see AcquireLease): that lock already serializes this
-// function's whole scan-and-claim sequence against a concurrent take()
-// (which itself re-acquires the very same allocation lock, once per
-// candidate slot, for its own mkdir+TryLock step — see tryAcquireSlots),
-// so the two can never interleave inside either one's critical section.
+// reclaimed (see AttemptRecovery).
 //
-// This additionally takes the slot's own flock across the whole
+// claimSlotLock gives this the exact same exclusion take() gets: the
+// group's allocation lock only for the brief mkdir+open+flock-attempt
+// step (closing the same unlink race allocLockPath exists for), released
+// again immediately after — so a concurrent take() attempting the very
+// same slot number simply gets ErrBusy from its own TryLock the instant
+// this function's flock succeeds, no matter which of the two runs first.
+// The slot's own flock is then held across the rest of this function's
 // free-check + poison-check + possible-recovery + lease-write sequence
 // (released again before returning, since a live lease deliberately never
-// holds it long-term — see the Lease doc comment), mirroring take()'s own
-// lock-then-mutate pattern exactly. The allocation lock above is already
-// sufficient exclusion against take() specifically; holding the flock too
-// is what additionally makes this safe against any *other* caller that
-// only takes the slot's own flock without the allocation lock — which is
-// deliberately how AttemptRecovery's callers are documented to serialize
-// against each other (see poison.go) — rather than leaving this the one
-// caller of AttemptRecovery that doesn't.
-func claimSlotForLease(dir, key string, ttl time.Duration) (bool, error) {
-	lock, err := TryLock(lockPath(dir))
+// holds it long-term — see the Lease doc comment) — mirroring take()'s own
+// lock-then-mutate pattern, and AttemptRecovery's other callers' documented
+// discipline (see poison.go), exactly.
+func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key string, ttl time.Duration) (bool, error) {
+	lock, err := claimSlotLock(groupDir, dir)
 	if err != nil {
-		if err == ErrBusy {
-			return false, nil
-		}
 		return false, err
+	}
+	if lock == nil {
+		return false, nil // busy
 	}
 	defer lock.Release()
 
@@ -235,7 +233,7 @@ func claimSlotForLease(dir, key string, ttl time.Duration) (bool, error) {
 
 	meta := ReadMeta(dir)
 	if poison := CheckPoison(meta); poison.Poisoned() {
-		if !AttemptRecovery(dir, &meta, poison) {
+		if !AttemptRecovery(root, dir, n, device, osVersion, &meta, poison) {
 			return false, nil
 		}
 	}

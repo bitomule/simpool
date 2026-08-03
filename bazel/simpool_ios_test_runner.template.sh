@@ -50,10 +50,19 @@ set -euo pipefail
 # this slot — or a `simpool reap` — can verify that fingerprint and reclaim
 # it (kill the orphan, shut down the simulator) on its own, no manual step
 # required. It only stays quarantined if that identity can no longer be
-# verified (see `internal/pool/poison.go`'s AttemptRecovery). Nothing
-# automatically shuts down an otherwise-idle simulator on this path, though
-# — that is still `simpool reap --cold N`'s job (see the README's
-# "Architecture" section for why).
+# verified (see `internal/pool/poison.go`'s AttemptRecovery). Recovery only
+# ever shuts down the reclaimed slot's OWN device, never a sibling's — even
+# a stale/corrupt meta.json pointing at a different slot's live simulator is
+# refused (see `deviceBelongsToSlot` in poison.go).
+#
+# This same `simpool with` call also sweeps its whole group for OTHER slots
+# that are idle, unattached, and past a threshold, shutting their simulators
+# down as a side effect of this one's acquisition (see `sweepIdleSiblings`
+# in internal/pool/slot.go) — riding along on the group scan this call
+# already pays for rather than a separate always-on background sweep. A
+# live `simpool lease` (MAV's hot loop) always protects its slot from this,
+# regardless of idle time. `simpool reap --cold N` remains the only path
+# that can shut down THIS run's own slot once it's freed again.
 if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
   simpool_bin=""
   for candidate in "${SIMPOOL_BIN:-}" /opt/homebrew/bin/simpool /usr/local/bin/simpool; do

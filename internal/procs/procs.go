@@ -161,15 +161,31 @@ func processTree() (map[int][]int, error) {
 // grandchildren, ...), best-effort: a snapshot failure just yields nil (an
 // empty exclusion set) rather than failing the whole call, since this is
 // only ever used to build an exclusion set, not a safety-critical list.
+//
+// seen guards against a cyclic (pid, ppid) pair in processTree's snapshot —
+// reproduced directly by feeding processSnapshotFunc "10 20\n20 10\n": a
+// genuinely well-formed process tree can never contain a cycle (a process
+// cannot be its own ancestor), but this snapshot comes from parsing `ps`
+// output, not from a source that enforces that invariant, so a malformed or
+// racily-read snapshot must not be able to turn a bounded exclusion-set walk
+// into unbounded recursion. Without this, that two-line input alone
+// crashes the process with a stack overflow — not a panic `recover()` can
+// catch — well before any real process tree gets anywhere near deep enough
+// to matter on its own.
 func Descendants(pid int) []int {
 	tree, err := processTree()
 	if err != nil {
 		return nil
 	}
 	var out []int
+	seen := map[int]bool{pid: true}
 	var walk func(int)
 	walk = func(p int) {
 		for _, c := range tree[p] {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
 			out = append(out, c)
 			walk(c)
 		}
@@ -314,11 +330,22 @@ var startTimeEnv = []string{"TZ=UTC0", "LC_ALL=C", "LANG=C", "PATH=/bin:/usr/bin
 // compared for equality against a value recorded earlier the same way (see
 // pool.Meta.ConsumerStartedAt). Errors (no such process) are returned, not
 // swallowed — the caller must treat "can't verify" as "don't kill".
+//
+// Invoked via the absolute path /bin/ps, not the bare name "ps": exec.Command
+// resolves a bare name against the *calling* process's own ambient $PATH
+// (via exec.LookPath) before cmd.Env is ever consulted — cmd.Env only
+// affects the child's environment, not which binary gets resolved and
+// executed. Setting PATH=/bin:/usr/bin in startTimeEnv above hardens what
+// the child *sees*, but does nothing to pin down which "ps" is actually
+// run; an attacker-controlled ambient PATH ahead of /bin could otherwise
+// substitute an arbitrary "ps" that fabricates whatever start-time string
+// it likes, defeating the entire fingerprint this function exists to
+// produce trustworthy output for.
 func ProcessStartTime(pid int) (string, error) {
 	if pid <= 0 {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
-	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	cmd := exec.Command("/bin/ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
 	cmd.Env = startTimeEnv
 	out, err := cmd.Output()
 	if err != nil {

@@ -263,6 +263,47 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	return acquired, nil
 }
 
+// AcquireSlotByNumber locks EXACTLY slot n of the device+osVersion group
+// under root — never any other slot number, and never AcquireSlots' own
+// most-recently-used-first substitution. Returns (nil, nil) if that exact
+// slot is currently busy (held by someone else); the caller decides what to
+// do (see RunPreboot).
+//
+// This exists for `simpool preboot`: it reserves --count distinct slot
+// numbers with a single AcquireSlots(count) call (the only moment more than
+// one of this group's flocks is ever held at once, and only for the near-
+// instant directory-bookkeeping step, not the ~110s each one then spends
+// booting), immediately releases all of them, and re-claims them one at a
+// time — by NUMBER, through this function — right before provisioning each
+// one. Re-claiming through AcquireSlots itself instead would not work: its
+// most-recently-used-first policy (the right choice for `with`/`acquire`/
+// `lease`, which want a warm slot back) would simply keep handing preboot
+// the one slot it just warmed and released, since that slot is now the
+// most-recently-used free one in the group — --count 3 would silently warm
+// the same single slot three times and never touch the other two numbers
+// this call already reserved.
+func AcquireSlotByNumber(root, device, osVersion string, n int) (*Slot, error) {
+	groupDir := GroupDir(root, device, osVersion)
+	dir := SlotDir(groupDir, n)
+	lock, err := claimSlotLock(groupDir, dir)
+	if err != nil {
+		return nil, err
+	}
+	if lock == nil {
+		return nil, nil // busy
+	}
+	return &Slot{
+		Root:     root,
+		GroupDir: groupDir,
+		Dir:      dir,
+		Number:   n,
+		Device:   device,
+		OSVer:    osVersion,
+		lock:     lock,
+		Meta:     ReadMeta(dir),
+	}, nil
+}
+
 // withGroupAllocLock serializes structural mutations to a group's slot
 // directories — creating a brand-new one, or removing a purged one (see
 // RemoveSlotDir) — under a single, group-wide lock file distinct from any

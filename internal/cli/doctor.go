@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bitomule/simpool/internal/pool"
@@ -17,6 +18,12 @@ import (
 // had zero live children for less than this is presumed to be mid-startup
 // (booting a fresh simulator, resolving a runtime), not stuck.
 const stuckGrace = 3 * time.Minute
+
+// findDevice abstracts simctl.Find so tests can inject device-set state
+// (a meta.json pointing at some other slot's live device, a device under an
+// unexpected name) without touching the real device set — mirrors
+// pool.liveProvisionDeps' seam.
+var findDevice = simctl.Find
 
 // RunDoctor implements `simpool doctor`: a read-only coherence check.
 // Non-zero exit means something is wrong; it never modifies the pool
@@ -81,7 +88,7 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 			}
 
 			if meta.UDID != "" {
-				if entry, found, err := simctl.Find(meta.UDID); err == nil {
+				if entry, found, err := findDevice(meta.UDID); err == nil {
 					if !found {
 						note("%s: meta.json references device %s which no longer exists", label, meta.UDID)
 					} else if !pool.IsPoolName(entry.Name) {
@@ -90,8 +97,20 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// would be a serious bug elsewhere in simpool, not
 						// something to paper over here.
 						note("%s: meta.json references device %s (name %q) that is NOT pool-owned — this should never happen", label, meta.UDID, entry.Name)
-					} else if want := pool.DeviceName(root, meta.Device, meta.OSVersion, n); entry.Name != want {
-						note("%s: meta.json's device %s is named %q, expected %q", label, meta.UDID, entry.Name, want)
+					} else if want := pool.DeviceNameForGroup(root, group, n); entry.Name != want {
+						// The expected name is derived from this slot's own
+						// directory (root, group, slot number), never from
+						// meta.Device/meta.OSVersion — see DeviceNameForGroup's
+						// doc comment in paths.go for why deriving it from the
+						// meta.json under audit would make this check
+						// self-referential and blind to a meta.json that is
+						// internally coherent but points at another group's
+						// (or another pool root's) live simulator.
+						if tag, ok := poolDeviceTag(entry.Name); ok && tag != pool.RootTag(root) {
+							note("%s: meta.json's device %s (name %q) belongs to another simpool root %s, not this pool's root %s — two consumers may be pointed at one simulator", label, meta.UDID, entry.Name, tag, pool.RootTag(root))
+						} else {
+							note("%s: meta.json's device %s is named %q, expected %q", label, meta.UDID, entry.Name, want)
+						}
 					}
 				}
 			}
@@ -155,4 +174,22 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "FAIL ", p)
 	}
 	return 1
+}
+
+// poolDeviceTag extracts the RootTag embedded in a pool-owned simulator
+// name (pool.NamePrefix + 8 lowercase-hex chars + "_" + group + "_slot-N"),
+// reporting ok=false for anything that doesn't have that shape — including
+// names that merely start with the prefix but aren't well-formed pool names.
+func poolDeviceTag(name string) (tag string, ok bool) {
+	rest := strings.TrimPrefix(name, pool.NamePrefix)
+	if rest == name || len(rest) < 9 || rest[8] != '_' {
+		return "", false
+	}
+	tag = rest[:8]
+	for _, c := range tag {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", false
+		}
+	}
+	return tag, true
 }

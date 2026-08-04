@@ -33,7 +33,7 @@ func RunAcquire(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ownerCmd := "acquire (pid " + strconv.Itoa(os.Getpid()) + ")"
-	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, af.max, af.wait, ownerCmd, "acquire")
+	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, af.max, af.wait, ownerCmd, "acquire", stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "simpool acquire:", err)
 		return 1

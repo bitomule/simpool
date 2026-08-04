@@ -89,7 +89,15 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "simpool lease:", err)
 		return 1
 	}
+	fmt.Fprintf(stderr, "simpool: pool root %s\n", root)
 
+	// Deliberately no reportForeignRootDevices scan here (see
+	// acquireAndProvision's doc comment in provision.go): that costs an
+	// extra `simctl list devices` subprocess, which this hot path — called
+	// roughly once per mav tap/swipe/screenshot — cannot afford to pay on
+	// every single call. Root + per-phase timings below are free (no extra
+	// syscalls beyond what AcquireLease/EnsureProvisioned already make).
+	acquireStart := time.Now()
 	slot, err := pool.AcquireLease(root, lf.device, lf.os, key, lf.ttl, lf.max)
 	if err != nil {
 		if errors.Is(err, pool.ErrAtCapacity) {
@@ -99,12 +107,15 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 		}
 		return 1
 	}
+	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond))
 
 	ownerCmd := "lease (key " + key + ")"
-	if err := pool.EnsureProvisioned(slot, ownerCmd, "lease"); err != nil {
+	provisionStart := time.Now()
+	if err := pool.EnsureProvisioned(slot, ownerCmd, "lease", key); err != nil {
 		fmt.Fprintln(stderr, "simpool lease:", err)
 		return 1
 	}
+	fmt.Fprintf(stderr, "simpool: slot-%d provisioned (udid %s) in %s\n", slot.Number, slot.Meta.UDID, time.Since(provisionStart).Round(time.Millisecond))
 
 	fmt.Fprintln(stdout, slot.Meta.UDID)
 	return 0

@@ -32,12 +32,22 @@ Usage:
   simpool release [--key K]
       Drop --key's lease immediately instead of waiting out its TTL.
 
+  simpool preboot --device D --os V [--count N] [--max M]
+      Warm up N slots (boot their simulators) without a consumer, then
+      release them immediately, so the next with/acquire/lease/bazel-test
+      call finds a warm slot instead of paying a cold boot itself. Never
+      waits for capacity — a full group is left as-is, not blocked on.
+
   simpool status
       List every slot: lock state, holder, lease, device boot state.
 
-  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
+  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--dry-run]
       Recycle free+cold slots; never touches one with a live owner or an
-      active lease. Also clears expired lease files.
+      active lease. Also clears expired lease files. --warm caps how many
+      free simulators stay booted per group, independent of --max (which
+      caps how many may be resident/locked at once). --orphans reports
+      pool-named simulators no slot references; --purge-orphans deletes
+      them (only on that explicit request).
 
   simpool doctor
       Check pool coherence. Exits non-zero if anything looks wrong.`)
@@ -59,6 +69,8 @@ func main() {
 		code = cli.RunLease(rest, os.Stdout, os.Stderr)
 	case "release":
 		code = cli.RunRelease(rest, os.Stdout, os.Stderr)
+	case "preboot":
+		code = cli.RunPreboot(rest, os.Stdout, os.Stderr)
 	case "status":
 		code = cli.RunStatus(rest, os.Stdout, os.Stderr)
 	case "reap":

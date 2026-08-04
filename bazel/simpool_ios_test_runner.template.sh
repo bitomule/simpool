@@ -26,11 +26,47 @@
 #      finding it is a hard error, never a cue to create a same-named
 #      simulator the pool doesn't know about — this rule is never allowed
 #      to create or delete a pool slot's simulator out from under it.
+#   3. After a failed test run against a pool-owned slot, a cheap read-only
+#      probe checks whether the simulator itself is still responsive; if
+#      not, it's shut down so the pool re-verifies it on the next
+#      acquisition instead of handing a wedged-but-nominally-"Booted"
+#      device straight to the next consumer (see the comment at its call
+#      site, right after the test execution block).
 # Everything else, including the fallback when simpool isn't installed
 # (this script then behaves like a stock ios_xctestrun_runner), is
 # unmodified upstream behavior.
 
 set -euo pipefail
+
+# simpool: run "$@" with a wall-clock bound, killing it if it overruns.
+#
+# macOS ships no `timeout(1)`, so this backgrounds the command and polls
+# `kill -0` on its pid instead — the same background+poll shape every
+# bounded `xcrun simctl` call already gets on the Go side (see
+# SIMPOOL_SIMCTL_TIMEOUT in internal/simctl), applied here because this
+# script's own wedge probe below calls `xcrun simctl` directly against a
+# simulator that is, by definition, already suspected of being wedged —
+# exactly the moment an unbounded call is most likely to hang. Returns the
+# command's own exit status, or 124 (matching GNU timeout's convention) if
+# it had to be killed.
+simpool_run_bounded() {
+  local timeout_s="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local waited=0
+  local interval=1
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= timeout_s )); then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep "$interval"
+    waited=$(( waited + interval ))
+  done
+  wait "$pid"
+}
 
 # simpool: hold a pool slot's flock for the life of this whole test action.
 #
@@ -828,6 +864,36 @@ else
     -XCTest All \
     "$test_tmp_dir/$test_bundle_name.xctest" \
     2>&1 | tee -i "$testlog" || test_exit_code=$?
+fi
+
+# simpool: distinguish "the test failed" from "the simulator is unusable".
+# An ordinary assertion failure leaves the simulator alone (still Booted,
+# still responsive) — nothing below fires for that, common, case. An
+# infrastructure failure (CoreSimulator crashing, SpringBoard dying
+# mid-run) can leave the device in a state `simctl list` still reports as
+# "Booted" while it never responds to anything again, which
+# EnsureProvisioned's own fast path (internal/pool/provision.go) would
+# otherwise trust blindly on the NEXT acquisition — handing a wedged
+# device straight to whoever asks next with no boot wait at all. Only
+# probed on a failed run (never the happy path, so this costs nothing when
+# tests pass) and only for a pool-owned slot (SIMPOOL_NAME_0 unset means
+# the non-pool fallback path, which never reuses this simulator anyway).
+# The probe itself is read-only (mirrors internal/simctl.SpringBoardReady's
+# own readiness check); only a failed probe triggers the shutdown.
+#
+# Both calls run through simpool_run_bounded: a device already suspected of
+# being wedged is exactly the device a plain, unbounded `xcrun simctl` call
+# is most likely to hang against — and unlike every bounded simctl call on
+# the Go side, this test action holds its pool slot's flock for its entire
+# run, so a hang here would strand that slot until Bazel's own test timeout
+# kills the action, turning "the simulator is unusable" into "the pool has
+# lost a slot" — the opposite of what this probe exists to prevent.
+if [[ "$test_exit_code" -ne 0 && -n "${SIMPOOL_NAME_0:-}" ]]; then
+  wedge_probe_timeout="${SIMPOOL_WEDGE_PROBE_TIMEOUT:-15}"
+  if ! simpool_run_bounded "$wedge_probe_timeout" xcrun simctl spawn "$simulator_id" launchctl list >/dev/null 2>&1; then
+    echo "warning: simulator $simulator_id no longer responds (or didn't answer within ${wedge_probe_timeout}s) after a failed test run — shutting it down so the pool re-verifies it before handing it to the next consumer, instead of reusing it as-is" >&2
+    simpool_run_bounded "$wedge_probe_timeout" xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true
+  fi
 fi
 
 # Run a post-action binary, if provided.

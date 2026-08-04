@@ -10,6 +10,7 @@ import (
 
 	"github.com/bitomule/simpool/internal/pool"
 	"github.com/bitomule/simpool/internal/procs"
+	"github.com/bitomule/simpool/internal/simctl"
 )
 
 // TestRunDoctor_FlagsSlotWithLivePGIDEvenWithoutUDIDInArgv is the doctor-side
@@ -135,5 +136,73 @@ func TestRunDoctor_FlagsUnreadableLease(t *testing.T) {
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("lease.json")) {
 		t.Fatalf("doctor should mention the unreadable lease.json, got:\n%s", stdout.String())
+	}
+}
+
+// TestRunDoctor_CatchesMetaCoherentlyPointingAtAnotherGroupsDevice is the
+// regression test for the self-referential identity check: slot-0 of group
+// A ("iPhone 17 Pro"/26.3) carries a meta.json that is fully, internally
+// coherent for group B ("iPhone 16"/26.0) — Device/OSVersion/UDID all
+// consistent with each other — but the device that UDID actually names in
+// the (faked) device set is B's own slot-0 simulator, not A's.
+//
+// Computing the expected name from meta.Device/meta.OSVersion (the old
+// behavior) reproduces the same values meta.json already claims and always
+// matches, so this exact corruption shape passed silently. The expected
+// name must instead come from the slot's own directory (its group, on
+// disk) — see pool.DeviceNameForGroup — which is what actually catches it.
+//
+// Ablation: reverting doctor.go's DeviceNameForGroup(root, group, n) back to
+// DeviceName(root, meta.Device, meta.OSVersion, n) must turn this red (exit
+// 0, no problem reported) — that is what proves the test exercises the real
+// fix rather than some other coincidental signal.
+func TestRunDoctor_CatchesMetaCoherentlyPointingAtAnotherGroupsDevice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	groupADir := pool.GroupDir(home, "iPhone 17 Pro", "26.3")
+	slotA := pool.SlotDir(groupADir, 0)
+	if err := os.MkdirAll(slotA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	groupBDir := pool.GroupDir(home, "iPhone 16", "26.0")
+	slotB := pool.SlotDir(groupBDir, 0)
+	if err := os.MkdirAll(slotB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const sharedUDID = "coherent-but-wrong-group-udid"
+	if err := pool.WriteMeta(slotA, pool.Meta{
+		Device:    "iPhone 16",
+		OSVersion: "26.0",
+		UDID:      sharedUDID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bDeviceName := pool.DeviceName(home, "iPhone 16", "26.0", 0)
+
+	orig := findDevice
+	t.Cleanup(func() { findDevice = orig })
+	findDevice = func(udid string) (simctl.DeviceEntry, bool, error) {
+		if udid != sharedUDID {
+			return simctl.DeviceEntry{}, false, nil
+		}
+		return simctl.DeviceEntry{
+			UDID:        sharedUDID,
+			Name:        bDeviceName,
+			State:       "Booted",
+			IsAvailable: true,
+		}, true, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunDoctor(nil, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doctor should flag slot-0 of group A pointing (coherently) at group B's device, got exit 0:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	wantLabel := "iPhone-17-Pro@26.3/slot-0"
+	if !bytes.Contains(stdout.Bytes(), []byte(wantLabel)) {
+		t.Fatalf("doctor should name %s (the slot whose meta.json is wrong), got:\n%s", wantLabel, stdout.String())
 	}
 }

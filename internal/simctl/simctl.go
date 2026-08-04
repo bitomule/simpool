@@ -13,7 +13,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -52,9 +54,36 @@ func ListRuntimes() ([]Runtime, error) {
 // It also resolves the device type identifier for device within that
 // runtime's supported device types.
 func ResolveRuntime(device, osVersion string) (runtimeID, deviceTypeID string, err error) {
-	runtimes, err := ListRuntimes()
+	best, err := resolveRuntimeByVersion(osVersion)
 	if err != nil {
 		return "", "", err
+	}
+	for _, dt := range best.DeviceTypes {
+		if dt.Name == device {
+			return best.Identifier, dt.Identifier, nil
+		}
+	}
+	return "", "", fmt.Errorf("runtime %s does not support device type %q", best.Identifier, device)
+}
+
+// ResolveRuntimeVersion finds an available runtime whose version matches
+// osVersion the same way ResolveRuntime does, but without also resolving a
+// device type. Callers that need to compare a *resolved* runtime identifier
+// against a device's actual RuntimeID (see the substance check in
+// pool.ensureProvisioned) use this instead of ResolveRuntime so they don't
+// have to supply — or care about — a device type just to get the identifier.
+func ResolveRuntimeVersion(osVersion string) (identifier, version string, err error) {
+	best, err := resolveRuntimeByVersion(osVersion)
+	if err != nil {
+		return "", "", err
+	}
+	return best.Identifier, best.Version, nil
+}
+
+func resolveRuntimeByVersion(osVersion string) (*Runtime, error) {
+	runtimes, err := ListRuntimes()
+	if err != nil {
+		return nil, err
 	}
 	var best *Runtime
 	for i := range runtimes {
@@ -70,22 +99,23 @@ func ResolveRuntime(device, osVersion string) (runtimeID, deviceTypeID string, e
 		}
 	}
 	if best == nil {
-		return "", "", fmt.Errorf("no available simulator runtime matches OS version %q", osVersion)
+		return nil, fmt.Errorf("no available simulator runtime matches OS version %q", osVersion)
 	}
-	for _, dt := range best.DeviceTypes {
-		if dt.Name == device {
-			return best.Identifier, dt.Identifier, nil
-		}
-	}
-	return "", "", fmt.Errorf("runtime %s does not support device type %q", best.Identifier, device)
+	return best, nil
 }
 
 // deviceEntry mirrors one item under devices[<runtime>] in `simctl list
-// devices -j`.
+// devices -j`. IsAvailable and DeviceTypeID are read from the JSON;
+// RuntimeID is not part of an individual entry's JSON at all — `simctl`
+// only tells you a device's runtime by which map key it was filed under —
+// so ListDevices fills it in from that key as it flattens the map.
 type deviceEntry struct {
-	UDID  string `json:"udid"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	UDID         string `json:"udid"`
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	IsAvailable  bool   `json:"isAvailable"`
+	DeviceTypeID string `json:"deviceTypeIdentifier"`
+	RuntimeID    string `json:"-"`
 }
 
 type devicesDoc struct {
@@ -117,37 +147,217 @@ func Boot(udid string) error {
 	return nil
 }
 
-// BootSettleMargin is slept after `xcrun simctl bootstatus -b` itself
-// reports a simulator has finished booting. bootstatus's own "done" signal
-// is not sufficient by itself: rules_apple hits the exact same gap
-// independently (bazelbuild/rules_apple,
-// apple/testing/default_runner/simulator_creator.py's _boot_simulator runs
-// the identical `bootstatus <udid> -b` call and then still does
-// `time.sleep(3)`, commented "Even bootstatus doesn't wait long enough and
-// tests can still fail because the simulator isn't ready"). Adopted
-// verbatim rather than re-derived from scratch: it's the same underlying
-// symptom — springboard/backboardd answering simctl's own status query
-// before the device is actually ready for UI automation — observed by a
-// wholly independent, widely-used consumer of the same simctl API on the
-// same platform.
-const BootSettleMargin = 3 * time.Second
+// BootSettleMargin is slept once after the readiness poll (SpringBoardReady)
+// confirms a simulator is actually ready. It used to be an unconditional 3s
+// slept right after bootstatus's own "done" signal — necessary because that
+// signal alone is not sufficient (rules_apple's
+// apple/testing/default_runner/simulator_creator.py hits the identical gap
+// and works around it the same way, independently). SpringBoardReady now
+// does that waiting for real, so this only needs to be a short settle
+// margin after a poll that has already confirmed readiness — mirrors
+// rules_idb's own margin after the same probe.
+const BootSettleMargin = 1 * time.Second
 
-// BootAndWait boots udid if it isn't already booted and blocks until
-// `xcrun simctl bootstatus -b` reports it has finished, plus
-// BootSettleMargin. Unlike Boot, a nil return here means udid is safe to
-// hand to a caller that will immediately try to talk to it (axe, an
-// install) — that is the whole point of this function existing instead of
-// Boot: Boot only fires the boot and returns immediately, which is exactly
-// the gap that let a still-booting simulator's UDID reach a caller that
-// then failed to reach it.
+// springBoardPollInterval bounds how often SpringBoardReady is re-probed
+// while waiting for a simulator to become genuinely ready.
+const springBoardPollInterval = 500 * time.Millisecond
+
+// errReadinessTimedOut marks "the readiness poll never saw SpringBoard come
+// up before the deadline" as distinct from any other failure — it is the
+// one condition BootAndWaitWithDeps treats as retriable (see its single
+// re-boot retry).
+var errReadinessTimedOut = errors.New("simulator readiness poll timed out")
+
+// SpringBoardReady reports whether udid's SpringBoard is actually running —
+// the earliest point installs/launches reliably succeed, and a stronger
+// signal than `simctl bootstatus`, which can report a terminal failure yet
+// still exit 0. A probe that itself fails is reported as not-ready (never
+// silently swallowed into "ready"), the same rule ReadLease enforces for an
+// unfinished check.
+func SpringBoardReady(ctx context.Context, udid string) (bool, error) {
+	out, err := runContext(ctx, "simctl", "spawn", udid, "launchctl", "list")
+	if err != nil {
+		return false, err
+	}
+	return parseSpringBoardReady(out), nil
+}
+
+// parseSpringBoardReady scans `simctl spawn <udid> launchctl list` output
+// for the com.apple.SpringBoard line and reports whether its first field —
+// launchctl's pid column — is a real pid rather than "-" (its marker for
+// "known but not currently running"). Pure and side-effect-free so it can be
+// tested against captured output with no simulator involved.
+func parseSpringBoardReady(output []byte) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] != "com.apple.SpringBoard" {
+			continue
+		}
+		return fields[0] != "-"
+	}
+	return false
+}
+
+// BootWaitDeps abstracts BootAndWaitWithDeps' primitives — bootstatus, a
+// device lookup, the SpringBoard readiness probe, and shutdown — so its
+// state machine (triage bootstatus's exit code against the device's actual
+// state instead of trusting it blindly, poll for real readiness, retry at
+// most once via a single re-boot) can be exercised with fakes instead of
+// `xcrun` and a real simulator. Exported so package pool's tests can drive
+// the exact same logic (see internal/pool/provision_test.go) rather than
+// re-implementing it.
+type BootWaitDeps struct {
+	Bootstatus       func(ctx context.Context, udid string) error
+	Find             func(udid string) (DeviceEntry, bool, error)
+	SpringBoardReady func(ctx context.Context, udid string) (bool, error)
+	Shutdown         func(udid string) error
+}
+
+func liveBootWaitDeps() BootWaitDeps {
+	return BootWaitDeps{
+		Bootstatus:       bootstatusOnce,
+		Find:             Find,
+		SpringBoardReady: SpringBoardReady,
+		Shutdown:         Shutdown,
+	}
+}
+
+// BootAndWait boots udid if it isn't already booted and blocks until it is
+// genuinely ready to use — not just until `bootstatus` says so (see
+// BootWaitDeps' doc comment for why that alone isn't trustworthy). Unlike
+// Boot, a nil return here means udid is safe to hand to a caller that will
+// immediately try to talk to it (axe, an install) — that is the whole point
+// of this function existing instead of Boot: Boot only fires the boot and
+// returns immediately, which is exactly the gap that let a still-booting
+// simulator's UDID reach a caller that then failed to reach it.
 //
-// timeout bounds the wait: a wedged simulator produces a clear, actionable
-// error instead of hanging the caller indefinitely, and a timeout is never
-// mistaken for success.
+// timeout bounds the whole wait, including one retry: a wedged simulator
+// produces a clear, actionable error instead of hanging the caller
+// indefinitely, and a timeout is never mistaken for success.
 func BootAndWait(udid string, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	return BootAndWaitWithDeps(udid, timeout, liveBootWaitDeps())
+}
 
+// firstAttemptShare is how much of the overall timeout the first attempt
+// gets before the retry attempt claims whatever remains. 2/3 so a cold boot
+// (the common case, no retry needed) gets the lion's share of the budget,
+// while still leaving the retry attempt a real chance rather than a token
+// one.
+const firstAttemptShare = 2
+
+// minRetryBudget is the smallest remaining budget worth handing a retry
+// attempt of its own: two full SpringBoard poll cycles, so the retry has a
+// real chance to observe at least one genuine readiness check rather than
+// expiring before its first poll could even complete. Below this, a fresh
+// context.WithTimeout would expire before bootstatus (an exec.CommandContext
+// call) or even one SpringBoard poll could finish real work — so retrying
+// would only pay for a shutdown that then does nothing, which is worse than
+// not retrying at all (see the bug this constant fixes: two attempts used to
+// share one already-exhausted context, so the "retry" always did zero work
+// regardless of how much time was nominally left).
+const minRetryBudget = 2 * springBoardPollInterval
+
+// MinBootBudget is the smallest remaining timeout worth handing to
+// BootAndWait at all — see minRetryBudget's own doc comment for why less
+// than this can't even complete one real readiness check. Exported so a
+// caller computing a single deadline across a preceding wait (e.g.
+// EnsureProvisioned's boot-concurrency gate, see pool/provision.go) can fail
+// fast with a clear message instead of calling BootAndWait with a remainder
+// too small to do anything but expire immediately.
+const MinBootBudget = minRetryBudget
+
+// BootAndWaitWithDeps is BootAndWait with its primitives injected; see
+// BootWaitDeps.
+//
+// The two attempts each get their OWN context.WithTimeout, not one shared
+// between them: sharing a single context (the bug this fixed) means the
+// first attempt's polling loop runs until that context is exhausted, so by
+// the time the retry branch runs its deadline is already in the past —
+// every real primitive backed by that context (exec.CommandContext,
+// runContext) then fails instantly without doing any work, and the device
+// is left Shutdown by the retry's own deps.Shutdown call for nothing.
+// Splitting the caller's timeout into two independent budgets — most of it
+// for the first attempt, the true remainder for the retry — is what makes
+// the retry a real second boot instead of a guaranteed no-op.
+func BootAndWaitWithDeps(udid string, timeout time.Duration, deps BootWaitDeps) error {
+	deadline := time.Now().Add(timeout)
+
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), timeout*firstAttemptShare/(firstAttemptShare+1))
+	defer firstCancel()
+
+	err := waitForReadyOnce(firstCtx, udid, deps)
+	if err == nil {
+		time.Sleep(BootSettleMargin)
+		return nil
+	}
+	if !errors.Is(err, errReadinessTimedOut) {
+		// bootstatus failed and the device isn't actually Booted, or a
+		// lookup/probe itself errored — neither is retriable; surface it.
+		return err
+	}
+
+	remaining := time.Until(deadline)
+	if remaining < minRetryBudget {
+		return fmt.Errorf("simulator %s did not become ready within %s (SpringBoard never answered, and too little of the budget remained to retry with a real boot) — it may be wedged; try `xcrun simctl diagnose` if this keeps happening", udid, timeout)
+	}
+
+	// SpringBoard never answered within its share of the deadline. Retry
+	// exactly once — never in a loop, so a permanently wedged simulator
+	// fails in bounded time instead of retrying forever — by shutting down
+	// and running the same sequence again against a fresh context carrying
+	// the true remainder of the caller's timeout, not the first attempt's
+	// already-spent one.
+	if serr := deps.Shutdown(udid); serr != nil {
+		return fmt.Errorf("shutting down %s before retrying boot: %w", udid, serr)
+	}
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), remaining)
+	defer retryCancel()
+	err = waitForReadyOnce(retryCtx, udid, deps)
+	if err == nil {
+		time.Sleep(BootSettleMargin)
+		return nil
+	}
+	if errors.Is(err, errReadinessTimedOut) {
+		return fmt.Errorf("simulator %s did not become ready within %s, even after one re-boot (SpringBoard never answered) — it may be wedged; try `xcrun simctl diagnose` if this keeps happening", udid, timeout)
+	}
+	return err
+}
+
+// waitForReadyOnce runs bootstatus once, triages a non-zero exit against the
+// device's actual state instead of treating it as fatal outright —
+// bootstatus can report a terminal failure yet still exit 0, and the
+// reverse also happens (Bazel's own runner template already triages
+// bootstatus's exit code against device state for exactly this reason, see
+// bazel/simpool_ios_test_runner.template.sh) — then polls SpringBoardReady,
+// the actual readiness signal, until ctx's deadline. Returns
+// errReadinessTimedOut (not any other error, and never nil) if the deadline
+// is reached without SpringBoard ever answering, so the caller can tell
+// "worth retrying" apart from "not retriable".
+func waitForReadyOnce(ctx context.Context, udid string, deps BootWaitDeps) error {
+	if err := deps.Bootstatus(ctx, udid); err != nil {
+		entry, found, ferr := deps.Find(udid)
+		if ferr != nil || !found || entry.State != "Booted" {
+			return err
+		}
+		// bootstatus reported failure but the device is actually Booted —
+		// fall through to the readiness poll instead of treating this as
+		// fatal.
+	}
+
+	for {
+		ready, err := deps.SpringBoardReady(ctx, udid)
+		if err == nil && ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errReadinessTimedOut
+		case <-time.After(springBoardPollInterval):
+		}
+	}
+}
+
+func bootstatusOnce(ctx context.Context, udid string) error {
 	cmd := exec.CommandContext(ctx, "xcrun", "simctl", "bootstatus", udid, "-b")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -155,7 +365,7 @@ func BootAndWait(udid string, timeout time.Duration) error {
 	err := cmd.Run()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("simulator %s did not finish booting within %s (xcrun simctl bootstatus -b timed out) — it may be wedged; try `xcrun simctl shutdown %s`, or run `xcrun simctl diagnose` if this keeps happening", udid, timeout, udid)
+		return fmt.Errorf("simulator %s did not finish booting (xcrun simctl bootstatus -b timed out) — it may be wedged; try `xcrun simctl shutdown %s`, or run `xcrun simctl diagnose` if this keeps happening", udid, udid)
 	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
@@ -164,8 +374,6 @@ func BootAndWait(udid string, timeout time.Duration) error {
 		}
 		return fmt.Errorf("xcrun simctl bootstatus %s -b: %w: %s", udid, err, msg)
 	}
-
-	time.Sleep(BootSettleMargin)
 	return nil
 }
 
@@ -226,8 +434,11 @@ func ListDevices() ([]deviceEntry, error) {
 		return nil, fmt.Errorf("parsing simctl devices: %w", err)
 	}
 	var all []deviceEntry
-	for _, list := range doc.Devices {
-		all = append(all, list...)
+	for runtimeID, list := range doc.Devices {
+		for _, d := range list {
+			d.RuntimeID = runtimeID
+			all = append(all, d)
+		}
 	}
 	return all, nil
 }
@@ -237,18 +448,77 @@ func ListDevices() ([]deviceEntry, error) {
 // type name.
 type DeviceEntry = deviceEntry
 
-func run(args ...string) ([]byte, error) {
-	full := append([]string{"simctl"}, args...)
-	cmd := exec.Command("xcrun", full...)
+// EnvSimctlTimeout overrides DefaultSimctlTimeout, parsed with
+// time.ParseDuration (e.g. "30s", "500ms"). An unparseable or non-positive
+// value is ignored in favor of the default rather than treated as an error —
+// a malformed override should never turn into "no timeout at all".
+const EnvSimctlTimeout = "SIMPOOL_SIMCTL_TIMEOUT"
+
+// DefaultSimctlTimeout bounds every simctl call routed through run() — every
+// one except `bootstatus`, which has its own separate, typically much
+// longer deadline via BootAndWait's timeout parameter and must not be
+// double-bounded here as well. 120s because `simctl create` on a runtime's
+// first use and `simctl delete` of a multi-GB device are legitimately slow
+// on a loaded machine; anything past that is a wedge, not work — and a
+// wedged simctl must never be allowed to hang `simpool lease`, invoked by
+// mav as `target_command` roughly once a minute with nothing to retry it.
+const DefaultSimctlTimeout = 120 * time.Second
+
+// ErrSimctlTimeout is the sentinel wrapped into run()'s returned error when
+// a simctl invocation is killed for exceeding its deadline. Check with
+// errors.Is, not string matching.
+var ErrSimctlTimeout = errors.New("simctl call timed out")
+
+func simctlTimeout() time.Duration {
+	if v := os.Getenv(EnvSimctlTimeout); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultSimctlTimeout
+}
+
+// runContext executes one `xcrun` invocation and returns its stdout. It is a
+// package-level var — not a plain function — so tests can point it at
+// something other than the real `xcrun` binary (e.g. `/bin/sleep`) to
+// exercise run()'s timeout handling hermetically, with no simulator and no
+// Xcode involved.
+var runContext = func(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "xcrun", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
 		}
-		return nil, fmt.Errorf("xcrun %s: %w: %s", strings.Join(full, " "), err, msg)
+		if msg != "" {
+			return stdout.Bytes(), fmt.Errorf("%w: %s", err, msg)
+		}
+		return stdout.Bytes(), err
 	}
 	return stdout.Bytes(), nil
+}
+
+// run invokes `xcrun simctl <args...>`, bounded by simctlTimeout() so a
+// wedged CoreSimulator process can never hang the caller indefinitely (see
+// DefaultSimctlTimeout). The command line is always named in the returned
+// error — both on timeout and on ordinary failure — so a caller several
+// layers up (e.g. `simpool lease`'s one-line stdout contract, which cannot
+// carry this detail itself) still has something actionable on stderr.
+func run(args ...string) ([]byte, error) {
+	full := append([]string{"simctl"}, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), simctlTimeout())
+	defer cancel()
+
+	out, err := runContext(ctx, full...)
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("%w: xcrun %s", ErrSimctlTimeout, strings.Join(full, " "))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xcrun %s: %w", strings.Join(full, " "), err)
+	}
+	return out, nil
 }

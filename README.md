@@ -80,11 +80,15 @@ simpool lease --device D --os V [--key K] [--ttl D] [--max M]
 simpool release [--key K]
     Drop --key's lease immediately instead of waiting out its TTL.
 
+simpool preboot --device D --os V [--count N] [--max M]
+    Warm up N slots (boot their simulators) with no consumer attached,
+    then release them immediately — see "Warming up ahead of time" above.
+
 simpool status
     List every slot: lock state, holder (best-effort), lease, device
     boot state.
 
-simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--disown-poisoned] [--dry-run]
+simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -118,6 +122,20 @@ simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--
     merely failed to run. See "Architecture" for the full reasoning,
     including why this forgets rather than force-kills.
 
+    --warm N caps how many free simulators stay booted per device+OS
+    group, independent of --max (which caps concurrency, not residue —
+    see "Capacity" above): the N most-recently-used are kept, the rest
+    are shut down regardless of --cold. 0 (default) disables it.
+
+    --orphans scans the default device set for pool-named simulators no
+    slot under this pool root currently references by name (a purged
+    slot directory that left its simulator behind, a vanished pool root's
+    leftovers) and reports them — read-only by itself. --purge-orphans
+    additionally deletes what it finds, only after re-verifying no live
+    process still references each device, and only on this explicit
+    request — never automatically, and never as a side effect of an
+    ordinary scheduled `reap`.
+
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
 ```
@@ -150,6 +168,18 @@ only the one slot being provisioned is affected, so a slow cold boot for
 one slot never blocks acquisition attempts for any other slot, in this
 group or any other.
 
+### Observability
+
+`with`/`acquire`/`lease` write a handful of lines to stderr on every call:
+the resolved pool root, and how long acquiring the slot vs. provisioning
+its simulator each took. `with`/`acquire` additionally scan the device set
+for pool-named simulators tagged for a different (or vanished) pool root
+and name them if found — `lease` skips that extra scan since it's called
+roughly once a minute per mav action and can't afford another `simctl`
+subprocess on every call. None of this changes exit codes or stdout
+contracts; it's meant to make a slow or wrong acquisition diagnosable
+straight from a `bazel test` log, without re-running anything.
+
 ### Capacity
 
 Each device+OS group is capped at `--max` resident slots (default 3,
@@ -159,6 +189,36 @@ this tool exists to prevent. Once a group is at capacity, `with`/`acquire`
 poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
 before giving up. `lease` counts against the same `--max` (a leased slot is
 just as resident as a locked one) but never polls — see below.
+
+`--max` only ever bounds concurrency — how many slots may be resident/locked
+at once. It says nothing about how many stay *booted* once freed; that's a
+separate knob, `reap --warm N` (see "Recycling" below), because conflating
+the two makes sustained runs slower: a residue cap set as low as the
+concurrency cap means every run past the first pays a fresh cold boot for a
+slot that was needlessly shut down the moment it went idle.
+
+Booting itself is throttled machine-wide, separately from either cap: at
+most `SIMPOOL_BOOT_CONCURRENCY` simulators (default `ncpu/2`) boot at once,
+across every device+OS group and every simpool process sharing this pool
+root. This isn't primarily about speed — several simultaneous cold boots on
+a memory-constrained machine is exactly what triggers jetsam, and jetsam
+SIGKILLs consumers, which is what creates the orphans `reap`/recovery exist
+to clean up in the first place. The gate is held only for the duration of
+one boot, never for a slot's lifetime, so it can never widen how long
+anything else has to wait on a slot's own lock.
+
+### Warming up ahead of time
+
+`simpool preboot --device D --os V [--count N] [--max M]` provisions N
+slots — booting their simulators — and releases them immediately, with no
+consumer attached. Point it at a checkout's first-use device+OS group
+(a shell hook, a CI setup step) so the session that follows finds a warm
+slot instead of paying the ~110s cold-boot cost on its own critical path.
+It never waits for capacity (a full group is left exactly as it is) and
+never holds a slot beyond the provisioning step itself, so it can never
+starve a real acquisition racing it for the same slot number. There's no
+`--reconcile`: `--count` is always the caller's explicit ask, nothing
+inferred from history.
 
 ### MAV in the hot loop
 
@@ -292,6 +352,23 @@ host machine has `simpool`. That fallback is not equally *safe*, though:
 every concurrent test action missing `simpool` shares that one fixed-name
 simulator — exactly the collision this rule exists to prevent — and the
 runner warns on stderr when it takes that path.
+
+After a failed test run against a pool slot, the runner probes whether the
+simulator itself is still responsive (a cheap, read-only
+`simctl spawn <udid> launchctl list`) and shuts it down if it isn't — so an
+infrastructure failure (CoreSimulator crashing, SpringBoard dying mid-run,
+as opposed to an ordinary assertion failure) doesn't leave a simulator that
+`simctl list` still calls "Booted" but never responds to anything again in
+the pool, waiting to be handed to the next consumer as-is. Only checked on
+failure, so it costs nothing when tests pass.
+
+`device_type`/`os_version`/`wait` are validated at analysis time before
+they're substituted into the generated test-runner script: since that
+substitution is a literal, unescaped string replacement, a value containing
+a double quote, backtick, `$`, backslash, or newline would otherwise be
+able to break out of the script's own quoting. A bad value now fails the
+build with a clear message instead of producing broken (or exploitable)
+bash discovered only once a test actually runs.
 
 `max_slots`/`wait` attributes on the rule forward to `simpool with
 --max`/`--wait` for its device+OS group; both default to unset, which

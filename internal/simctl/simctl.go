@@ -13,7 +13,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -52,9 +54,36 @@ func ListRuntimes() ([]Runtime, error) {
 // It also resolves the device type identifier for device within that
 // runtime's supported device types.
 func ResolveRuntime(device, osVersion string) (runtimeID, deviceTypeID string, err error) {
-	runtimes, err := ListRuntimes()
+	best, err := resolveRuntimeByVersion(osVersion)
 	if err != nil {
 		return "", "", err
+	}
+	for _, dt := range best.DeviceTypes {
+		if dt.Name == device {
+			return best.Identifier, dt.Identifier, nil
+		}
+	}
+	return "", "", fmt.Errorf("runtime %s does not support device type %q", best.Identifier, device)
+}
+
+// ResolveRuntimeVersion finds an available runtime whose version matches
+// osVersion the same way ResolveRuntime does, but without also resolving a
+// device type. Callers that need to compare a *resolved* runtime identifier
+// against a device's actual RuntimeID (see the substance check in
+// pool.ensureProvisioned) use this instead of ResolveRuntime so they don't
+// have to supply — or care about — a device type just to get the identifier.
+func ResolveRuntimeVersion(osVersion string) (identifier, version string, err error) {
+	best, err := resolveRuntimeByVersion(osVersion)
+	if err != nil {
+		return "", "", err
+	}
+	return best.Identifier, best.Version, nil
+}
+
+func resolveRuntimeByVersion(osVersion string) (*Runtime, error) {
+	runtimes, err := ListRuntimes()
+	if err != nil {
+		return nil, err
 	}
 	var best *Runtime
 	for i := range runtimes {
@@ -70,22 +99,23 @@ func ResolveRuntime(device, osVersion string) (runtimeID, deviceTypeID string, e
 		}
 	}
 	if best == nil {
-		return "", "", fmt.Errorf("no available simulator runtime matches OS version %q", osVersion)
+		return nil, fmt.Errorf("no available simulator runtime matches OS version %q", osVersion)
 	}
-	for _, dt := range best.DeviceTypes {
-		if dt.Name == device {
-			return best.Identifier, dt.Identifier, nil
-		}
-	}
-	return "", "", fmt.Errorf("runtime %s does not support device type %q", best.Identifier, device)
+	return best, nil
 }
 
 // deviceEntry mirrors one item under devices[<runtime>] in `simctl list
-// devices -j`.
+// devices -j`. IsAvailable and DeviceTypeID are read from the JSON;
+// RuntimeID is not part of an individual entry's JSON at all — `simctl`
+// only tells you a device's runtime by which map key it was filed under —
+// so ListDevices fills it in from that key as it flattens the map.
 type deviceEntry struct {
-	UDID  string `json:"udid"`
-	Name  string `json:"name"`
-	State string `json:"state"`
+	UDID         string `json:"udid"`
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	IsAvailable  bool   `json:"isAvailable"`
+	DeviceTypeID string `json:"deviceTypeIdentifier"`
+	RuntimeID    string `json:"-"`
 }
 
 type devicesDoc struct {
@@ -226,8 +256,11 @@ func ListDevices() ([]deviceEntry, error) {
 		return nil, fmt.Errorf("parsing simctl devices: %w", err)
 	}
 	var all []deviceEntry
-	for _, list := range doc.Devices {
-		all = append(all, list...)
+	for runtimeID, list := range doc.Devices {
+		for _, d := range list {
+			d.RuntimeID = runtimeID
+			all = append(all, d)
+		}
 	}
 	return all, nil
 }
@@ -237,18 +270,77 @@ func ListDevices() ([]deviceEntry, error) {
 // type name.
 type DeviceEntry = deviceEntry
 
-func run(args ...string) ([]byte, error) {
-	full := append([]string{"simctl"}, args...)
-	cmd := exec.Command("xcrun", full...)
+// EnvSimctlTimeout overrides DefaultSimctlTimeout, parsed with
+// time.ParseDuration (e.g. "30s", "500ms"). An unparseable or non-positive
+// value is ignored in favor of the default rather than treated as an error —
+// a malformed override should never turn into "no timeout at all".
+const EnvSimctlTimeout = "SIMPOOL_SIMCTL_TIMEOUT"
+
+// DefaultSimctlTimeout bounds every simctl call routed through run() — every
+// one except `bootstatus`, which has its own separate, typically much
+// longer deadline via BootAndWait's timeout parameter and must not be
+// double-bounded here as well. 120s because `simctl create` on a runtime's
+// first use and `simctl delete` of a multi-GB device are legitimately slow
+// on a loaded machine; anything past that is a wedge, not work — and a
+// wedged simctl must never be allowed to hang `simpool lease`, invoked by
+// mav as `target_command` roughly once a minute with nothing to retry it.
+const DefaultSimctlTimeout = 120 * time.Second
+
+// ErrSimctlTimeout is the sentinel wrapped into run()'s returned error when
+// a simctl invocation is killed for exceeding its deadline. Check with
+// errors.Is, not string matching.
+var ErrSimctlTimeout = errors.New("simctl call timed out")
+
+func simctlTimeout() time.Duration {
+	if v := os.Getenv(EnvSimctlTimeout); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultSimctlTimeout
+}
+
+// runContext executes one `xcrun` invocation and returns its stdout. It is a
+// package-level var — not a plain function — so tests can point it at
+// something other than the real `xcrun` binary (e.g. `/bin/sleep`) to
+// exercise run()'s timeout handling hermetically, with no simulator and no
+// Xcode involved.
+var runContext = func(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "xcrun", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())
 		}
-		return nil, fmt.Errorf("xcrun %s: %w: %s", strings.Join(full, " "), err, msg)
+		if msg != "" {
+			return stdout.Bytes(), fmt.Errorf("%w: %s", err, msg)
+		}
+		return stdout.Bytes(), err
 	}
 	return stdout.Bytes(), nil
+}
+
+// run invokes `xcrun simctl <args...>`, bounded by simctlTimeout() so a
+// wedged CoreSimulator process can never hang the caller indefinitely (see
+// DefaultSimctlTimeout). The command line is always named in the returned
+// error — both on timeout and on ordinary failure — so a caller several
+// layers up (e.g. `simpool lease`'s one-line stdout contract, which cannot
+// carry this detail itself) still has something actionable on stderr.
+func run(args ...string) ([]byte, error) {
+	full := append([]string{"simctl"}, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), simctlTimeout())
+	defer cancel()
+
+	out, err := runContext(ctx, full...)
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("%w: xcrun %s", ErrSimctlTimeout, strings.Join(full, " "))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("xcrun %s: %w", strings.Join(full, " "), err)
+	}
+	return out, nil
 }

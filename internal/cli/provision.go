@@ -34,7 +34,13 @@ func acquireAndProvision(device, osVersion string, count, max int, wait time.Dur
 	}
 
 	for _, s := range slots {
-		if err := pool.EnsureProvisioned(s, ownerCmd, mode); err != nil {
+		// "with"/"acquire" never hold a lease of their own — see
+		// EnsureProvisioned's leaseKey doc comment — so "" here is not a
+		// placeholder, it is the correct value: no real lease key can ever
+		// equal it (Lease.Alive() requires a non-empty Key), so the
+		// substance-mismatch guard's "is this MY lease" check can never
+		// accidentally match someone else's.
+		if err := pool.EnsureProvisioned(s, ownerCmd, mode, ""); err != nil {
 			release()
 			return nil, "", fmt.Errorf("slot %s: %w", s.Dir, err)
 		}

@@ -238,13 +238,45 @@ func BootAndWait(udid string, timeout time.Duration) error {
 	return BootAndWaitWithDeps(udid, timeout, liveBootWaitDeps())
 }
 
+// firstAttemptShare is how much of the overall timeout the first attempt
+// gets before the retry attempt claims whatever remains. 2/3 so a cold boot
+// (the common case, no retry needed) gets the lion's share of the budget,
+// while still leaving the retry attempt a real chance rather than a token
+// one.
+const firstAttemptShare = 2
+
+// minRetryBudget is the smallest remaining budget worth handing a retry
+// attempt of its own: two full SpringBoard poll cycles, so the retry has a
+// real chance to observe at least one genuine readiness check rather than
+// expiring before its first poll could even complete. Below this, a fresh
+// context.WithTimeout would expire before bootstatus (an exec.CommandContext
+// call) or even one SpringBoard poll could finish real work — so retrying
+// would only pay for a shutdown that then does nothing, which is worse than
+// not retrying at all (see the bug this constant fixes: two attempts used to
+// share one already-exhausted context, so the "retry" always did zero work
+// regardless of how much time was nominally left).
+const minRetryBudget = 2 * springBoardPollInterval
+
 // BootAndWaitWithDeps is BootAndWait with its primitives injected; see
 // BootWaitDeps.
+//
+// The two attempts each get their OWN context.WithTimeout, not one shared
+// between them: sharing a single context (the bug this fixed) means the
+// first attempt's polling loop runs until that context is exhausted, so by
+// the time the retry branch runs its deadline is already in the past —
+// every real primitive backed by that context (exec.CommandContext,
+// runContext) then fails instantly without doing any work, and the device
+// is left Shutdown by the retry's own deps.Shutdown call for nothing.
+// Splitting the caller's timeout into two independent budgets — most of it
+// for the first attempt, the true remainder for the retry — is what makes
+// the retry a real second boot instead of a guaranteed no-op.
 func BootAndWaitWithDeps(udid string, timeout time.Duration, deps BootWaitDeps) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	deadline := time.Now().Add(timeout)
 
-	err := waitForReadyOnce(ctx, udid, deps)
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), timeout*firstAttemptShare/(firstAttemptShare+1))
+	defer firstCancel()
+
+	err := waitForReadyOnce(firstCtx, udid, deps)
 	if err == nil {
 		time.Sleep(BootSettleMargin)
 		return nil
@@ -255,14 +287,23 @@ func BootAndWaitWithDeps(udid string, timeout time.Duration, deps BootWaitDeps) 
 		return err
 	}
 
+	remaining := time.Until(deadline)
+	if remaining < minRetryBudget {
+		return fmt.Errorf("simulator %s did not become ready within %s (SpringBoard never answered, and too little of the budget remained to retry with a real boot) — it may be wedged; try `xcrun simctl diagnose` if this keeps happening", udid, timeout)
+	}
+
 	// SpringBoard never answered within its share of the deadline. Retry
 	// exactly once — never in a loop, so a permanently wedged simulator
 	// fails in bounded time instead of retrying forever — by shutting down
-	// and running the same sequence again against whatever's left of ctx.
+	// and running the same sequence again against a fresh context carrying
+	// the true remainder of the caller's timeout, not the first attempt's
+	// already-spent one.
 	if serr := deps.Shutdown(udid); serr != nil {
 		return fmt.Errorf("shutting down %s before retrying boot: %w", udid, serr)
 	}
-	err = waitForReadyOnce(ctx, udid, deps)
+	retryCtx, retryCancel := context.WithTimeout(context.Background(), remaining)
+	defer retryCancel()
+	err = waitForReadyOnce(retryCtx, udid, deps)
 	if err == nil {
 		time.Sleep(BootSettleMargin)
 		return nil

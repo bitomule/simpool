@@ -108,13 +108,32 @@ func substanceMismatchReason(entry simctl.DeviceEntry, runtimeID, deviceTypeID s
 // It only ever deletes and signals recreation once every guard can be
 // positively confirmed: this slot's poison state is NotPoisoned (no
 // evidence, and no unverifiable evidence either, of a still-alive previous
-// consumer) and no live lease sits on the slot. Any guard that cannot be
-// confirmed — a poison check that itself failed, an unreadable lease.json —
-// returns an error instead of ever silently reusing OR silently deleting: a
-// stale-runtime simulator handed to a caller is a slow, confusing failure,
-// but destroying a simulator out from under an active session is worse, so
-// when in doubt this always chooses the error over either extreme.
-func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason string) error {
+// consumer) and no live lease belonging to a DIFFERENT caller sits on the
+// slot. Any guard that cannot be confirmed — a poison check that itself
+// failed, an unreadable lease.json — returns an error instead of ever
+// silently reusing OR silently deleting: a stale-runtime simulator handed to
+// a caller is a slow, confusing failure, but destroying a simulator out from
+// under an active session is worse, so when in doubt this always chooses the
+// error over either extreme.
+//
+// ownLeaseKey is the caller's OWN lease key, if this call is happening on
+// the `simpool lease` path — empty for `with`/`acquire`, which never hold a
+// lease at all. It matters because AcquireLease writes lease.json for its
+// own key BEFORE calling EnsureProvisioned (so the flock-free reservation is
+// visible to any concurrent claimant immediately, not just once provisioning
+// finishes): by the time this function runs on that path, ReadLease below is
+// reading the very lease the current call itself just wrote milliseconds
+// earlier, not evidence of some OTHER live consumer. Without this
+// distinction every `simpool lease` substance mismatch would refuse itself
+// unconditionally — the guard built for "someone else is using this slot"
+// firing on "I am using this slot", turning a self-healing drift (an Xcode
+// upgrade replacing a runtime) into a permanent wedge that never ages out,
+// since sticky renewal keeps re-extending this exact lease's TTL on every
+// subsequent call. A lease for a different key is exactly what this must
+// keep refusing to touch — that is the real exclusion mechanism during
+// provisioning (see AcquireLease's doc comment: the slot flock is released
+// before this runs).
+func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason, ownLeaseKey string) error {
 	group := filepath.Base(s.GroupDir)
 	label := fmt.Sprintf("%s/slot-%d", group, s.Number)
 
@@ -128,7 +147,7 @@ func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason string) 
 	if err != nil {
 		return fmt.Errorf("%s: device %s does not match requested substance (%s), but lease.json could not be read — refusing to delete or reuse it: %w", label, udid, reason, err)
 	}
-	if lease.Alive() {
+	if lease.Alive() && lease.Key != ownLeaseKey {
 		return fmt.Errorf("%s: device %s does not match requested substance (%s), but a live lease (key %q) is on this slot — refusing to delete or reuse it", label, udid, reason, lease.Key)
 	}
 
@@ -161,14 +180,20 @@ func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason string) 
 // caller; every other concurrent acquisition in the same (or any other)
 // device+OS group proceeds unaffected.
 //
-// mode records which subcommand is provisioning ("with" or "acquire") so
-// `reap`/`doctor` can tell a legitimately child-less `acquire` holder apart
-// from a stuck `with` (see Meta.Mode).
-func EnsureProvisioned(s *Slot, ownerCmd, mode string) error {
-	return ensureProvisioned(s, ownerCmd, mode, liveProvisionDeps, BootTimeout())
+// mode records which subcommand is provisioning ("with", "acquire", or
+// "lease") so `reap`/`doctor` can tell a legitimately child-less `acquire`
+// holder apart from a stuck `with` (see Meta.Mode).
+//
+// leaseKey is the caller's own sticky lease key on the `simpool lease` path
+// (see RunLease) — pass "" for `with`/`acquire`, which never hold a lease.
+// It is threaded through to resolveSubstanceMismatch so a substance
+// mismatch on the lease path can tell "my own just-written lease" apart
+// from "someone else's live lease" — see that function's doc comment.
+func EnsureProvisioned(s *Slot, ownerCmd, mode, leaseKey string) error {
+	return ensureProvisioned(s, ownerCmd, mode, leaseKey, liveProvisionDeps, BootTimeout())
 }
 
-func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootTimeout time.Duration) error {
+func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionDeps, bootTimeout time.Duration) error {
 	name := s.DeviceName()
 	udid := s.Meta.UDID
 	// knownState carries a device's already-known state (from the Find or
@@ -262,7 +287,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootT
 	// really is nothing usable at all).
 	if haveAdopted && resolveErr == nil && strictSubstanceEnabled() && !substanceOK(adopted, runtimeID, deviceTypeID) {
 		reason := substanceMismatchReason(adopted, runtimeID, deviceTypeID)
-		if err := resolveSubstanceMismatch(s, deps, udid, reason); err != nil {
+		if err := resolveSubstanceMismatch(s, deps, udid, reason, leaseKey); err != nil {
 			return err
 		}
 		// Guards confirmed safe and the mismatched device is now gone —

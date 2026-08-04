@@ -101,7 +101,7 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ownerCmd := "lease (key " + key + ")"
-	if err := pool.EnsureProvisioned(slot, ownerCmd, "lease"); err != nil {
+	if err := pool.EnsureProvisioned(slot, ownerCmd, "lease", key); err != nil {
 		fmt.Fprintln(stderr, "simpool lease:", err)
 		return 1
 	}

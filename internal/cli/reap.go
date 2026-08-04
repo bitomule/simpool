@@ -58,6 +58,8 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
 	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify (a recycled pid, or a process group owned by another user): forget this slot's identity and delete its device, WITHOUT signaling the process that poisoned it — that process, if actually still alive, is left running untouched. Only ever affects a `with` slot whose poison is an unverifiable process-group fingerprint; never a live lease/acquire consumer or a check that merely failed to run. Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
+	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
+	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -85,7 +87,102 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 			enforceWarmCap(root, groupDir, *warmCap, *dryRun, stdout, stderr)
 		}
 	}
+
+	if *orphans || *purgeOrphans {
+		reapOrphans(root, groups, *purgeOrphans, *dryRun, stdout, stderr)
+	}
 	return 0
+}
+
+// listPoolDevices and shutdownOrphan/deleteOrphan are package-level vars —
+// not direct simctl calls — so tests can exercise reapOrphans' decision
+// logic (which devices count as referenced, the live-consumer safety check,
+// --dry-run) with a fake device set instead of the real one, mirroring
+// doctor.go's findDevice seam.
+var listPoolDevices = simctl.ListDevices
+var shutdownOrphan = simctl.Shutdown
+var deleteOrphan = simctl.Delete
+
+// reapOrphans finds pool-named devices in the default device set that no
+// slot currently under root references by name, and — only when purge is
+// true, i.e. only ever on the caller's explicit, opt-in request, exactly
+// like --disown-poisoned — deletes them. Scanning and reporting is always
+// safe and side-effect-free; deletion additionally requires (re-verified
+// here, not trusted from any earlier pass) that no live process still
+// references the device, failing safe (skip, don't delete) if that check
+// itself cannot complete.
+//
+// "Referenced" is checked purely by name — pool.DeviceNameForGroup, derived
+// from a slot's own directory (root, group, slot number), the same
+// self-referential-guard rule every other cross-slot check in this codebase
+// follows (see paths.go's DeviceNameForGroup doc comment) — never from any
+// slot's meta.json, which is exactly the kind of stale/lost bookkeeping
+// that produces an orphan in the first place. A device whose name embeds a
+// DIFFERENT pool root's tag (see RootTag) is unconditionally orphaned from
+// THIS root's point of view, whether that other root still exists
+// elsewhere on disk or not: this invocation only ever knows about slots
+// under its own root, so a foreign-tag device can never be "referenced" by
+// anything it can see.
+func reapOrphans(root string, groups []string, purge, dryRun bool, stdout, stderr io.Writer) {
+	devices, err := listPoolDevices()
+	if err != nil {
+		fmt.Fprintf(stderr, "reap --orphans: listing devices: %v\n", err)
+		return
+	}
+
+	known := map[string]bool{}
+	for _, groupDir := range groups {
+		group := filepath.Base(groupDir)
+		for _, n := range pool.ListSlotNumbers(groupDir) {
+			known[pool.DeviceNameForGroup(root, group, n)] = true
+		}
+	}
+	rootTag := pool.RootTag(root)
+
+	for _, d := range devices {
+		if !pool.IsPoolName(d.Name) || known[d.Name] {
+			continue
+		}
+
+		reason := "no slot directory under this pool root currently references this name"
+		if tag, ok := poolDeviceTag(d.Name); !ok {
+			reason = "malformed pool-prefixed name"
+		} else if tag != rootTag {
+			reason = fmt.Sprintf("belongs to a different (possibly vanished) pool root %s, not this pool's root %s", tag, rootTag)
+		}
+
+		if !purge {
+			fmt.Fprintf(stdout, "ORPHAN %s (%s)  %s — rerun with --purge-orphans to delete\n", d.Name, d.UDID, reason)
+			continue
+		}
+
+		// Never a witness to itself: re-verify liveness right before
+		// acting, not from any earlier state, and treat a check that
+		// cannot complete as "still referenced" — the same fail-safe rule
+		// CheckPoison and every poisoned-slot guard in this codebase
+		// applies to a liveness check that didn't finish.
+		live, lerr := procs.LiveConsumers(d.UDID)
+		if lerr != nil {
+			fmt.Fprintf(stdout, "SKIP   %s (%s)  could not verify no live process still references it (%v) — not touching\n", d.Name, d.UDID, lerr)
+			continue
+		}
+		if len(live) > 0 {
+			fmt.Fprintf(stdout, "SKIP   %s (%s)  a live process still references this device — not touching\n", d.Name, d.UDID)
+			continue
+		}
+
+		fmt.Fprintf(stdout, "PURGE  %s (%s)  %s\n", d.Name, d.UDID, reason)
+		if dryRun {
+			continue
+		}
+		if err := shutdownOrphan(d.UDID); err != nil {
+			fmt.Fprintf(stderr, "reap --orphans: shutting down %s: %v\n", d.UDID, err)
+			continue
+		}
+		if err := deleteOrphan(d.UDID); err != nil {
+			fmt.Fprintf(stderr, "reap --orphans: deleting %s: %v\n", d.UDID, err)
+		}
+	}
 }
 
 // warmCandidate is a free, verified-safe, currently-booted slot considered

@@ -348,8 +348,22 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// racing partway through. This is a different fast path than skipping
 	// the wait mid-boot: that would reproduce the exact bug being fixed.
 	if knownState != "Booted" {
-		if err := deps.bootAndWait(udid, bootTimeout); err != nil {
-			return fmt.Errorf("booting %s: %w", udid, err)
+		// Machine-wide boot-concurrency gate (see bootgate.go): held only
+		// across the boot itself, never the rest of provisioning or the
+		// slot's own lifetime, and always acquired AFTER the slot's own
+		// flock (which the caller already holds at this point — see
+		// AcquireBootGate's doc comment for why that fixed order can never
+		// deadlock). Acquisition is itself bounded by bootTimeout so a
+		// machine stuck at the concurrency cap fails the same clear,
+		// actionable way a wedged boot itself would, rather than hanging.
+		gate, err := AcquireBootGate(s.Root, bootTimeout)
+		if err != nil {
+			return err
+		}
+		bootErr := deps.bootAndWait(udid, bootTimeout)
+		_ = gate.Release()
+		if bootErr != nil {
+			return fmt.Errorf("booting %s: %w", udid, bootErr)
 		}
 	}
 

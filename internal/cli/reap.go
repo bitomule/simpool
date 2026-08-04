@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,6 +57,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
 	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify (a recycled pid, or a process group owned by another user): forget this slot's identity and delete its device, WITHOUT signaling the process that poisoned it — that process, if actually still alive, is left running untouched. Only ever affects a `with` slot whose poison is an unverifiable process-group fingerprint; never a live lease/acquire consumer or a check that merely failed to run. Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
+	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -77,7 +79,111 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, stdout, stderr)
 		}
 	}
+
+	if *warmCap > 0 {
+		for _, groupDir := range groups {
+			enforceWarmCap(root, groupDir, *warmCap, *dryRun, stdout, stderr)
+		}
+	}
 	return 0
+}
+
+// warmCandidate is a free, verified-safe, currently-booted slot considered
+// by enforceWarmCap for its group's --warm accounting.
+type warmCandidate struct {
+	n    int
+	lock *pool.Lock
+	meta pool.Meta
+}
+
+// enforceWarmCap separates "how many slots may be resident/locked at once"
+// (--max, unchanged, enforced by AcquireSlots/AcquireLease at claim time)
+// from "how many stay booted once freed" (--warm, this function): rules_idb
+// found that conflating the two — capping residue at the same number as
+// concurrency — makes sustained runs 2-4x slower and flaky, since every run
+// past the first pays a fresh cold boot for a slot that was needlessly shut
+// down the moment it went idle.
+//
+// Only ever acts on a group's MOST-RECENTLY-used slots beyond warmCap: it
+// keeps the warmCap most-recently-used free+booted slots running and shuts
+// down the rest, so the ones most likely to be reused next stay warm.
+// Exactly like reapSlot, every candidate's own flock is taken first and
+// every one of reapSlot's existing safety checks (unreadable lease treated
+// as busy, a live lease, a poisoned slot, a name that doesn't match this
+// exact slot) is re-applied here independently — never a witness to its own
+// meta.json, never touching a slot this pass cannot positively verify is
+// free, idle, and genuinely this slot's own device.
+func enforceWarmCap(root, groupDir string, warmCap int, dryRun bool, stdout, stderr io.Writer) {
+	group := filepath.Base(groupDir)
+	var warm []warmCandidate
+
+	for _, n := range pool.ListSlotNumbers(groupDir) {
+		dir := pool.SlotDir(groupDir, n)
+		lock, err := pool.TryLock(pool.LockPath(dir))
+		if err != nil {
+			if err != pool.ErrBusy {
+				fmt.Fprintf(stderr, "reap %s/slot-%d: --warm: %v\n", group, n, err)
+			}
+			continue // busy (held, or leased flock-free) is never this pass's to touch
+		}
+
+		if lease, err := pool.ReadLease(dir); err != nil || lease.Alive() {
+			// Unreadable or alive: never guess-touch, mirrors reapSlot's own
+			// "unreadable means occupied" rule for lease.json.
+			_ = lock.Release()
+			continue
+		}
+
+		meta := pool.ReadMeta(dir)
+		if poison := pool.CheckPoison(meta); poison.Poisoned() {
+			// A free-looking slot whose previous consumer might still be
+			// alive is never eligible — same rule as reapSlot's own idle/
+			// --cold/--purge accounting.
+			_ = lock.Release()
+			continue
+		}
+		if meta.UDID == "" {
+			_ = lock.Release()
+			continue
+		}
+		entry, found, err := findDevice(meta.UDID)
+		if err != nil || !found {
+			_ = lock.Release()
+			continue
+		}
+		// The expected name is derived from this slot's own directory
+		// (root, group, slot number), never from meta.Device/meta.OSVersion
+		// — same self-referential-guard rule as reapSlot's cross-slot check.
+		if want := pool.DeviceNameForGroup(root, group, n); entry.Name != want || entry.State != "Booted" {
+			_ = lock.Release()
+			continue
+		}
+
+		warm = append(warm, warmCandidate{n: n, lock: lock, meta: meta})
+	}
+
+	sort.SliceStable(warm, func(i, j int) bool {
+		return warm[i].meta.LastUsed.After(warm[j].meta.LastUsed)
+	})
+
+	for i, c := range warm {
+		if i < warmCap {
+			_ = c.lock.Release()
+			continue
+		}
+		label := fmt.Sprintf("%s/slot-%d", group, c.n)
+		idle := time.Since(c.meta.LastUsed)
+		if dryRun {
+			fmt.Fprintf(stdout, "WARM  %s  would shut down %s (idle %s) to stay within --warm %d cap\n", label, c.meta.UDID, idle.Round(time.Second), warmCap)
+			_ = c.lock.Release()
+			continue
+		}
+		fmt.Fprintf(stdout, "WARM  %s  shutting down %s (idle %s) to stay within --warm %d cap\n", label, c.meta.UDID, idle.Round(time.Second), warmCap)
+		if err := simctl.Shutdown(c.meta.UDID); err != nil {
+			fmt.Fprintf(stderr, "reap %s: --warm: %v\n", label, err)
+		}
+		_ = c.lock.Release()
+	}
 }
 
 func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, stdout, stderr io.Writer) {

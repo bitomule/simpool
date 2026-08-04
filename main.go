@@ -35,9 +35,11 @@ Usage:
   simpool status
       List every slot: lock state, holder, lease, device boot state.
 
-  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--dry-run]
+  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--dry-run]
       Recycle free+cold slots; never touches one with a live owner or an
-      active lease. Also clears expired lease files.
+      active lease. Also clears expired lease files. --warm caps how many
+      free simulators stay booted per group, independent of --max (which
+      caps how many may be resident/locked at once).
 
   simpool doctor
       Check pool coherence. Exits non-zero if anything looks wrong.`)

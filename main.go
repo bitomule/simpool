@@ -32,6 +32,12 @@ Usage:
   simpool release [--key K]
       Drop --key's lease immediately instead of waiting out its TTL.
 
+  simpool preboot --device D --os V [--count N] [--max M]
+      Warm up N slots (boot their simulators) without a consumer, then
+      release them immediately, so the next with/acquire/lease/bazel-test
+      call finds a warm slot instead of paying a cold boot itself. Never
+      waits for capacity — a full group is left as-is, not blocked on.
+
   simpool status
       List every slot: lock state, holder, lease, device boot state.
 
@@ -61,6 +67,8 @@ func main() {
 		code = cli.RunLease(rest, os.Stdout, os.Stderr)
 	case "release":
 		code = cli.RunRelease(rest, os.Stdout, os.Stderr)
+	case "preboot":
+		code = cli.RunPreboot(rest, os.Stdout, os.Stderr)
 	case "status":
 		code = cli.RunStatus(rest, os.Stdout, os.Stderr)
 	case "reap":

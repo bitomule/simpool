@@ -3,6 +3,7 @@ package pool
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/bitomule/simpool/internal/simctl"
@@ -46,6 +47,11 @@ type provisionDeps struct {
 	resolveRuntime func(device, osVersion string) (runtimeID, deviceTypeID string, err error)
 	create         func(name, deviceTypeID, runtimeID string) (string, error)
 	bootAndWait    func(udid string, timeout time.Duration) error
+	// shutdown and delete are only ever invoked by the substance-mismatch
+	// path below (see resolveSubstanceMismatch) — never by the ordinary
+	// adopt-or-create flow.
+	shutdown func(udid string) error
+	delete   func(udid string) error
 }
 
 var liveProvisionDeps = provisionDeps{
@@ -54,6 +60,86 @@ var liveProvisionDeps = provisionDeps{
 	resolveRuntime: simctl.ResolveRuntime,
 	create:         simctl.Create,
 	bootAndWait:    simctl.BootAndWait,
+	shutdown:       simctl.Shutdown,
+	delete:         simctl.Delete,
+}
+
+// EnvStrictSubstance, when set to "0", disables substance verification and
+// falls back to the old name-only reuse — an emergency escape hatch, not a
+// recommended setting: without it, a device that has drifted out from under
+// its slot (a runtime Xcode replaced, one that's gone isAvailable:false)
+// gets adopted and re-adopted forever, failing every boot with an opaque
+// error instead of being replaced once, here.
+const EnvStrictSubstance = "SIMPOOL_STRICT_SUBSTANCE"
+
+func strictSubstanceEnabled() bool {
+	return os.Getenv(EnvStrictSubstance) != "0"
+}
+
+// substanceOK reports whether entry is actually usable as the device the
+// caller resolved device/osVersion to — not just named right. Matching by
+// name alone lets a device survive a runtime upgrade that quietly replaced
+// what it used to point at: "latest" drifts across Xcode upgrades, and a
+// name match alone cannot tell a healthy device from one that has gone
+// isAvailable:false or is still parked on a runtime that no longer exists.
+func substanceOK(entry simctl.DeviceEntry, runtimeID, deviceTypeID string) bool {
+	return entry.IsAvailable && entry.RuntimeID == runtimeID && entry.DeviceTypeID == deviceTypeID
+}
+
+// substanceMismatchReason renders a human-readable explanation of why entry
+// failed substanceOK, for the log line resolveSubstanceMismatch prints and
+// for actionable errors when the mismatch can't be safely acted on.
+func substanceMismatchReason(entry simctl.DeviceEntry, runtimeID, deviceTypeID string) string {
+	switch {
+	case !entry.IsAvailable:
+		return "device reports isAvailable=false"
+	case entry.RuntimeID != runtimeID:
+		return fmt.Sprintf("device runtime %s does not match resolved runtime %s", entry.RuntimeID, runtimeID)
+	case entry.DeviceTypeID != deviceTypeID:
+		return fmt.Sprintf("device type %s does not match resolved device type %s", entry.DeviceTypeID, deviceTypeID)
+	default:
+		return "substance mismatch"
+	}
+}
+
+// resolveSubstanceMismatch decides what to do about an adopted device (udid,
+// already confirmed by the caller to be exactly this slot's own by name —
+// see DeviceNameForGroup) whose substance doesn't match what was requested.
+// It only ever deletes and signals recreation once every guard can be
+// positively confirmed: this slot's poison state is NotPoisoned (no
+// evidence, and no unverifiable evidence either, of a still-alive previous
+// consumer) and no live lease sits on the slot. Any guard that cannot be
+// confirmed — a poison check that itself failed, an unreadable lease.json —
+// returns an error instead of ever silently reusing OR silently deleting: a
+// stale-runtime simulator handed to a caller is a slow, confusing failure,
+// but destroying a simulator out from under an active session is worse, so
+// when in doubt this always chooses the error over either extreme.
+func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason string) error {
+	group := filepath.Base(s.GroupDir)
+	label := fmt.Sprintf("%s/slot-%d", group, s.Number)
+
+	if poison := CheckPoison(s.Meta); poison.Reason == PoisonedByCheckFailure {
+		return fmt.Errorf("%s: device %s does not match requested substance (%s), but its previous consumer's liveness could not be verified — refusing to delete or reuse it: %v", label, udid, reason, poison.Err)
+	} else if poison.Poisoned() {
+		return fmt.Errorf("%s: device %s does not match requested substance (%s), but its previous consumer still appears alive (%s) — refusing to delete or reuse it", label, udid, reason, poison)
+	}
+
+	lease, err := ReadLease(s.Dir)
+	if err != nil {
+		return fmt.Errorf("%s: device %s does not match requested substance (%s), but lease.json could not be read — refusing to delete or reuse it: %w", label, udid, reason, err)
+	}
+	if lease.Alive() {
+		return fmt.Errorf("%s: device %s does not match requested substance (%s), but a live lease (key %q) is on this slot — refusing to delete or reuse it", label, udid, reason, lease.Key)
+	}
+
+	fmt.Fprintf(os.Stderr, "simpool: %s device %s does not match requested substance (%s) — deleting and recreating\n", label, udid, reason)
+	if err := deps.shutdown(udid); err != nil {
+		return fmt.Errorf("%s: shutting down %s before recreating for a substance mismatch: %w", label, udid, err)
+	}
+	if err := deps.delete(udid); err != nil {
+		return fmt.Errorf("%s: deleting %s for a substance mismatch: %w", label, udid, err)
+	}
+	return nil
 }
 
 // EnsureProvisioned makes sure s has a booted simulator matching
@@ -96,6 +182,20 @@ func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootT
 	// default.
 	knownState := ""
 
+	// Hoisted to the top: both the reuse path (to verify substance — see
+	// substanceOK) and the create path need this, and it was already being
+	// called on both paths separately before this change, so this is a net
+	// simplification, not an extra subprocess. resolveErr is deliberately
+	// not returned here: a device this call can otherwise adopt outright
+	// must not fail to hand out just because ResolveRuntime hiccuped —
+	// only the create path (which has nothing else to fall back on) and
+	// the substance check (which has nothing to compare against) treat it
+	// as blocking, below.
+	runtimeID, deviceTypeID, resolveErr := deps.resolveRuntime(s.Device, s.OSVer)
+
+	var adopted simctl.DeviceEntry
+	haveAdopted := false
+
 	if udid != "" {
 		entry, found, err := deps.find(udid)
 		if err != nil {
@@ -113,6 +213,8 @@ func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootT
 			udid = ""
 		} else {
 			knownState = entry.State
+			adopted = entry
+			haveAdopted = true
 		}
 	}
 
@@ -146,14 +248,34 @@ func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootT
 			if len(matches) == 1 {
 				udid = matches[0].UDID
 				knownState = matches[0].State
+				adopted = matches[0]
+				haveAdopted = true
 			}
 		}
 	}
 
-	if udid == "" {
-		runtimeID, deviceTypeID, err := deps.resolveRuntime(s.Device, s.OSVer)
-		if err != nil {
+	// Substance verification: a name match alone is not proof this device
+	// is actually usable — see substanceOK's doc comment. Skipped (falls
+	// back to the old name-only reuse) when SIMPOOL_STRICT_SUBSTANCE=0, or
+	// when resolveErr means there is nothing to compare against anyway (the
+	// create path below will surface that same error if it turns out there
+	// really is nothing usable at all).
+	if haveAdopted && resolveErr == nil && strictSubstanceEnabled() && !substanceOK(adopted, runtimeID, deviceTypeID) {
+		reason := substanceMismatchReason(adopted, runtimeID, deviceTypeID)
+		if err := resolveSubstanceMismatch(s, deps, udid, reason); err != nil {
 			return err
+		}
+		// Guards confirmed safe and the mismatched device is now gone —
+		// fall through to the create path below exactly as if nothing had
+		// ever been found under this name.
+		udid = ""
+		knownState = ""
+		haveAdopted = false
+	}
+
+	if udid == "" {
+		if resolveErr != nil {
+			return resolveErr
 		}
 		newUDID, err := deps.create(name, deviceTypeID, runtimeID)
 		if err != nil {
@@ -167,18 +289,14 @@ func ensureProvisioned(s *Slot, ownerCmd, mode string, deps provisionDeps, bootT
 		// either: knownState is left "" (meaning "unknown/not booted"),
 		// which is exactly what makes the boot-and-wait step below run
 		// unconditionally for it.
-	}
-
-	if s.Meta.RuntimeID == "" {
-		// udid was adopted (matched by UDID or recovered by name) rather
-		// than freshly created above, so the branch that resolves and
-		// records RuntimeID never ran. Left empty, MAV_TARGET_RUNTIME (§5)
-		// would silently and permanently export "" for this slot. Best
-		// effort: a failure here must not block handing out an otherwise
-		// perfectly usable simulator.
-		if runtimeID, _, err := deps.resolveRuntime(s.Device, s.OSVer); err == nil {
-			s.Meta.RuntimeID = runtimeID
-		}
+	} else if haveAdopted {
+		// MAV_TARGET_RUNTIME must always describe the same device
+		// MAV_TARGET_UDID does — see Meta.RuntimeID's doc comment — so this
+		// is set from the adopted device's OWN actual runtime, never from
+		// what ResolveRuntime would have resolved for a fresh request; the
+		// two are only guaranteed to agree for a device this same call just
+		// created (the branch above).
+		s.Meta.RuntimeID = adopted.RuntimeID
 	}
 
 	// Only pay for the boot-and-wait round trip when the device isn't

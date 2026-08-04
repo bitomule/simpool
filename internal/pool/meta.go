@@ -11,8 +11,19 @@ import (
 // for that. Meta can be missing, stale, or corrupt without the pool
 // becoming incorrect; callers must tolerate a zero-value Meta.
 type Meta struct {
-	Device    string    `json:"device"`
-	OSVersion string    `json:"osVersion"`
+	Device    string `json:"device"`
+	OSVersion string `json:"osVersion"`
+	// RuntimeID is exported to consumers as MAV_TARGET_RUNTIME (see
+	// cli/common.go) and must always describe the SAME device as UDID does.
+	// ensureProvisioned sets it from the adopted device's own actual
+	// RuntimeID (simctl.DeviceEntry.RuntimeID), not from what
+	// ResolveRuntime(Device, OSVersion) would have resolved — those can
+	// disagree after a runtime drift (see the substance check in
+	// provision.go), and a MAV_TARGET_RUNTIME that names a different
+	// runtime than MAV_TARGET_UDID is actually on is worse than one that's
+	// merely stale. Only ever falls back to the resolved id for a device
+	// this same call just created, where "adopted" and "resolved" are by
+	// construction the same runtime.
 	RuntimeID string    `json:"runtimeId"`
 	UDID      string    `json:"udid"`
 	Created   time.Time `json:"created"`

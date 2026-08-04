@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -55,6 +57,36 @@ func stubResolveRuntime(runtimeID, deviceTypeID string) func(device, osVersion s
 	}
 }
 
+func neverShutdown(t *testing.T) func(udid string) error {
+	return func(udid string) error {
+		t.Fatal("shutdown should not be called: no substance mismatch was set up in this test")
+		return nil
+	}
+}
+
+func neverDelete(t *testing.T) func(udid string) error {
+	return func(udid string) error {
+		t.Fatal("delete should not be called: no substance mismatch was set up in this test")
+		return nil
+	}
+}
+
+// matchingEntry builds a simctl.DeviceEntry whose substance (availability,
+// runtime, device type) matches stubResolveRuntime("runtime-1",
+// "devicetype-1") — the resolveRuntime stub every test in this file uses —
+// so tests that aren't specifically about substance verification don't
+// trip the substance-mismatch path by accident.
+func matchingEntry(udid, name, state string) simctl.DeviceEntry {
+	return simctl.DeviceEntry{
+		UDID:         udid,
+		Name:         name,
+		State:        state,
+		IsAvailable:  true,
+		RuntimeID:    "runtime-1",
+		DeviceTypeID: "devicetype-1",
+	}
+}
+
 // TestEnsureProvisioned_AlreadyBootedSkipsWait is the regression test for
 // the idempotency fix: a slot whose recorded device is already reported
 // "Booted" by the same lookup that confirmed its identity must never pay
@@ -74,7 +106,7 @@ func TestEnsureProvisioned_AlreadyBootedSkipsWait(t *testing.T) {
 			if u != udid {
 				t.Fatalf("find called with %q, want %q", u, udid)
 			}
-			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Booted"}, true, nil
+			return matchingEntry(udid, name, "Booted"), true, nil
 		},
 		listDevices:    neverListDevices(t),
 		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
@@ -83,6 +115,8 @@ func TestEnsureProvisioned_AlreadyBootedSkipsWait(t *testing.T) {
 			bootAndWaitCalled = true
 			return nil
 		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
 	}
 
 	if err := ensureProvisioned(s, "lease (key test)", "lease", deps, time.Second); err != nil {
@@ -113,7 +147,7 @@ func TestEnsureProvisioned_NotBootedWaits(t *testing.T) {
 			var gotTimeout time.Duration
 			deps := provisionDeps{
 				find: func(u string) (simctl.DeviceEntry, bool, error) {
-					return simctl.DeviceEntry{UDID: udid, Name: name, State: state}, true, nil
+					return matchingEntry(udid, name, state), true, nil
 				},
 				listDevices:    neverListDevices(t),
 				resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
@@ -123,6 +157,8 @@ func TestEnsureProvisioned_NotBootedWaits(t *testing.T) {
 					gotTimeout = timeout
 					return nil
 				},
+				shutdown: neverShutdown(t),
+				delete:   neverDelete(t),
 			}
 
 			wantTimeout := 42 * time.Second
@@ -151,7 +187,7 @@ func TestEnsureProvisioned_SlowBootWaitsInsteadOfFailing(t *testing.T) {
 
 	deps := provisionDeps{
 		find: func(u string) (simctl.DeviceEntry, bool, error) {
-			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Booting"}, true, nil
+			return matchingEntry(udid, name, "Booting"), true, nil
 		},
 		listDevices:    neverListDevices(t),
 		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
@@ -163,6 +199,8 @@ func TestEnsureProvisioned_SlowBootWaitsInsteadOfFailing(t *testing.T) {
 			time.Sleep(30 * time.Millisecond)
 			return nil
 		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
 	}
 
 	start := time.Now()
@@ -189,7 +227,7 @@ func TestEnsureProvisioned_BootTimeoutIsClearAndNeverSilent(t *testing.T) {
 
 	deps := provisionDeps{
 		find: func(u string) (simctl.DeviceEntry, bool, error) {
-			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Booting"}, true, nil
+			return matchingEntry(udid, name, "Booting"), true, nil
 		},
 		listDevices:    neverListDevices(t),
 		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
@@ -197,6 +235,8 @@ func TestEnsureProvisioned_BootTimeoutIsClearAndNeverSilent(t *testing.T) {
 		bootAndWait: func(u string, timeout time.Duration) error {
 			return timeoutErr
 		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
 	}
 
 	err := ensureProvisioned(s, "with", "with", deps, time.Second)
@@ -422,5 +462,243 @@ func TestReadinessGate_RetriesExactlyOnceWhenReadinessNeverArrives(t *testing.T)
 	}
 	if readyCalls == 0 {
 		t.Fatal("SpringBoardReady was never polled at all")
+	}
+}
+
+// TestEnsureProvisioned_SubstanceMismatchDeletesAndRecreates covers the
+// three ways an adopted device can fail substanceOK: wrong runtime,
+// isAvailable=false, wrong device type. Each must delete the stale device
+// and create a fresh one — never silently reused just because its name
+// still matches.
+func TestEnsureProvisioned_SubstanceMismatchDeletesAndRecreates(t *testing.T) {
+	const matchRuntime, matchDevType = "runtime-1", "devicetype-1"
+
+	cases := []struct {
+		name  string
+		entry func(udid, deviceName string) simctl.DeviceEntry
+	}{
+		{
+			name: "wrong runtime",
+			entry: func(udid, deviceName string) simctl.DeviceEntry {
+				return simctl.DeviceEntry{UDID: udid, Name: deviceName, State: "Shutdown", IsAvailable: true, RuntimeID: "runtime-OLD", DeviceTypeID: matchDevType}
+			},
+		},
+		{
+			name: "not available",
+			entry: func(udid, deviceName string) simctl.DeviceEntry {
+				return simctl.DeviceEntry{UDID: udid, Name: deviceName, State: "Shutdown", IsAvailable: false, RuntimeID: matchRuntime, DeviceTypeID: matchDevType}
+			},
+		},
+		{
+			name: "wrong device type",
+			entry: func(udid, deviceName string) simctl.DeviceEntry {
+				return simctl.DeviceEntry{UDID: udid, Name: deviceName, State: "Shutdown", IsAvailable: true, RuntimeID: matchRuntime, DeviceTypeID: "devicetype-OLD"}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			device, osVersion := "iPhone 17 Pro", "26.3"
+			oldUDID := "stale-udid"
+			s := fakeSlot(t, device, osVersion, oldUDID)
+			name := s.DeviceName()
+			newUDID := "recreated-udid"
+
+			var shutdownCalls, deleteCalls, createCalls int
+			var shutdownUDID, deletedUDID string
+
+			deps := provisionDeps{
+				find: func(u string) (simctl.DeviceEntry, bool, error) {
+					return tc.entry(u, name), true, nil
+				},
+				listDevices:    neverListDevices(t),
+				resolveRuntime: stubResolveRuntime(matchRuntime, matchDevType),
+				create: func(n, deviceTypeID, runtimeID string) (string, error) {
+					createCalls++
+					if deviceTypeID != matchDevType || runtimeID != matchRuntime {
+						t.Errorf("create called with (%q,%q), want resolved (%q,%q)", deviceTypeID, runtimeID, matchDevType, matchRuntime)
+					}
+					return newUDID, nil
+				},
+				bootAndWait: func(u string, timeout time.Duration) error { return nil },
+				shutdown: func(u string) error {
+					shutdownCalls++
+					shutdownUDID = u
+					return nil
+				},
+				delete: func(u string) error {
+					deleteCalls++
+					deletedUDID = u
+					return nil
+				},
+			}
+
+			if err := ensureProvisioned(s, "with", "with", deps, time.Second); err != nil {
+				t.Fatalf("ensureProvisioned: %v", err)
+			}
+			if shutdownCalls != 1 {
+				t.Errorf("shutdown called %d times, want 1", shutdownCalls)
+			}
+			if deleteCalls != 1 {
+				t.Fatalf("delete called %d times, want 1", deleteCalls)
+			}
+			if createCalls != 1 {
+				t.Fatalf("create called %d times, want 1", createCalls)
+			}
+			if shutdownUDID != oldUDID || deletedUDID != oldUDID {
+				t.Errorf("shutdown/delete called with (%q,%q), want the stale device %q for both", shutdownUDID, deletedUDID, oldUDID)
+			}
+			if s.Meta.UDID != newUDID {
+				t.Errorf("Meta.UDID = %q, want the recreated %q", s.Meta.UDID, newUDID)
+			}
+			if s.Meta.RuntimeID != matchRuntime {
+				t.Errorf("Meta.RuntimeID = %q, want resolved %q for a freshly created device", s.Meta.RuntimeID, matchRuntime)
+			}
+		})
+	}
+}
+
+// TestEnsureProvisioned_SubstanceMatchReusesWithoutTouchingDevice proves the
+// non-mismatch case never deletes or creates anything, and that
+// Meta.RuntimeID is set from the adopted device's own RuntimeID.
+func TestEnsureProvisioned_SubstanceMatchReusesWithoutTouchingDevice(t *testing.T) {
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "good-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return matchingEntry(udid, name, "Shutdown"), true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait:    func(u string, timeout time.Duration) error { return nil },
+		shutdown:       neverShutdown(t),
+		delete:         neverDelete(t),
+	}
+
+	if err := ensureProvisioned(s, "with", "with", deps, time.Second); err != nil {
+		t.Fatalf("ensureProvisioned: %v", err)
+	}
+	if s.Meta.UDID != udid {
+		t.Errorf("Meta.UDID = %q, want %q", s.Meta.UDID, udid)
+	}
+	if s.Meta.RuntimeID != "runtime-1" {
+		t.Errorf("Meta.RuntimeID = %q, want the adopted device's own runtime %q", s.Meta.RuntimeID, "runtime-1")
+	}
+}
+
+// TestEnsureProvisioned_SubstanceMismatchWithLiveLeaseRefusesToTouch proves
+// the "when in doubt, error" guard: a substance mismatch that would
+// otherwise be recreated must NOT be acted on while a live lease sits on
+// the slot — that lease is the sole exclusion mechanism during
+// provisioning (AcquireLease releases the slot flock before calling this),
+// so deleting the device out from under it would be exactly the failure
+// mode substance verification must never introduce.
+func TestEnsureProvisioned_SubstanceMismatchWithLiveLeaseRefusesToTouch(t *testing.T) {
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "leased-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	if err := WriteLease(s.Dir, Lease{Key: "hot-repo", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Shutdown", IsAvailable: false, RuntimeID: "runtime-1", DeviceTypeID: "devicetype-1"}, true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait: func(u string, timeout time.Duration) error {
+			t.Fatal("bootAndWait should not run when the substance mismatch could not be safely resolved")
+			return nil
+		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
+	}
+
+	err := ensureProvisioned(s, "with", "with", deps, time.Second)
+	if err == nil {
+		t.Fatal("ensureProvisioned returned nil for a substance mismatch with a live lease on the slot — must refuse, not silently reuse or delete")
+	}
+}
+
+// TestEnsureProvisioned_SubstanceMismatchWithPoisonedMetaRefusesToTouch is
+// the same guard for the other exclusion mechanism: a slot whose previous
+// consumer is still alive (verified via a real process, mirroring
+// slot_test.go's own poisoned-slot tests) must not have its device deleted
+// just because it also happens to look substance-mismatched.
+func TestEnsureProvisioned_SubstanceMismatchWithPoisonedMetaRefusesToTouch(t *testing.T) {
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "poisoned-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	orphan := exec.Command("sleep", "300")
+	orphan.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := orphan.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := orphan.Process.Pid
+	defer func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }()
+
+	s.Meta.Mode = "with"
+	s.Meta.ConsumerPGID = pgid
+
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Shutdown", IsAvailable: false, RuntimeID: "runtime-1", DeviceTypeID: "devicetype-1"}, true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait: func(u string, timeout time.Duration) error {
+			t.Fatal("bootAndWait should not run when the substance mismatch could not be safely resolved")
+			return nil
+		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
+	}
+
+	err := ensureProvisioned(s, "with", "with", deps, time.Second)
+	if err == nil {
+		t.Fatal("ensureProvisioned returned nil for a substance mismatch while the slot's previous consumer is still alive — must refuse")
+	}
+}
+
+// TestEnsureProvisioned_StrictSubstanceDisabledFallsBackToNameOnlyReuse
+// proves the SIMPOOL_STRICT_SUBSTANCE=0 escape hatch actually disables the
+// check rather than merely suppressing its side effects.
+func TestEnsureProvisioned_StrictSubstanceDisabledFallsBackToNameOnlyReuse(t *testing.T) {
+	t.Setenv(EnvStrictSubstance, "0")
+
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "drifted-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{UDID: udid, Name: name, State: "Booted", IsAvailable: false, RuntimeID: "runtime-OLD", DeviceTypeID: "devicetype-OLD"}, true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait:    func(u string, timeout time.Duration) error { return nil },
+		shutdown:       neverShutdown(t),
+		delete:         neverDelete(t),
+	}
+
+	if err := ensureProvisioned(s, "with", "with", deps, time.Second); err != nil {
+		t.Fatalf("ensureProvisioned: %v", err)
+	}
+	if s.Meta.UDID != udid {
+		t.Errorf("Meta.UDID = %q, want %q — SIMPOOL_STRICT_SUBSTANCE=0 must fall back to name-only reuse", s.Meta.UDID, udid)
 	}
 }

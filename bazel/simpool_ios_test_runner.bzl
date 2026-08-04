@@ -91,6 +91,40 @@ def _get_template_substitutions(
 
     return {"%({})s".format(key): value for key, value in substitutions.items()}
 
+# Characters that would let a value substituted into one of the generated
+# script's double-quoted "%(...)s" slots (the exec line building
+# simpool_with_args in simpool_ios_test_runner.template.sh:
+# `--device "%(device_type)s"`, `--os "%(os_version)s"`, `--wait "%(wait)s"`)
+# break out of that quoting: ctx.actions.expand_template does literal string
+# substitution with no shell escaping of any kind, so a value containing one
+# of these could turn a rule attribute into arbitrary injected bash in a
+# script `bazel test` then executes for every dependent test target.
+_UNSAFE_SHELL_CHARS = ["\"", "`", "$", "\\", "\n"]
+
+def _validate_shell_safe(value, attr_name, rule_label):
+    """Fails the build with a clear message if value cannot be safely
+    embedded inside a double-quoted string in the generated test runner
+    shell script — see _UNSAFE_SHELL_CHARS above for exactly which
+    characters and why. Catching this at analysis time turns a malformed
+    attribute into a normal, actionable Bazel build error instead of a
+    broken (or exploitable) generated script that only surfaces once a
+    dependent test actually runs.
+    """
+    for ch in _UNSAFE_SHELL_CHARS:
+        if ch in value:
+            message = (
+                "{label}: {attr} = \"{value}\" contains a character ({ch}) that " +
+                "cannot be safely embedded in the generated test-runner shell " +
+                "script (it is substituted inside a double-quoted string with " +
+                "no escaping) — remove it from {attr}"
+            ).format(
+                label = rule_label,
+                attr = attr_name,
+                value = value,
+                ch = repr(ch),
+            )
+            fail(message)
+
 def _get_execution_environment(ctx):
     xcode_version = str(ctx.attr._xcode_config[apple_common.XcodeVersionConfig].xcode_version())
     if not xcode_version:
@@ -108,6 +142,16 @@ def _simpool_ios_test_runner_impl(ctx):
         fail("error: os_version must be set on simpool_ios_test_runner, or passed with --ios_simulator_version")
     if not device_type:
         fail("error: device_type must be set on simpool_ios_test_runner, or passed with --ios_simulator_device")
+
+    # Validated here, at analysis time, not left to surface as a broken (or
+    # exploitable) generated script the first time a dependent test actually
+    # runs — see _validate_shell_safe's doc comment. max_slots is skipped: it
+    # is attr.int, which Bazel itself already guarantees is a plain integer
+    # before this function ever runs.
+    _validate_shell_safe(os_version, "os_version", str(ctx.label))
+    _validate_shell_safe(device_type, "device_type", str(ctx.label))
+    if ctx.attr.wait:
+        _validate_shell_safe(ctx.attr.wait, "wait", str(ctx.label))
 
     runfiles = ctx.runfiles(files = [
         ctx.file._xctestrun_template,

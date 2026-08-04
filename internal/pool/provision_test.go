@@ -1,9 +1,11 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -284,5 +286,141 @@ func TestEnsureProvisioned_FreshCreateAlwaysWaits(t *testing.T) {
 	}
 	if s.Meta.UDID != newUDID {
 		t.Errorf("Meta.UDID = %q, want %q", s.Meta.UDID, newUDID)
+	}
+}
+
+// bootAndWaitFromDeps builds a provisionDeps.bootAndWait replacement out of
+// simctl.BootWaitDeps — proving EnsureProvisioned's readiness gate is driven
+// by the real state machine in simctl.BootAndWaitWithDeps (triage
+// bootstatus's exit code against device state, poll for real readiness,
+// retry at most once), exercised here entirely with fakes: no `xcrun`, no
+// simulator.
+func bootAndWaitFromDeps(deps simctl.BootWaitDeps) func(udid string, timeout time.Duration) error {
+	return func(udid string, timeout time.Duration) error {
+		return simctl.BootAndWaitWithDeps(udid, timeout, deps)
+	}
+}
+
+// TestReadinessGate_BootstatusFailureButDeviceActuallyBooted proves
+// bootstatus's own exit code is triaged against the device's real state
+// instead of trusted blindly: bootstatus can report a terminal failure yet
+// the device turns out to be genuinely Booted (the same ambiguity the Bazel
+// runner template already triages), and that must not be read as fatal.
+func TestReadinessGate_BootstatusFailureButDeviceActuallyBooted(t *testing.T) {
+	var mu sync.Mutex
+	shutdownCalls := 0
+
+	deps := simctl.BootWaitDeps{
+		Bootstatus: func(ctx context.Context, udid string) error {
+			return errors.New("bootstatus: simulated non-zero exit")
+		},
+		Find: func(udid string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{UDID: udid, State: "Booted"}, true, nil
+		},
+		SpringBoardReady: func(ctx context.Context, udid string) (bool, error) {
+			return true, nil
+		},
+		Shutdown: func(udid string) error {
+			mu.Lock()
+			shutdownCalls++
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	if err := bootAndWaitFromDeps(deps)("udid-1", time.Second); err != nil {
+		t.Fatalf("BootAndWaitWithDeps returned an error despite the device actually being Booted: %v", err)
+	}
+	if shutdownCalls != 0 {
+		t.Fatalf("shutdown was called %d times; a bootstatus failure that resolves to an actually-Booted device must not trigger a retry", shutdownCalls)
+	}
+}
+
+// TestReadinessGate_BootstatusFailureAndDeviceNotBooted proves the other
+// half: when bootstatus fails AND the device's real state is not Booted,
+// that is a genuine, non-retriable failure — it must error, and must NEVER
+// return nil (a nil here would hand out a UDID that isn't actually usable).
+func TestReadinessGate_BootstatusFailureAndDeviceNotBooted(t *testing.T) {
+	bootstatusErr := errors.New("bootstatus: simulated non-zero exit")
+	deps := simctl.BootWaitDeps{
+		Bootstatus: func(ctx context.Context, udid string) error {
+			return bootstatusErr
+		},
+		Find: func(udid string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{UDID: udid, State: "Shutdown"}, true, nil
+		},
+		SpringBoardReady: func(ctx context.Context, udid string) (bool, error) {
+			t.Fatal("SpringBoardReady should never be polled when bootstatus failed and the device is confirmed not Booted")
+			return false, nil
+		},
+		Shutdown: func(udid string) error {
+			t.Fatal("shutdown should never run for a non-retriable failure")
+			return nil
+		},
+	}
+
+	err := bootAndWaitFromDeps(deps)("udid-2", time.Second)
+	if err == nil {
+		t.Fatal("BootAndWaitWithDeps returned nil for a device that bootstatus failed on and is confirmed Shutdown — must never be read as ready")
+	}
+	if !errors.Is(err, bootstatusErr) {
+		t.Errorf("error does not wrap the original bootstatus error: %v", err)
+	}
+}
+
+// TestReadinessGate_RetriesExactlyOnceWhenReadinessNeverArrives proves the
+// bounded-retry guarantee: if SpringBoard never comes up, BootAndWaitWithDeps
+// shuts the device down and retries the whole sequence exactly once — never
+// in an unbounded loop — then gives up with an error once the deadline
+// (shared across both attempts) is exhausted.
+func TestReadinessGate_RetriesExactlyOnceWhenReadinessNeverArrives(t *testing.T) {
+	var mu sync.Mutex
+	bootstatusCalls, shutdownCalls, readyCalls := 0, 0, 0
+
+	deps := simctl.BootWaitDeps{
+		Bootstatus: func(ctx context.Context, udid string) error {
+			mu.Lock()
+			bootstatusCalls++
+			mu.Unlock()
+			return nil // bootstatus itself succeeds every time
+		},
+		Find: func(udid string) (simctl.DeviceEntry, bool, error) {
+			t.Fatal("Find should never be called when bootstatus itself never fails")
+			return simctl.DeviceEntry{}, false, nil
+		},
+		SpringBoardReady: func(ctx context.Context, udid string) (bool, error) {
+			mu.Lock()
+			readyCalls++
+			mu.Unlock()
+			return false, nil // SpringBoard never comes up
+		},
+		Shutdown: func(udid string) error {
+			mu.Lock()
+			shutdownCalls++
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	start := time.Now()
+	err := bootAndWaitFromDeps(deps)("udid-3", 150*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("BootAndWaitWithDeps returned nil for a device whose readiness probe never once reported ready")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("took %s to give up on a 150ms-timeout call — the retry is not bounded", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if shutdownCalls != 1 {
+		t.Fatalf("shutdown called %d times, want exactly 1 (bounded retry, never a loop)", shutdownCalls)
+	}
+	if bootstatusCalls != 2 {
+		t.Fatalf("bootstatus called %d times, want exactly 2 (once per attempt: initial + one retry)", bootstatusCalls)
+	}
+	if readyCalls == 0 {
+		t.Fatal("SpringBoardReady was never polled at all")
 	}
 }

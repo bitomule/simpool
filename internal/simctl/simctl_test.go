@@ -135,6 +135,30 @@ func TestRun_TimesOutInsteadOfHanging(t *testing.T) {
 	}
 }
 
+// TestParseSpringBoardReady covers the exact output shapes captured from a
+// real device: a running SpringBoard reports a real pid in the first field,
+// a known-but-not-running one reports "-", and launchctl reporting nothing
+// at all (device not reachable yet) must read as not ready too — never as
+// ready by default.
+func TestParseSpringBoardReady(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"running", "29719\t0\tcom.apple.SpringBoard\n", true},
+		{"not running", "-\t0\tcom.apple.SpringBoard\n", false},
+		{"absent", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseSpringBoardReady([]byte(tc.output)); got != tc.want {
+				t.Errorf("parseSpringBoardReady(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSimctlTimeout_IgnoresMalformedOverride proves a bad
 // SIMPOOL_SIMCTL_TIMEOUT value falls back to the default instead of
 // disabling the timeout altogether (an unbounded timeout is worse than a

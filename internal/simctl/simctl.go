@@ -147,37 +147,167 @@ func Boot(udid string) error {
 	return nil
 }
 
-// BootSettleMargin is slept after `xcrun simctl bootstatus -b` itself
-// reports a simulator has finished booting. bootstatus's own "done" signal
-// is not sufficient by itself: rules_apple hits the exact same gap
-// independently (bazelbuild/rules_apple,
-// apple/testing/default_runner/simulator_creator.py's _boot_simulator runs
-// the identical `bootstatus <udid> -b` call and then still does
-// `time.sleep(3)`, commented "Even bootstatus doesn't wait long enough and
-// tests can still fail because the simulator isn't ready"). Adopted
-// verbatim rather than re-derived from scratch: it's the same underlying
-// symptom — springboard/backboardd answering simctl's own status query
-// before the device is actually ready for UI automation — observed by a
-// wholly independent, widely-used consumer of the same simctl API on the
-// same platform.
-const BootSettleMargin = 3 * time.Second
+// BootSettleMargin is slept once after the readiness poll (SpringBoardReady)
+// confirms a simulator is actually ready. It used to be an unconditional 3s
+// slept right after bootstatus's own "done" signal — necessary because that
+// signal alone is not sufficient (rules_apple's
+// apple/testing/default_runner/simulator_creator.py hits the identical gap
+// and works around it the same way, independently). SpringBoardReady now
+// does that waiting for real, so this only needs to be a short settle
+// margin after a poll that has already confirmed readiness — mirrors
+// rules_idb's own margin after the same probe.
+const BootSettleMargin = 1 * time.Second
 
-// BootAndWait boots udid if it isn't already booted and blocks until
-// `xcrun simctl bootstatus -b` reports it has finished, plus
-// BootSettleMargin. Unlike Boot, a nil return here means udid is safe to
-// hand to a caller that will immediately try to talk to it (axe, an
-// install) — that is the whole point of this function existing instead of
-// Boot: Boot only fires the boot and returns immediately, which is exactly
-// the gap that let a still-booting simulator's UDID reach a caller that
-// then failed to reach it.
+// springBoardPollInterval bounds how often SpringBoardReady is re-probed
+// while waiting for a simulator to become genuinely ready.
+const springBoardPollInterval = 500 * time.Millisecond
+
+// errReadinessTimedOut marks "the readiness poll never saw SpringBoard come
+// up before the deadline" as distinct from any other failure — it is the
+// one condition BootAndWaitWithDeps treats as retriable (see its single
+// re-boot retry).
+var errReadinessTimedOut = errors.New("simulator readiness poll timed out")
+
+// SpringBoardReady reports whether udid's SpringBoard is actually running —
+// the earliest point installs/launches reliably succeed, and a stronger
+// signal than `simctl bootstatus`, which can report a terminal failure yet
+// still exit 0. A probe that itself fails is reported as not-ready (never
+// silently swallowed into "ready"), the same rule ReadLease enforces for an
+// unfinished check.
+func SpringBoardReady(ctx context.Context, udid string) (bool, error) {
+	out, err := runContext(ctx, "simctl", "spawn", udid, "launchctl", "list")
+	if err != nil {
+		return false, err
+	}
+	return parseSpringBoardReady(out), nil
+}
+
+// parseSpringBoardReady scans `simctl spawn <udid> launchctl list` output
+// for the com.apple.SpringBoard line and reports whether its first field —
+// launchctl's pid column — is a real pid rather than "-" (its marker for
+// "known but not currently running"). Pure and side-effect-free so it can be
+// tested against captured output with no simulator involved.
+func parseSpringBoardReady(output []byte) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[2] != "com.apple.SpringBoard" {
+			continue
+		}
+		return fields[0] != "-"
+	}
+	return false
+}
+
+// BootWaitDeps abstracts BootAndWaitWithDeps' primitives — bootstatus, a
+// device lookup, the SpringBoard readiness probe, and shutdown — so its
+// state machine (triage bootstatus's exit code against the device's actual
+// state instead of trusting it blindly, poll for real readiness, retry at
+// most once via a single re-boot) can be exercised with fakes instead of
+// `xcrun` and a real simulator. Exported so package pool's tests can drive
+// the exact same logic (see internal/pool/provision_test.go) rather than
+// re-implementing it.
+type BootWaitDeps struct {
+	Bootstatus       func(ctx context.Context, udid string) error
+	Find             func(udid string) (DeviceEntry, bool, error)
+	SpringBoardReady func(ctx context.Context, udid string) (bool, error)
+	Shutdown         func(udid string) error
+}
+
+func liveBootWaitDeps() BootWaitDeps {
+	return BootWaitDeps{
+		Bootstatus:       bootstatusOnce,
+		Find:             Find,
+		SpringBoardReady: SpringBoardReady,
+		Shutdown:         Shutdown,
+	}
+}
+
+// BootAndWait boots udid if it isn't already booted and blocks until it is
+// genuinely ready to use — not just until `bootstatus` says so (see
+// BootWaitDeps' doc comment for why that alone isn't trustworthy). Unlike
+// Boot, a nil return here means udid is safe to hand to a caller that will
+// immediately try to talk to it (axe, an install) — that is the whole point
+// of this function existing instead of Boot: Boot only fires the boot and
+// returns immediately, which is exactly the gap that let a still-booting
+// simulator's UDID reach a caller that then failed to reach it.
 //
-// timeout bounds the wait: a wedged simulator produces a clear, actionable
-// error instead of hanging the caller indefinitely, and a timeout is never
-// mistaken for success.
+// timeout bounds the whole wait, including one retry: a wedged simulator
+// produces a clear, actionable error instead of hanging the caller
+// indefinitely, and a timeout is never mistaken for success.
 func BootAndWait(udid string, timeout time.Duration) error {
+	return BootAndWaitWithDeps(udid, timeout, liveBootWaitDeps())
+}
+
+// BootAndWaitWithDeps is BootAndWait with its primitives injected; see
+// BootWaitDeps.
+func BootAndWaitWithDeps(udid string, timeout time.Duration, deps BootWaitDeps) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	err := waitForReadyOnce(ctx, udid, deps)
+	if err == nil {
+		time.Sleep(BootSettleMargin)
+		return nil
+	}
+	if !errors.Is(err, errReadinessTimedOut) {
+		// bootstatus failed and the device isn't actually Booted, or a
+		// lookup/probe itself errored — neither is retriable; surface it.
+		return err
+	}
+
+	// SpringBoard never answered within its share of the deadline. Retry
+	// exactly once — never in a loop, so a permanently wedged simulator
+	// fails in bounded time instead of retrying forever — by shutting down
+	// and running the same sequence again against whatever's left of ctx.
+	if serr := deps.Shutdown(udid); serr != nil {
+		return fmt.Errorf("shutting down %s before retrying boot: %w", udid, serr)
+	}
+	err = waitForReadyOnce(ctx, udid, deps)
+	if err == nil {
+		time.Sleep(BootSettleMargin)
+		return nil
+	}
+	if errors.Is(err, errReadinessTimedOut) {
+		return fmt.Errorf("simulator %s did not become ready within %s, even after one re-boot (SpringBoard never answered) — it may be wedged; try `xcrun simctl diagnose` if this keeps happening", udid, timeout)
+	}
+	return err
+}
+
+// waitForReadyOnce runs bootstatus once, triages a non-zero exit against the
+// device's actual state instead of treating it as fatal outright —
+// bootstatus can report a terminal failure yet still exit 0, and the
+// reverse also happens (Bazel's own runner template already triages
+// bootstatus's exit code against device state for exactly this reason, see
+// bazel/simpool_ios_test_runner.template.sh) — then polls SpringBoardReady,
+// the actual readiness signal, until ctx's deadline. Returns
+// errReadinessTimedOut (not any other error, and never nil) if the deadline
+// is reached without SpringBoard ever answering, so the caller can tell
+// "worth retrying" apart from "not retriable".
+func waitForReadyOnce(ctx context.Context, udid string, deps BootWaitDeps) error {
+	if err := deps.Bootstatus(ctx, udid); err != nil {
+		entry, found, ferr := deps.Find(udid)
+		if ferr != nil || !found || entry.State != "Booted" {
+			return err
+		}
+		// bootstatus reported failure but the device is actually Booted —
+		// fall through to the readiness poll instead of treating this as
+		// fatal.
+	}
+
+	for {
+		ready, err := deps.SpringBoardReady(ctx, udid)
+		if err == nil && ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errReadinessTimedOut
+		case <-time.After(springBoardPollInterval):
+		}
+	}
+}
+
+func bootstatusOnce(ctx context.Context, udid string) error {
 	cmd := exec.CommandContext(ctx, "xcrun", "simctl", "bootstatus", udid, "-b")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -185,7 +315,7 @@ func BootAndWait(udid string, timeout time.Duration) error {
 	err := cmd.Run()
 
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("simulator %s did not finish booting within %s (xcrun simctl bootstatus -b timed out) — it may be wedged; try `xcrun simctl shutdown %s`, or run `xcrun simctl diagnose` if this keeps happening", udid, timeout, udid)
+		return fmt.Errorf("simulator %s did not finish booting (xcrun simctl bootstatus -b timed out) — it may be wedged; try `xcrun simctl shutdown %s`, or run `xcrun simctl diagnose` if this keeps happening", udid, udid)
 	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
@@ -194,8 +324,6 @@ func BootAndWait(udid string, timeout time.Duration) error {
 		}
 		return fmt.Errorf("xcrun simctl bootstatus %s -b: %w: %s", udid, err, msg)
 	}
-
-	time.Sleep(BootSettleMargin)
 	return nil
 }
 

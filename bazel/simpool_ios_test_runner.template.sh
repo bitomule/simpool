@@ -26,6 +26,12 @@
 #      finding it is a hard error, never a cue to create a same-named
 #      simulator the pool doesn't know about — this rule is never allowed
 #      to create or delete a pool slot's simulator out from under it.
+#   3. After a failed test run against a pool-owned slot, a cheap read-only
+#      probe checks whether the simulator itself is still responsive; if
+#      not, it's shut down so the pool re-verifies it on the next
+#      acquisition instead of handing a wedged-but-nominally-"Booted"
+#      device straight to the next consumer (see the comment at its call
+#      site, right after the test execution block).
 # Everything else, including the fallback when simpool isn't installed
 # (this script then behaves like a stock ios_xctestrun_runner), is
 # unmodified upstream behavior.
@@ -828,6 +834,27 @@ else
     -XCTest All \
     "$test_tmp_dir/$test_bundle_name.xctest" \
     2>&1 | tee -i "$testlog" || test_exit_code=$?
+fi
+
+# simpool: distinguish "the test failed" from "the simulator is unusable".
+# An ordinary assertion failure leaves the simulator alone (still Booted,
+# still responsive) — nothing below fires for that, common, case. An
+# infrastructure failure (CoreSimulator crashing, SpringBoard dying
+# mid-run) can leave the device in a state `simctl list` still reports as
+# "Booted" while it never responds to anything again, which
+# EnsureProvisioned's own fast path (internal/pool/provision.go) would
+# otherwise trust blindly on the NEXT acquisition — handing a wedged
+# device straight to whoever asks next with no boot wait at all. Only
+# probed on a failed run (never the happy path, so this costs nothing when
+# tests pass) and only for a pool-owned slot (SIMPOOL_NAME_0 unset means
+# the non-pool fallback path, which never reuses this simulator anyway).
+# The probe itself is read-only (mirrors internal/simctl.SpringBoardReady's
+# own readiness check); only a failed probe triggers the shutdown.
+if [[ "$test_exit_code" -ne 0 && -n "${SIMPOOL_NAME_0:-}" ]]; then
+  if ! xcrun simctl spawn "$simulator_id" launchctl list >/dev/null 2>&1; then
+    echo "warning: simulator $simulator_id no longer responds after a failed test run — shutting it down so the pool re-verifies it before handing it to the next consumer, instead of reusing it as-is" >&2
+    xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true
+  fi
 fi
 
 # Run a post-action binary, if provided.

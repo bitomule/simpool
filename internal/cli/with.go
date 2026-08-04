@@ -36,7 +36,7 @@ func RunWith(args []string, stdout, stderr io.Writer) int {
 	}
 
 	ownerCmd := strings.Join(cmdArgs, " ")
-	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, af.max, af.wait, ownerCmd, "with")
+	slots, runDir, err := acquireAndProvision(af.device, af.os, af.count, af.max, af.wait, ownerCmd, "with", stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, "simpool with:", err)
 		return 1

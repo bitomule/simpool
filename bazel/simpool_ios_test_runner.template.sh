@@ -38,6 +38,36 @@
 
 set -euo pipefail
 
+# simpool: run "$@" with a wall-clock bound, killing it if it overruns.
+#
+# macOS ships no `timeout(1)`, so this backgrounds the command and polls
+# `kill -0` on its pid instead — the same background+poll shape every
+# bounded `xcrun simctl` call already gets on the Go side (see
+# SIMPOOL_SIMCTL_TIMEOUT in internal/simctl), applied here because this
+# script's own wedge probe below calls `xcrun simctl` directly against a
+# simulator that is, by definition, already suspected of being wedged —
+# exactly the moment an unbounded call is most likely to hang. Returns the
+# command's own exit status, or 124 (matching GNU timeout's convention) if
+# it had to be killed.
+simpool_run_bounded() {
+  local timeout_s="$1"
+  shift
+  "$@" &
+  local pid=$!
+  local waited=0
+  local interval=1
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= timeout_s )); then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep "$interval"
+    waited=$(( waited + interval ))
+  done
+  wait "$pid"
+}
+
 # simpool: hold a pool slot's flock for the life of this whole test action.
 #
 # Bazel test actions run with a sanitized environment — no inherited PATH,
@@ -850,10 +880,19 @@ fi
 # the non-pool fallback path, which never reuses this simulator anyway).
 # The probe itself is read-only (mirrors internal/simctl.SpringBoardReady's
 # own readiness check); only a failed probe triggers the shutdown.
+#
+# Both calls run through simpool_run_bounded: a device already suspected of
+# being wedged is exactly the device a plain, unbounded `xcrun simctl` call
+# is most likely to hang against — and unlike every bounded simctl call on
+# the Go side, this test action holds its pool slot's flock for its entire
+# run, so a hang here would strand that slot until Bazel's own test timeout
+# kills the action, turning "the simulator is unusable" into "the pool has
+# lost a slot" — the opposite of what this probe exists to prevent.
 if [[ "$test_exit_code" -ne 0 && -n "${SIMPOOL_NAME_0:-}" ]]; then
-  if ! xcrun simctl spawn "$simulator_id" launchctl list >/dev/null 2>&1; then
-    echo "warning: simulator $simulator_id no longer responds after a failed test run — shutting it down so the pool re-verifies it before handing it to the next consumer, instead of reusing it as-is" >&2
-    xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true
+  wedge_probe_timeout="${SIMPOOL_WEDGE_PROBE_TIMEOUT:-15}"
+  if ! simpool_run_bounded "$wedge_probe_timeout" xcrun simctl spawn "$simulator_id" launchctl list >/dev/null 2>&1; then
+    echo "warning: simulator $simulator_id no longer responds (or didn't answer within ${wedge_probe_timeout}s) after a failed test run — shutting it down so the pool re-verifies it before handing it to the next consumer, instead of reusing it as-is" >&2
+    simpool_run_bounded "$wedge_probe_timeout" xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true
   fi
 fi
 

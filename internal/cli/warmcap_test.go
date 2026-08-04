@@ -145,12 +145,23 @@ func TestEnforceWarmCap_SkipsBusyLeasedAndPoisonedSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// slot-3: free, valid, booted — the only real candidate.
+	// slot-3 and slot-4: free, valid, booted — the only real candidates.
+	// Two of them (not one) so --warm 1, a cap RunReap can actually produce
+	// (it gates on *warmCap > 0 — warmCap=0 never reaches this function),
+	// still has something over-cap to select: slot-3 is older and gets
+	// shut down, slot-4 is kept warm and silent.
 	okDir := pool.SlotDir(groupDir, 3)
 	if err := os.MkdirAll(okDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.WriteMeta(okDir, pool.Meta{UDID: "udid-ok", LastUsed: time.Now()}); err != nil {
+	if err := pool.WriteMeta(okDir, pool.Meta{UDID: "udid-ok", LastUsed: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	newerDir := pool.SlotDir(groupDir, 4)
+	if err := os.MkdirAll(newerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(newerDir, pool.Meta{UDID: "udid-ok-newer", LastUsed: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -158,10 +169,11 @@ func TestEnforceWarmCap_SkipsBusyLeasedAndPoisonedSlots(t *testing.T) {
 		"udid-leased":   1,
 		"udid-poisoned": 2,
 		"udid-ok":       3,
+		"udid-ok-newer": 4,
 	})
 
 	var stdout, stderr bytes.Buffer
-	enforceWarmCap(root, groupDir, 0 /*warmCap: shut down every real candidate*/, true /*dryRun*/, &stdout, &stderr)
+	enforceWarmCap(root, groupDir, 1 /*warmCap*/, true /*dryRun*/, &stdout, &stderr)
 
 	out := stdout.String()
 	for _, forbidden := range []string{"slot-0", "slot-1", "slot-2"} {
@@ -170,7 +182,10 @@ func TestEnforceWarmCap_SkipsBusyLeasedAndPoisonedSlots(t *testing.T) {
 		}
 	}
 	if !bytes.Contains([]byte(out), []byte("slot-3")) {
-		t.Errorf("slot-3 is the only safe candidate and should be selected, got:\n%s", out)
+		t.Errorf("slot-3 is the older of the two safe candidates and should be selected over the --warm 1 cap, got:\n%s", out)
+	}
+	if bytes.Contains([]byte(out), []byte("slot-4")) {
+		t.Errorf("slot-4 is the most-recently-used safe candidate and must be kept within the --warm 1 cap, got:\n%s", out)
 	}
 
 	freeBusy, err := pool.IsSlotFree(busyDir)
@@ -206,5 +221,147 @@ func TestRunReap_WarmDisabledByDefault(t *testing.T) {
 	}
 	if bytes.Contains(stdout.Bytes(), []byte("WARM")) {
 		t.Fatalf("--warm defaults to disabled (0); reap must not emit WARM decisions without it, got:\n%s", stdout.String())
+	}
+}
+
+// TestEnforceWarmCap_ShutsDownOnlyOverCapSlots is the non-dry-run test the
+// destructive branch previously had none of: every earlier warmcap test ran
+// with dryRun=true, so no test ever reached the call that actually shuts a
+// simulator down. This one proves shutdownWarm is called with exactly the
+// over-cap slots' UDIDs and never the kept ones.
+func TestEnforceWarmCap_ShutsDownOnlyOverCapSlots(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	group := filepath.Base(groupDir)
+
+	now := time.Now()
+	udids := map[int]string{0: "udid-oldest", 1: "udid-middle", 2: "udid-newest"}
+	lastUsed := map[int]time.Time{0: now.Add(-3 * time.Hour), 1: now.Add(-2 * time.Hour), 2: now.Add(-1 * time.Hour)}
+
+	byUDID := map[string]int{}
+	for n, udid := range udids {
+		dir := pool.SlotDir(groupDir, n)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.WriteMeta(dir, pool.Meta{UDID: udid, LastUsed: lastUsed[n]}); err != nil {
+			t.Fatal(err)
+		}
+		byUDID[udid] = n
+	}
+	fakeBootedDevice(t, root, group, byUDID)
+
+	origShutdown := shutdownWarm
+	t.Cleanup(func() { shutdownWarm = origShutdown })
+	var shutDown []string
+	shutdownWarm = func(udid string) error {
+		shutDown = append(shutDown, udid)
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	enforceWarmCap(root, groupDir, 1 /*warmCap*/, false /*dryRun*/, &stdout, &stderr)
+
+	want := map[string]bool{"udid-oldest": true, "udid-middle": true}
+	if len(shutDown) != len(want) {
+		t.Fatalf("got shutdownWarm calls %v, want exactly %v", shutDown, want)
+	}
+	for _, udid := range shutDown {
+		if !want[udid] {
+			t.Errorf("shutdownWarm called with unexpected udid %q", udid)
+		}
+		if udid == "udid-newest" {
+			t.Error("the most-recently-used slot must be kept within the --warm cap, never shut down")
+		}
+	}
+
+	free, err := pool.IsSlotFree(pool.SlotDir(groupDir, byUDID["udid-newest"]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !free {
+		t.Fatal("enforceWarmCap must release the lock it re-took on the kept slot too")
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected stderr:\n%s", stderr.String())
+	}
+}
+
+// TestEnforceWarmCap_SkipsSlotThatBecameBusyBetweenPasses proves the second,
+// shutdown-time lock+reclassify actually matters: a slot that was a valid
+// candidate during the first (classify-then-release) pass but got claimed
+// by something else before the second (shutdown) pass reaches it — a
+// concurrent `simpool lease`/`with`/`acquire` — must be skipped, never shut
+// down out from under its new holder. The race is made deterministic, not
+// timing-dependent: slot-0 is processed (and its first-pass lock released)
+// before slot-1 in ascending slot-number order, so hooking findDevice's call
+// for slot-1 to grab slot-0's now-free lock reliably lands in the exact
+// window enforceWarmCap's second pass needs to observe as busy.
+func TestEnforceWarmCap_SkipsSlotThatBecameBusyBetweenPasses(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	group := filepath.Base(groupDir)
+	oldestDir := pool.SlotDir(groupDir, 0)
+	newestDir := pool.SlotDir(groupDir, 1)
+
+	now := time.Now()
+	if err := os.MkdirAll(oldestDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(newestDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(oldestDir, pool.Meta{UDID: "udid-oldest", LastUsed: now.Add(-2 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteMeta(newestDir, pool.Meta{UDID: "udid-newest", LastUsed: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	var raceLock *pool.Lock
+	origFind := findDevice
+	t.Cleanup(func() { findDevice = origFind })
+	findDevice = func(udid string) (simctl.DeviceEntry, bool, error) {
+		if udid == "udid-newest" && raceLock == nil {
+			lock, err := pool.TryLock(pool.LockPath(oldestDir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raceLock = lock
+			t.Cleanup(func() { _ = raceLock.Release() })
+		}
+		n := 0
+		if udid == "udid-newest" {
+			n = 1
+		}
+		return simctl.DeviceEntry{
+			UDID:        udid,
+			Name:        pool.DeviceNameForGroup(root, group, n),
+			State:       "Booted",
+			IsAvailable: true,
+		}, true, nil
+	}
+
+	origShutdown := shutdownWarm
+	t.Cleanup(func() { shutdownWarm = origShutdown })
+	var shutDown []string
+	shutdownWarm = func(udid string) error {
+		shutDown = append(shutDown, udid)
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	enforceWarmCap(root, groupDir, 0 /*warmCap*/, false /*dryRun*/, &stdout, &stderr)
+
+	for _, udid := range shutDown {
+		if udid == "udid-oldest" {
+			t.Fatalf("a slot locked by someone else between the classify and shutdown passes must never be shut down, got calls: %v", shutDown)
+		}
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("slot-0")) {
+		t.Errorf("a slot that became busy before the shutdown pass must not be reported as shut down, got:\n%s", stdout.String())
+	}
+	if len(shutDown) != 1 || shutDown[0] != "udid-newest" {
+		t.Errorf("the still-free slot should still be shut down normally, got calls: %v", shutDown)
 	}
 }

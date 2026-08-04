@@ -46,13 +46,8 @@ func TestReapOrphans_ReportsOnlyUnreferencedPoolNamedDevices(t *testing.T) {
 		{UDID: "udid-not-mine", Name: "My Own iPhone"},
 	})
 
-	groups, err := pool.ListGroupDirs(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	var stdout, stderr bytes.Buffer
-	reapOrphans(root, groups, false /*purge*/, false /*dryRun*/, &stdout, &stderr)
+	reapOrphans(root, false /*purge*/, false /*dryRun*/, &stdout, &stderr)
 
 	out := stdout.String()
 	if bytes.Contains([]byte(out), []byte("udid-referenced")) {
@@ -85,7 +80,7 @@ func TestReapOrphans_ReportOnlyNeverDeletesWithoutPurge(t *testing.T) {
 	deleteOrphan = func(udid string) error { deleteCalled = true; return nil }
 
 	var stdout, stderr bytes.Buffer
-	reapOrphans(root, nil, false /*purge*/, false /*dryRun*/, &stdout, &stderr)
+	reapOrphans(root, false /*purge*/, false /*dryRun*/, &stdout, &stderr)
 
 	if shutdownCalled || deleteCalled {
 		t.Fatal("reapOrphans without --purge-orphans must never shut down or delete anything")
@@ -135,7 +130,7 @@ func TestReapOrphans_PurgeSkipsDeviceWithLiveConsumer(t *testing.T) {
 	deleteOrphan = func(string) error { return nil }
 
 	var stdout, stderr bytes.Buffer
-	reapOrphans(root, nil, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
+	reapOrphans(root, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
 
 	if shutdownCalled {
 		t.Fatalf("a device with a live consumer must never be shut down/deleted, got stdout:\n%s", stdout.String())
@@ -160,7 +155,7 @@ func TestReapOrphans_PurgeDryRunNeverActs(t *testing.T) {
 	deleteOrphan = func(string) error { called = true; return nil }
 
 	var stdout, stderr bytes.Buffer
-	reapOrphans(root, nil, true /*purge*/, true /*dryRun*/, &stdout, &stderr)
+	reapOrphans(root, true /*purge*/, true /*dryRun*/, &stdout, &stderr)
 
 	if called {
 		t.Fatal("--dry-run must never actually shut down or delete an orphan")
@@ -186,7 +181,7 @@ func TestReapOrphans_PurgeDeletesVerifiedOrphan(t *testing.T) {
 	deleteOrphan = func(udid string) error { order = append(order, "delete:"+udid); return nil }
 
 	var stdout, stderr bytes.Buffer
-	reapOrphans(root, nil, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
+	reapOrphans(root, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
 
 	want := []string{"shutdown:udid-orphan-real-purge", "delete:udid-orphan-real-purge"}
 	if len(order) != len(want) || order[0] != want[0] || order[1] != want[1] {
@@ -194,5 +189,91 @@ func TestReapOrphans_PurgeDeletesVerifiedOrphan(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("unexpected stderr:\n%s", stderr.String())
+	}
+}
+
+// TestReapOrphans_UnreadableGroupListingAbortsPurge proves that when a
+// group's slot listing cannot be read (EACCES, EMFILE, ...), reapOrphans
+// treats that exactly like every other "couldn't verify" case in this
+// codebase — as still-referenced, not as confirmed-free — and aborts the
+// whole pass rather than purge against a `known` set that might be missing
+// that group's live slot. Before this fix, ListSlotNumbers silently
+// swallowed the read error into an empty slice, so the live slot's device
+// looked unreferenced and got deleted out from under it.
+func TestReapOrphans_UnreadableGroupListingAbortsPurge(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root bypasses directory permission bits")
+	}
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	if err := os.MkdirAll(pool.SlotDir(groupDir, 0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	group := filepath.Base(groupDir)
+	liveName := pool.DeviceNameForGroup(root, group, 0)
+
+	if err := os.Chmod(groupDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(groupDir, 0o755) })
+
+	withFakeDevices(t, []simctl.DeviceEntry{
+		{UDID: "udid-live-slot-0", Name: liveName},
+	})
+
+	origShutdown, origDelete := shutdownOrphan, deleteOrphan
+	t.Cleanup(func() { shutdownOrphan, deleteOrphan = origShutdown, origDelete })
+	var acted bool
+	shutdownOrphan = func(string) error { acted = true; return nil }
+	deleteOrphan = func(string) error { acted = true; return nil }
+
+	var stdout, stderr bytes.Buffer
+	reapOrphans(root, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
+
+	if acted {
+		t.Fatal("an unreadable group listing must never lead to a purge — the live slot's device could be the one that was missed")
+	}
+	if stderr.Len() == 0 {
+		t.Error("expected a loud stderr message explaining the abort")
+	}
+}
+
+// TestReapOrphans_GroupCreatedDuringDeviceScanIsNotPurged proves reapOrphans
+// re-lists groups and slots strictly after its own listPoolDevices() call,
+// not from a slice snapshotted before it — a group/slot created in that
+// window (e.g. mav leasing a brand-new device+OS pair while a slow reap
+// pass is still running) must never be purged as an orphan.
+func TestReapOrphans_GroupCreatedDuringDeviceScanIsNotPurged(t *testing.T) {
+	root := t.TempDir()
+	device, osVersion := "NewDevice", "2.0"
+	group := pool.GroupName(device, osVersion)
+	freshName := pool.DeviceNameForGroup(root, group, 0)
+
+	orig := listPoolDevices
+	t.Cleanup(func() { listPoolDevices = orig })
+	listPoolDevices = func() ([]simctl.DeviceEntry, error) {
+		// Simulate a lease created concurrently with (and discovered only
+		// after) this device scan: the group/slot did not exist yet when
+		// callers snapshot group directories before a scan like this one.
+		if err := os.MkdirAll(pool.SlotDir(pool.GroupDir(root, device, osVersion), 0), 0o755); err != nil {
+			return nil, err
+		}
+		return []simctl.DeviceEntry{{UDID: "udid-freshly-leased", Name: freshName}}, nil
+	}
+
+	origShutdown, origDelete := shutdownOrphan, deleteOrphan
+	t.Cleanup(func() { shutdownOrphan, deleteOrphan = origShutdown, origDelete })
+	var acted bool
+	shutdownOrphan = func(string) error { acted = true; return nil }
+	deleteOrphan = func(string) error { acted = true; return nil }
+
+	var stdout, stderr bytes.Buffer
+	reapOrphans(root, true /*purge*/, false /*dryRun*/, &stdout, &stderr)
+
+	if acted {
+		t.Fatalf("a slot created during the device scan must count as referenced, not be purged; stdout:\n%s", stdout.String())
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("PURGE")) || bytes.Contains(stdout.Bytes(), []byte("ORPHAN")) {
+		t.Errorf("the freshly-leased device must not be reported as an orphan at all, got:\n%s", stdout.String())
 	}
 }

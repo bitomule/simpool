@@ -353,14 +353,27 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		// slot's own lifetime, and always acquired AFTER the slot's own
 		// flock (which the caller already holds at this point — see
 		// AcquireBootGate's doc comment for why that fixed order can never
-		// deadlock). Acquisition is itself bounded by bootTimeout so a
-		// machine stuck at the concurrency cap fails the same clear,
-		// actionable way a wedged boot itself would, rather than hanging.
-		gate, err := AcquireBootGate(s.Root, bootTimeout)
+		// deadlock).
+		//
+		// bootTimeout is the caller's whole budget for "have a booted,
+		// ready simulator" — the gate wait and the boot itself must share
+		// ONE deadline, not each get their own full bootTimeout, or a
+		// caller already at the boot-concurrency cap could wait up to
+		// bootTimeout for the gate and then be handed another full
+		// bootTimeout for the boot, doubling the one bound this codebase
+		// promises on the path mav's target_command hits roughly once a
+		// minute with nothing to retry it.
+		deadline := time.Now().Add(bootTimeout)
+		gate, err := AcquireBootGate(s.Root, time.Until(deadline))
 		if err != nil {
 			return err
 		}
-		bootErr := deps.bootAndWait(udid, bootTimeout)
+		remaining := time.Until(deadline)
+		if remaining < simctl.MinBootBudget {
+			_ = gate.Release()
+			return fmt.Errorf("simpool: the boot-concurrency gate took long enough to free up that only %s remained of the %s boot timeout — too little to attempt a real boot; the machine may be overloaded with simultaneous boots, try again or override %s/%s", remaining.Round(time.Millisecond), bootTimeout, EnvBootTimeout, EnvBootConcurrency)
+		}
+		bootErr := deps.bootAndWait(udid, remaining)
 		_ = gate.Release()
 		if bootErr != nil {
 			return fmt.Errorf("booting %s: %w", udid, bootErr)

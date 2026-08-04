@@ -89,7 +89,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *orphans || *purgeOrphans {
-		reapOrphans(root, groups, *purgeOrphans, *dryRun, stdout, stderr)
+		reapOrphans(root, *purgeOrphans, *dryRun, stdout, stderr)
 	}
 	return 0
 }
@@ -123,17 +123,46 @@ var deleteOrphan = simctl.Delete
 // elsewhere on disk or not: this invocation only ever knows about slots
 // under its own root, so a foreign-tag device can never be "referenced" by
 // anything it can see.
-func reapOrphans(root string, groups []string, purge, dryRun bool, stdout, stderr io.Writer) {
+//
+// reapOrphans deliberately re-lists both groups and slots itself, strictly
+// after its own listPoolDevices() call, rather than trusting any slice
+// RunReap snapshotted earlier — RunReap's reapSlot pass runs a `simctl list
+// devices` per slot plus multi-second synchronous shutdowns, so by the time
+// this runs, minutes may have passed. A group or slot created during that
+// window (e.g. mav leasing a brand-new device+OS pair) can only ever ADD to
+// `known` this way, never remove from it, which is what makes the race
+// collapse in the safe direction: a listing taken before this device scan
+// can only under-report devices that already existed, never over-report
+// slots that don't.
+//
+// Building `known` from an unreadable listing is exactly the "couldn't
+// verify must read as busy, don't touch" rule this codebase learned the
+// hard way, applied to the one path that deletes simulators: if any group's
+// slot listing can't be read (EACCES, EMFILE, ...), reapOrphans aborts the
+// entire pass rather than purge against a `known` set that might be silently
+// missing a live slot's device.
+func reapOrphans(root string, purge, dryRun bool, stdout, stderr io.Writer) {
 	devices, err := listPoolDevices()
 	if err != nil {
 		fmt.Fprintf(stderr, "reap --orphans: listing devices: %v\n", err)
 		return
 	}
 
+	groups, err := pool.ListGroupDirs(root)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap --orphans: listing pool groups: %v\n", err)
+		return
+	}
+
 	known := map[string]bool{}
 	for _, groupDir := range groups {
 		group := filepath.Base(groupDir)
-		for _, n := range pool.ListSlotNumbers(groupDir) {
+		nums, err := pool.ListSlotNumbersChecked(groupDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "reap --orphans: listing slots under %s: %v — aborting, not touching any device this run\n", group, err)
+			return
+		}
+		for _, n := range nums {
 			known[pool.DeviceNameForGroup(root, group, n)] = true
 		}
 	}
@@ -186,11 +215,54 @@ func reapOrphans(root string, groups []string, purge, dryRun bool, stdout, stder
 }
 
 // warmCandidate is a free, verified-safe, currently-booted slot considered
-// by enforceWarmCap for its group's --warm accounting.
+// by enforceWarmCap for its group's --warm accounting. Deliberately holds no
+// lock — see enforceWarmCap's doc comment on why the two passes never share
+// one.
 type warmCandidate struct {
 	n    int
-	lock *pool.Lock
 	meta pool.Meta
+}
+
+// shutdownWarm is a package-level var, not a direct simctl.Shutdown call, so
+// tests can exercise enforceWarmCap's destructive branch (which UDIDs it
+// shuts down, which it leaves alone) with a fake instead of a real
+// simulator, mirroring shutdownOrphan/deleteOrphan/findDevice's existing
+// seams.
+var shutdownWarm = simctl.Shutdown
+
+// classifyWarmSlot applies every safety check a slot must pass to be
+// eligible for --warm accounting: unreadable/live lease treated as busy, a
+// poisoned slot, no UDID, the device missing or not found, and a name/state
+// mismatch against what this exact slot (root, group, slot number — never
+// meta.Device/meta.OSVersion, the same self-referential-guard rule as
+// reapSlot's own cross-slot check) is supposed to own. Assumes dir's flock
+// is already held by the caller; never releases it. Returns the slot's meta
+// and true only when every check passes.
+func classifyWarmSlot(root, group string, n int, dir string) (pool.Meta, bool) {
+	if lease, err := pool.ReadLease(dir); err != nil || lease.Alive() {
+		// Unreadable or alive: never guess-touch, mirrors reapSlot's own
+		// "unreadable means occupied" rule for lease.json.
+		return pool.Meta{}, false
+	}
+
+	meta := pool.ReadMeta(dir)
+	if poison := pool.CheckPoison(meta); poison.Poisoned() {
+		// A free-looking slot whose previous consumer might still be
+		// alive is never eligible — same rule as reapSlot's own idle/
+		// --cold/--purge accounting.
+		return pool.Meta{}, false
+	}
+	if meta.UDID == "" {
+		return pool.Meta{}, false
+	}
+	entry, found, err := findDevice(meta.UDID)
+	if err != nil || !found {
+		return pool.Meta{}, false
+	}
+	if want := pool.DeviceNameForGroup(root, group, n); entry.Name != want || entry.State != "Booted" {
+		return pool.Meta{}, false
+	}
+	return meta, true
 }
 
 // enforceWarmCap separates "how many slots may be resident/locked at once"
@@ -204,12 +276,20 @@ type warmCandidate struct {
 // Only ever acts on a group's MOST-RECENTLY-used slots beyond warmCap: it
 // keeps the warmCap most-recently-used free+booted slots running and shuts
 // down the rest, so the ones most likely to be reused next stay warm.
-// Exactly like reapSlot, every candidate's own flock is taken first and
-// every one of reapSlot's existing safety checks (unreadable lease treated
-// as busy, a live lease, a poisoned slot, a name that doesn't match this
-// exact slot) is re-applied here independently — never a witness to its own
-// meta.json, never touching a slot this pass cannot positively verify is
-// free, idle, and genuinely this slot's own device.
+//
+// Unlike an earlier version of this function, the classification pass never
+// holds more than one slot's flock at a time: every other lock-taking path
+// in this codebase (reapSlot, AcquireSlots, reapOrphans) follows that rule,
+// and accumulating every eligible slot's flock before releasing any of them
+// made a --warm pass read as "the whole group is busy" to a concurrent
+// `simpool lease` — which never waits for capacity — for as long as the
+// scan (a real `simctl list devices` per slot) plus every synchronous
+// shutdown that followed took. Each candidate's lock is now taken,
+// classified, and released before moving to the next slot; only the slots
+// actually selected for shutdown are locked a second time, immediately
+// before acting, with the full classification re-run under that second lock
+// so a slot that turned busy, leased, poisoned, or was reassigned in between
+// is skipped rather than acted on.
 func enforceWarmCap(root, groupDir string, warmCap int, dryRun bool, stdout, stderr io.Writer) {
 	group := filepath.Base(groupDir)
 	var warm []warmCandidate
@@ -223,40 +303,12 @@ func enforceWarmCap(root, groupDir string, warmCap int, dryRun bool, stdout, std
 			}
 			continue // busy (held, or leased flock-free) is never this pass's to touch
 		}
-
-		if lease, err := pool.ReadLease(dir); err != nil || lease.Alive() {
-			// Unreadable or alive: never guess-touch, mirrors reapSlot's own
-			// "unreadable means occupied" rule for lease.json.
-			_ = lock.Release()
+		meta, ok := classifyWarmSlot(root, group, n, dir)
+		_ = lock.Release()
+		if !ok {
 			continue
 		}
-
-		meta := pool.ReadMeta(dir)
-		if poison := pool.CheckPoison(meta); poison.Poisoned() {
-			// A free-looking slot whose previous consumer might still be
-			// alive is never eligible — same rule as reapSlot's own idle/
-			// --cold/--purge accounting.
-			_ = lock.Release()
-			continue
-		}
-		if meta.UDID == "" {
-			_ = lock.Release()
-			continue
-		}
-		entry, found, err := findDevice(meta.UDID)
-		if err != nil || !found {
-			_ = lock.Release()
-			continue
-		}
-		// The expected name is derived from this slot's own directory
-		// (root, group, slot number), never from meta.Device/meta.OSVersion
-		// — same self-referential-guard rule as reapSlot's cross-slot check.
-		if want := pool.DeviceNameForGroup(root, group, n); entry.Name != want || entry.State != "Booted" {
-			_ = lock.Release()
-			continue
-		}
-
-		warm = append(warm, warmCandidate{n: n, lock: lock, meta: meta})
+		warm = append(warm, warmCandidate{n: n, meta: meta})
 	}
 
 	sort.SliceStable(warm, func(i, j int) bool {
@@ -265,21 +317,38 @@ func enforceWarmCap(root, groupDir string, warmCap int, dryRun bool, stdout, std
 
 	for i, c := range warm {
 		if i < warmCap {
-			_ = c.lock.Release()
 			continue
 		}
 		label := fmt.Sprintf("%s/slot-%d", group, c.n)
-		idle := time.Since(c.meta.LastUsed)
-		if dryRun {
-			fmt.Fprintf(stdout, "WARM  %s  would shut down %s (idle %s) to stay within --warm %d cap\n", label, c.meta.UDID, idle.Round(time.Second), warmCap)
-			_ = c.lock.Release()
+		dir := pool.SlotDir(groupDir, c.n)
+
+		lock, err := pool.TryLock(pool.LockPath(dir))
+		if err != nil {
+			if err != pool.ErrBusy {
+				fmt.Fprintf(stderr, "reap %s: --warm: %v\n", label, err)
+			}
+			continue // became busy since classification — not this pass's to touch
+		}
+		meta, ok := classifyWarmSlot(root, group, c.n, dir)
+		if !ok {
+			// Something about this slot changed since it was classified
+			// (leased, poisoned, reassigned, shut down already) — skip it
+			// rather than act on stale first-pass state.
+			_ = lock.Release()
 			continue
 		}
-		fmt.Fprintf(stdout, "WARM  %s  shutting down %s (idle %s) to stay within --warm %d cap\n", label, c.meta.UDID, idle.Round(time.Second), warmCap)
-		if err := simctl.Shutdown(c.meta.UDID); err != nil {
+
+		idle := time.Since(meta.LastUsed)
+		if dryRun {
+			fmt.Fprintf(stdout, "WARM  %s  would shut down %s (idle %s) to stay within --warm %d cap\n", label, meta.UDID, idle.Round(time.Second), warmCap)
+			_ = lock.Release()
+			continue
+		}
+		fmt.Fprintf(stdout, "WARM  %s  shutting down %s (idle %s) to stay within --warm %d cap\n", label, meta.UDID, idle.Round(time.Second), warmCap)
+		if err := shutdownWarm(meta.UDID); err != nil {
 			fmt.Fprintf(stderr, "reap %s: --warm: %v\n", label, err)
 		}
-		_ = c.lock.Release()
+		_ = lock.Release()
 	}
 }
 

@@ -168,10 +168,120 @@ func TestEnsureProvisioned_NotBootedWaits(t *testing.T) {
 			if gotUDID != udid {
 				t.Fatalf("bootAndWait was not called with the slot's device (state %q) — got udid %q", state, gotUDID)
 			}
-			if gotTimeout != wantTimeout {
-				t.Errorf("bootAndWait timeout = %v, want %v", gotTimeout, wantTimeout)
+			// bootAndWait now gets the REMAINDER of a single deadline after
+			// an (uncontended, near-instant here) boot-gate wait — not the
+			// full bootTimeout handed to ensureProvisioned a second time —
+			// so it must be close to wantTimeout, not bit-for-bit equal to
+			// it. See TestEnsureProvisioned_BootBudgetSharedWithGateWait for
+			// the case where the gate wait actually eats into the budget.
+			if gotTimeout <= 0 || gotTimeout > wantTimeout || wantTimeout-gotTimeout > time.Second {
+				t.Errorf("bootAndWait timeout = %v, want close to (but not exceeding) %v", gotTimeout, wantTimeout)
 			}
 		})
+	}
+}
+
+// TestEnsureProvisioned_BootBudgetSharedWithGateWait is the regression test
+// for the boot budget being charged twice: before this fix, a caller could
+// wait up to bootTimeout for a free boot-concurrency slot and THEN be handed
+// a second, fresh, full bootTimeout for the boot itself — a machine already
+// at the boot-concurrency cap could make ensureProvisioned take up to 2x the
+// timeout it documents, on the exact path `simpool lease` (mav's
+// target_command, invoked roughly once a minute with nothing to retry it)
+// is meant to bound. The gate wait and the boot must share ONE deadline.
+func TestEnsureProvisioned_BootBudgetSharedWithGateWait(t *testing.T) {
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "gate-contended-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	t.Setenv(EnvBootConcurrency, "1")
+	held, err := AcquireBootGate(s.Root, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const gateHoldTime = 1500 * time.Millisecond
+	go func() {
+		time.Sleep(gateHoldTime)
+		_ = held.Release()
+	}()
+
+	var gotTimeout time.Duration
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return matchingEntry(udid, name, "Shutdown"), true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait: func(u string, timeout time.Duration) error {
+			gotTimeout = timeout
+			return nil
+		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
+	}
+
+	bootTimeout := 3 * time.Second
+	start := time.Now()
+	if err := ensureProvisioned(s, "with", "with", "", deps, bootTimeout); err != nil {
+		t.Fatalf("ensureProvisioned: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed >= bootTimeout {
+		t.Fatalf("ensureProvisioned took %v against a %v boot budget that included a %v gate wait — the old bug charged the gate wait ON TOP of a full second bootTimeout, which this bound (elapsed < bootTimeout) would have caught", elapsed, bootTimeout, gateHoldTime)
+	}
+	wantRemaining := bootTimeout - gateHoldTime
+	if gotTimeout >= bootTimeout || gotTimeout <= 0 {
+		t.Fatalf("bootAndWait got the full %v bootTimeout (or nothing), want the remainder after the gate wait (~%v)", gotTimeout, wantRemaining)
+	}
+	if diff := gotTimeout - wantRemaining; diff > 300*time.Millisecond || diff < -300*time.Millisecond {
+		t.Errorf("bootAndWait timeout = %v, want close to %v (bootTimeout minus the gate wait)", gotTimeout, wantRemaining)
+	}
+}
+
+// TestEnsureProvisioned_FailsFastWhenGateWaitLeavesNoRealBootBudget proves
+// ensureProvisioned refuses to call bootAndWait with a remainder too small
+// to complete even one real readiness check (see simctl.MinBootBudget) —
+// failing fast with a clear message instead of guaranteeing a boot attempt
+// that can only ever expire immediately.
+func TestEnsureProvisioned_FailsFastWhenGateWaitLeavesNoRealBootBudget(t *testing.T) {
+	device, osVersion := "iPhone 17 Pro", "26.3"
+	udid := "starved-udid"
+	s := fakeSlot(t, device, osVersion, udid)
+	name := s.DeviceName()
+
+	t.Setenv(EnvBootConcurrency, "1")
+	held, err := AcquireBootGate(s.Root, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const gateHoldTime = 900 * time.Millisecond
+	go func() {
+		time.Sleep(gateHoldTime)
+		_ = held.Release()
+	}()
+
+	deps := provisionDeps{
+		find: func(u string) (simctl.DeviceEntry, bool, error) {
+			return matchingEntry(udid, name, "Shutdown"), true, nil
+		},
+		listDevices:    neverListDevices(t),
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create:         neverCreate(t),
+		bootAndWait: func(u string, timeout time.Duration) error {
+			t.Fatal("bootAndWait must never be called with too little of the boot budget left to do real work")
+			return nil
+		},
+		shutdown: neverShutdown(t),
+		delete:   neverDelete(t),
+	}
+
+	// 1200ms total budget, ~900ms eaten by the gate wait, leaves ~300ms —
+	// below simctl.MinBootBudget (1s: two SpringBoard poll cycles).
+	if err := ensureProvisioned(s, "with", "with", "", deps, 1200*time.Millisecond); err == nil {
+		t.Fatal("expected an error when the gate wait leaves less than simctl.MinBootBudget of the boot timeout")
 	}
 }
 
@@ -204,7 +314,7 @@ func TestEnsureProvisioned_SlowBootWaitsInsteadOfFailing(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := ensureProvisioned(s, "with", "with", "", deps, time.Second); err != nil {
+	if err := ensureProvisioned(s, "with", "with", "", deps, 5*time.Second); err != nil {
 		t.Fatalf("ensureProvisioned returned an error for a slow-but-successful boot: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < 30*time.Millisecond {
@@ -239,7 +349,7 @@ func TestEnsureProvisioned_BootTimeoutIsClearAndNeverSilent(t *testing.T) {
 		delete:   neverDelete(t),
 	}
 
-	err := ensureProvisioned(s, "with", "with", "", deps, time.Second)
+	err := ensureProvisioned(s, "with", "with", "", deps, 5*time.Second)
 	if err == nil {
 		t.Fatal("ensureProvisioned returned nil for a boot that never finished — a timeout must never be read as ready")
 	}
@@ -318,7 +428,7 @@ func TestEnsureProvisioned_FreshCreateAlwaysWaits(t *testing.T) {
 		},
 	}
 
-	if err := ensureProvisioned(s, "acquire", "acquire", "", deps, time.Second); err != nil {
+	if err := ensureProvisioned(s, "acquire", "acquire", "", deps, 5*time.Second); err != nil {
 		t.Fatalf("ensureProvisioned: %v", err)
 	}
 	if !bootAndWaitCalled {
@@ -626,7 +736,7 @@ func TestEnsureProvisioned_SubstanceMismatchDeletesAndRecreates(t *testing.T) {
 						},
 					}
 
-					if err := ensureProvisioned(s, pc.ownerCmd, pc.mode, pc.leaseKey, deps, time.Second); err != nil {
+					if err := ensureProvisioned(s, pc.ownerCmd, pc.mode, pc.leaseKey, deps, 5*time.Second); err != nil {
 						t.Fatalf("ensureProvisioned: %v", err)
 					}
 					if shutdownCalls != 1 {
@@ -674,7 +784,7 @@ func TestEnsureProvisioned_SubstanceMatchReusesWithoutTouchingDevice(t *testing.
 		delete:         neverDelete(t),
 	}
 
-	if err := ensureProvisioned(s, "with", "with", "", deps, time.Second); err != nil {
+	if err := ensureProvisioned(s, "with", "with", "", deps, 5*time.Second); err != nil {
 		t.Fatalf("ensureProvisioned: %v", err)
 	}
 	if s.Meta.UDID != udid {
@@ -836,7 +946,7 @@ func TestEnsureProvisioned_LeasePathWithOwnFreshLeaseDeletesAndRecreatesDrifted(
 	}
 
 	ownerCmd := "lease (key " + key + ")"
-	if err := ensureProvisioned(slot, ownerCmd, "lease", key, deps, time.Second); err != nil {
+	if err := ensureProvisioned(slot, ownerCmd, "lease", key, deps, 5*time.Second); err != nil {
 		t.Fatalf("ensureProvisioned refused a drifted device on the mav `simpool lease` path despite the live lease belonging to its OWN caller: %v", err)
 	}
 	if shutdownCalls != 1 || deleteCalls != 1 || createCalls != 1 {

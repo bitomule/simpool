@@ -257,6 +257,15 @@ const firstAttemptShare = 2
 // regardless of how much time was nominally left).
 const minRetryBudget = 2 * springBoardPollInterval
 
+// MinBootBudget is the smallest remaining timeout worth handing to
+// BootAndWait at all — see minRetryBudget's own doc comment for why less
+// than this can't even complete one real readiness check. Exported so a
+// caller computing a single deadline across a preceding wait (e.g.
+// EnsureProvisioned's boot-concurrency gate, see pool/provision.go) can fail
+// fast with a clear message instead of calling BootAndWait with a remainder
+// too small to do anything but expire immediately.
+const MinBootBudget = minRetryBudget
+
 // BootAndWaitWithDeps is BootAndWait with its primitives injected; see
 // BootWaitDeps.
 //

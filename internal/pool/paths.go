@@ -151,10 +151,32 @@ func SlotDir(groupDir string, n int) string {
 
 // ListSlotNumbers returns the slot numbers that already have a directory
 // under groupDir, sorted ascending. Missing/unreadable groupDir yields nil.
+//
+// This silently-empty contract is the right default for every read-only or
+// best-effort call site (status, doctor, AcquireSlots/AcquireLease picking a
+// free slot number, ReleaseLease's best-effort sweep) — none of them can
+// mistake "nothing found" for "confirmed free" in a way that deletes
+// anything. A caller that CAN delete something on the strength of this list
+// (reapOrphans' `known` set) must not use this: see ListSlotNumbersChecked.
 func ListSlotNumbers(groupDir string) []int {
+	nums, _ := ListSlotNumbersChecked(groupDir)
+	return nums
+}
+
+// ListSlotNumbersChecked is ListSlotNumbers but distinguishes "no slots"
+// from "could not tell": a genuinely missing groupDir still yields (nil,
+// nil), but any other failure (EACCES, EMFILE, ...) yields a non-nil error
+// instead of being swallowed into an empty slice. Any caller for whom an
+// incomplete listing must read as "still referenced, don't touch" rather
+// than "nothing here" — the same fail-safe rule ReadLease and CheckPoison
+// already apply to their own reads — must use this, not ListSlotNumbers.
+func ListSlotNumbersChecked(groupDir string) ([]int, error) {
 	entries, err := os.ReadDir(groupDir)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var nums []int
 	for _, e := range entries {
@@ -172,7 +194,7 @@ func ListSlotNumbers(groupDir string) []int {
 		nums = append(nums, n)
 	}
 	sortInts(nums)
-	return nums
+	return nums, nil
 }
 
 func sortInts(a []int) {

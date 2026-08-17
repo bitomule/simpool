@@ -287,6 +287,56 @@ func IsSimpoolHolder(pid int, subcommand string) bool {
 	return fields[1] == subcommand
 }
 
+// idbCompanionBinary is the exact daemon `idb` spawns, one process per
+// simulator UDID, to bridge grpc calls to CoreSimulator (see
+// IsIdbCompanionFor).
+const idbCompanionBinary = "idb_companion"
+
+// IsIdbCompanionFor reports whether pid is genuinely an idb_companion
+// daemon pinned to udid via its own `--udid` flag — not merely a process
+// whose command line happens to contain udid as a substring somewhere.
+// idb_companion's own invocation always carries udid twice (`--udid
+// <udid>` and `--grpc-domain-sock /tmp/idb/<udid>`), so a bare substring
+// match — which is all `pgrep -f <udid>` (MatchingPIDs/LiveConsumers)
+// proves — is not enough corroboration that this is really a companion for
+// this exact device rather than some unrelated process that happens to
+// mention the UDID.
+//
+// idb_companion is the one daemon `idb` — the backend MAV uses for
+// coordinate taps — spawns on demand and never reaps on its own: per its
+// own `--help`, "Terminate if the target goes offline" defaults to false,
+// so a companion outlives its simulator's shutdown (or deletion)
+// indefinitely unless something else notices and kills it. Unlike a
+// generic consumer, it is not "the thing doing the work" — the caller
+// (mav, axe, a human running `idb`) is; the companion is disposable
+// infrastructure `idb` respawns transparently the next time anything needs
+// to talk to that device. That is what makes it narrowly, uniquely safe to
+// reclaim once its target is independently confirmed not running — see
+// pool.CheckPoison's PoisonedByOrphanedCompanions — where a generic "this
+// process looks idle" heuristic would not be: identification here is by
+// exact binary name plus an exact `--udid` flag match, never by a guess
+// about what the process is doing.
+func IsIdbCompanionFor(pid int, udid string) bool {
+	cl := CommandLine(pid)
+	if cl == "" {
+		return false
+	}
+	fields := strings.Fields(cl)
+	if len(fields) == 0 {
+		return false
+	}
+	bin := fields[0]
+	if bin != idbCompanionBinary && !strings.HasSuffix(bin, "/"+idbCompanionBinary) {
+		return false
+	}
+	for i := 1; i < len(fields)-1; i++ {
+		if fields[i] == "--udid" {
+			return fields[i+1] == udid
+		}
+	}
+	return false
+}
+
 // CommandLine returns the full command line of pid, best-effort ("" if it
 // can't be read, e.g. the process already exited or belongs to another
 // user).

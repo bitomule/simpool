@@ -39,6 +39,22 @@ const (
 	// Never a kill candidate: a failed check must be read as "busy, don't
 	// touch", never as "confirmed free".
 	PoisonedByCheckFailure
+	// PoisonedByOrphanedCompanions means every PID procs.LiveConsumers
+	// found is independently verified (procs.IsIdbCompanionFor) to be an
+	// idb_companion daemon pinned, via its own --udid flag, to THIS slot's
+	// device — and that device is independently confirmed not currently
+	// running (simctl reports it Shutdown, or it no longer exists in the
+	// device set at all: the real production incident this exists to fix
+	// was a companion still holding the UDID of a simulator deleted nine
+	// days earlier). Unlike PoisonedByLiveConsumers, this reason IS a kill
+	// candidate for AttemptRecovery, regardless of Meta.Mode: idb_companion
+	// is disposable infrastructure `idb` respawns on demand, never "the
+	// consumer" itself, and it cannot be doing useful work against a
+	// device that is provably not running. A single non-companion PID, or
+	// a companion whose target is still Booted (or whose state could not
+	// be determined), falls back to PoisonedByLiveConsumers instead — see
+	// CheckPoison.
+	PoisonedByOrphanedCompanions
 )
 
 // Poison is the result of CheckPoison: whether a free-looking slot's
@@ -49,6 +65,10 @@ type Poison struct {
 	PGID int
 	// Err is set only when Reason == PoisonedByCheckFailure.
 	Err error
+	// CompanionPIDs is set only when Reason == PoisonedByOrphanedCompanions:
+	// every live PID CheckPoison verified is an idb_companion daemon
+	// pinned to a target confirmed not currently running.
+	CompanionPIDs []int
 }
 
 // Poisoned reports whether the slot should be treated as unavailable for
@@ -63,6 +83,8 @@ func (p Poison) String() string {
 		return "a live process still references this slot's device"
 	case PoisonedByCheckFailure:
 		return fmt.Sprintf("could not verify liveness: %v", p.Err)
+	case PoisonedByOrphanedCompanions:
+		return fmt.Sprintf("orphaned idb_companion daemon(s) attached to a non-running device (pids %v)", p.CompanionPIDs)
 	default:
 		return "not poisoned"
 	}
@@ -93,10 +115,68 @@ func CheckPoison(meta Meta) Poison {
 	if err != nil {
 		return Poison{Reason: PoisonedByCheckFailure, Err: err}
 	}
-	if len(live) > 0 {
-		return Poison{Reason: PoisonedByLiveConsumers}
+	if len(live) == 0 {
+		return Poison{}
 	}
-	return Poison{}
+	if companions, ok := allOrphanedIdbCompanions(meta.UDID, live); ok {
+		return Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: companions}
+	}
+	return Poison{Reason: PoisonedByLiveConsumers}
+}
+
+// companionDeviceFind is simctl.Find, as a package-level var so tests can
+// simulate a Booted/Shutdown/error device state for a synthetic UDID
+// without creating or booting a real simulator — mirrors the seams already
+// used elsewhere in this codebase (reap.go's findDevice/shutdownOrphan,
+// provision.go's liveProvisionDeps).
+var companionDeviceFind = simctl.Find
+
+// companionDeviceOffline reports whether udid names a simulator that is
+// definitely not currently running — the only condition under which an
+// idb_companion process attached to it can possibly be doing no useful
+// work. "Not running" covers two cases: simctl reports its state as
+// something other than Booted, or the UDID no longer names any device in
+// the default set at all (the actual production incident this exists to
+// fix: a companion still holding the UDID of a simulator deleted nine days
+// earlier — that one can't even be checked for boot state, since there is
+// no device left to check, but "no device by this UDID exists" is itself
+// conclusive: it cannot be Booted). Any failure to determine this at all
+// (simctl.Find itself erroring) reports ok=false — the same fail-safe rule
+// every poison check in this codebase follows: an inability to verify must
+// never be read as "confirmed offline".
+func companionDeviceOffline(udid string) (offline, ok bool) {
+	entry, found, err := companionDeviceFind(udid)
+	if err != nil {
+		return false, false
+	}
+	if !found {
+		return true, true
+	}
+	return entry.State != "Booted", true
+}
+
+// allOrphanedIdbCompanions reports whether every pid in live is verified
+// (procs.IsIdbCompanionFor) to be an idb_companion daemon pinned to udid,
+// AND udid's own device is independently confirmed not currently running
+// (companionDeviceOffline). Both conditions are checked — a companion
+// attached to a genuinely Booted device is doing legitimate work (or at
+// least might be) and must never be reclaimed, and a single non-companion
+// PID mixed in with real companions means this slot is not narrowly
+// explained by companion residue alone, so the whole set falls back to the
+// ordinary, never-a-kill-candidate PoisonedByLiveConsumers reason. The
+// device state is checked first: if it can't be shown offline, there is no
+// need to even look at what the live PIDs are.
+func allOrphanedIdbCompanions(udid string, live []int) ([]int, bool) {
+	offline, ok := companionDeviceOffline(udid)
+	if !ok || !offline {
+		return nil, false
+	}
+	for _, pid := range live {
+		if !procs.IsIdbCompanionFor(pid, udid) {
+			return nil, false
+		}
+	}
+	return live, true
 }
 
 // VerifyConsumerIdentity checks meta's recorded consumer fingerprint
@@ -208,6 +288,16 @@ func deviceBelongsToSlot(root, udid, groupName string, n int) bool {
 // the caller must fall back to its existing quarantine behavior (refuse to
 // hand it out, or leave it alone).
 func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, poison Poison) bool {
+	if poison.Reason == PoisonedByOrphanedCompanions {
+		// Mode-independent, and handled entirely separately from the
+		// ConsumerPGID branch below: idb_companion residue has nothing to
+		// do with which subcommand is holding (or held) this slot, only
+		// with what `idb` itself left behind, so this runs ahead of — not
+		// behind — the Mode == "with" gate that scopes every other branch
+		// of this function. See reclaimOrphanedCompanions.
+		return reclaimOrphanedCompanions(poison)
+	}
+
 	if meta.Mode != "with" {
 		// Only a `with`-launched process group is something simpool itself
 		// spawned (Setpgid) and can therefore safely kill. `acquire` never
@@ -269,6 +359,49 @@ func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 	meta.ConsumerPGID = 0
 	meta.ConsumerStartedAt = ""
 	_ = WriteMeta(dir, *meta)
+	return true
+}
+
+// reclaimOrphanedCompanions kills exactly the PIDs CheckPoison already
+// verified are idb_companion daemons pinned to a device confirmed not
+// currently running (see PoisonedByOrphanedCompanions) — never a process
+// group: idb_companion is not something simpool spawned via Setpgid, so
+// there is no pgid relationship to exploit the way KillProcessGroup needs.
+// Each pid is signaled individually, exactly like reap's own STUCK-holder
+// kill in reapHeldSlot, for the identical reason: a companion's own pgid is
+// whatever `idb` (or launchd, if reparented) happened to assign it, not
+// guaranteed to be its own — kill(-pid) could otherwise land on an
+// unrelated process group that happens to share that numeric id.
+//
+// Unlike the ConsumerPGID branch above, nothing in meta.json ever records
+// an idb_companion's pid — `idb` spawns it completely outside simpool's own
+// bookkeeping — so there is nothing to clear or persist here on success:
+// the slot is simply safe to hand out again once every kill is verified to
+// have actually stuck. The device itself is never touched: its state was
+// already independently confirmed not Booted before this was ever called
+// (companionDeviceOffline), so there is nothing to shut down, and if it no
+// longer exists at all there is nothing to shut down either — a stale
+// meta.UDID pointing at a deleted device is EnsureProvisioned's problem to
+// paper over the next time this slot is handed out, not this function's.
+func reclaimOrphanedCompanions(poison Poison) bool {
+	if len(poison.CompanionPIDs) == 0 {
+		return false
+	}
+	for _, pid := range poison.CompanionPIDs {
+		if err := procs.Kill(pid, syscall.SIGKILL); err != nil {
+			return false
+		}
+	}
+	time.Sleep(recoveryPostKillWait)
+	for _, pid := range poison.CompanionPIDs {
+		if procs.Alive(pid) {
+			// The signal didn't stick (or something else about this pid
+			// couldn't be confirmed dead) — quarantine exactly like the
+			// ConsumerPGID branch's own post-kill verification rather than
+			// declaring victory on the strength of a signal send alone.
+			return false
+		}
+	}
 	return true
 }
 

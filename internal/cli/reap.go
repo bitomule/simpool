@@ -420,19 +420,31 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	meta := pool.ReadMeta(dir)
 	if poison := pool.CheckPoison(meta); poison.Poisoned() {
 		if dryRun {
-			msg := fmt.Sprintf("SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery", label, meta.UDID, poison)
-			if disownPoisoned && meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID {
-				msg += fmt.Sprintf("; if recovery still can't verify identity on a real run, --disown-poisoned would then forget pgid %d's fingerprint and delete device %s (pgid itself left completely untouched, not killed)", meta.ConsumerPGID, meta.UDID)
+			var msg string
+			if poison.Reason == pool.PoisonedByOrphanedCompanions {
+				msg = fmt.Sprintf("SKIP  %s  %s — dry-run, would kill %d orphaned idb_companion daemon(s), device left untouched", label, poison, len(poison.CompanionPIDs))
+			} else {
+				msg = fmt.Sprintf("SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery", label, meta.UDID, poison)
+				if disownPoisoned && meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID {
+					msg += fmt.Sprintf("; if recovery still can't verify identity on a real run, --disown-poisoned would then forget pgid %d's fingerprint and delete device %s (pgid itself left completely untouched, not killed)", meta.ConsumerPGID, meta.UDID)
+				}
 			}
 			fmt.Fprintln(stdout, msg)
 			return
 		}
 		if pool.AttemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison) {
-			// Only ever true for a verified `with`-spawned orphan (see
-			// AttemptRecovery) — never for a LiveConsumers-only signal,
-			// which for a leased slot is the healthy case, not an orphan,
-			// and never for a failed liveness check.
-			fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
+			// True either for a verified `with`-spawned orphan (see
+			// AttemptRecovery's ConsumerPGID branch) — never for a plain
+			// LiveConsumers-only signal, which for a leased slot is the
+			// healthy case, not an orphan — or for a verified-inert
+			// idb_companion daemon reclaimed regardless of Mode (see
+			// PoisonedByOrphanedCompanions); never for a failed liveness
+			// check either way.
+			if poison.Reason == pool.PoisonedByOrphanedCompanions {
+				fmt.Fprintf(stdout, "RECOVER %s  killed %d orphaned idb_companion daemon(s) attached to device %s — device left untouched, it was already confirmed not running\n", label, len(poison.CompanionPIDs), meta.UDID)
+			} else {
+				fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
+			}
 			// Return immediately rather than falling through to this same
 			// pass's idle/cold/--purge accounting: AttemptRecovery's
 			// simctl.Shutdown call is measured SYNCHRONOUS (5-7.5s wall

@@ -634,8 +634,40 @@ func DisownPoisonedSlot(root, dir string, n int, groupName string, meta *Meta, p
 // substitutes for that guard here — mirroring exactly how the ConsumerPGID
 // branch above substitutes operator judgment for VerifyConsumerIdentity's
 // unattainable proof in its own two motivating cases.
+//
+// What this function does still require, exactly like reclaimOrphanedCompanions
+// (and unlike the deviceBelongsToSlot guard it skips), is re-verifying
+// companionDeviceOffline(meta.UDID) immediately before acting: routing around
+// deviceBelongsToSlot only ever concerns whether udid is confirmed to be THIS
+// slot's own device, never whether the device it currently names is actually
+// not running. CheckPoison's own determination and this call are seconds
+// apart in production (reapSlot runs several real `xcrun simctl` invocations
+// in between — see reap.go), a real window in which the device behind a
+// stale meta.UDID could come back up: either because it is this slot's own
+// device that booted since CheckPoison ran, or — since identity is never
+// confirmed on this path at all — because meta.UDID now points at some
+// entirely different, currently-Booted simulator (another slot's, or a
+// developer's own). Skipping this re-check used to let --disown-poisoned
+// kill a companion attached to a device the operator's request never
+// actually asked it to touch.
 func disownOrphanedCompanions(dir string, meta *Meta, poison Poison) error {
 	if len(poison.CompanionPIDs) == 0 || meta.UDID == "" {
+		return ErrNotDisownable
+	}
+	if offline, ok := companionDeviceOffline(meta.UDID); !ok || !offline {
+		// Re-verified and no longer holds — the device came back (or its
+		// state became unreadable) in the window between CheckPoison's
+		// original determination and this call, exactly the same rule
+		// reclaimOrphanedCompanions applies to its own automatic path (see
+		// its own re-verify above). Deliberately NOT gated on
+		// deviceBelongsToSlot — see this function's own doc comment for why
+		// that guard is routed around here on purpose — but the device
+		// still not currently running is never something this function may
+		// skip re-checking: meta.UDID could just as easily now name a real,
+		// booted device (this slot's own, having booted in the window since
+		// CheckPoison ran, or — since identity is never confirmed on this
+		// path — someone else's real simulator a stale meta.UDID happens to
+		// point at) whose companion is doing genuine work.
 		return ErrNotDisownable
 	}
 	for _, pid := range poison.CompanionPIDs {

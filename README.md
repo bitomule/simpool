@@ -726,12 +726,17 @@ process group simpool can simply stop tracking, forgetting an orphaned
 companion without killing it would accomplish nothing: `idb_companion`
 never self-terminates when its target goes offline, so it would keep
 consuming resources and keep re-poisoning this slot on every subsequent
-`CheckPoison` call, forever. `--disown-poisoned` here re-verifies each pid
-is still a genuine companion, kills all of them (every pid gets an attempt
-regardless of an earlier one's error), verifies each is actually dead, and
-only then forgets the slot's stale `meta.json` UDID — no device is ever
-shut down or deleted, since a deleted device has nothing left to touch and
-a Shutdown-but-unverified one was never proven to be this slot's to act on.
+`CheckPoison` call, forever. `--disown-poisoned` here re-verifies the
+device is still confirmed offline (exactly like `AttemptRecovery`'s own
+automatic path — see above; the identity-unverified device can still come
+back up, or `meta.UDID` can point at a different, currently-Booted device
+entirely, in the window between `CheckPoison` and this call) and that each
+pid is still a genuine companion, kills all of them (every pid gets an
+attempt regardless of an earlier one's error), verifies each is actually
+dead, and only then forgets the slot's stale `meta.json` UDID — no device
+is ever shut down or deleted, since a deleted device has nothing left to
+touch and a Shutdown-but-unverified one was never proven to be this slot's
+to act on.
 
 Respects `--dry-run` for both branches (reports what it would do — forget,
 or forget-and-kill — without touching anything).
@@ -805,11 +810,33 @@ releases the lock on SIGKILL with no cleanup step":
   and every PID in a multi-PID set gets a kill attempt even when an earlier
   one reports an error, proven with 3 real companion processes and a
   `companionKill` seam that reports a fake `EPERM` for the first while
-  actually killing all three. Every one of these guards — the allowlist,
-  the empty-listing distinction, the identity guard, both re-verify checks,
-  and the no-early-return kill loop — was ablation-verified: reverting the
-  corresponding line of `poison.go` individually turns the matching test
-  red.
+  actually killing all three. `disownOrphanedCompanions` (the
+  `--disown-poisoned` path) gets the identical set of guard tests as its
+  `reclaimOrphanedCompanions` twin, not just the identity-confirmed
+  end-to-end cases above: `TestDisownOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling`
+  proves it refuses when the device is confirmed `Booted` at the moment of
+  the call (a hand-built `Poison` standing in for `CheckPoison`'s earlier
+  determination — this was a real gap: a seventh review reproduced disown
+  succeeding against a device it had just re-verified as `Booted`),
+  `_StillWorksForTheDeletedDeviceCase` proves that fix doesn't regress the
+  flagship deleted-device scenario, `_ReVerifiesCompanionIdentityBeforeKilling`
+  and `_ReportsErrorWhenKillDoesNotStick` mirror the reclaim side's own
+  per-PID and post-kill guards, and
+  `_AttemptsEveryPIDEvenIfAnEarlierOneErrors` mirrors the no-early-return
+  kill loop. `TestCompanionDeviceOffline_ErrCheckIsLoadBearingEvenWithAPopulatedList`
+  covers `companionDeviceOffline`'s `err != nil` guard specifically: the
+  real `simctl.ListDevices` always returns a nil device list on its own
+  error path, so a test built on that realistic shape can't tell the
+  err-check apart from the (also-triggered) empty-listing check — this one
+  instead feeds a seam that returns a *populated*, Shutdown-naming device
+  list alongside an error, the one shape that actually isolates it (the
+  renamed `TestCheckPoison_CompanionDeviceListingFails_NeverReclaimed`, its
+  former name notwithstanding, only ever proved the latter). Every one of
+  these guards — the allowlist, the empty-listing distinction, the identity
+  guard, every re-verify check on both the reclaim and disown paths, the
+  no-early-return kill loops, and the `companionDeviceOffline` err-check —
+  was ablation-verified: reverting the corresponding line of `poison.go`
+  individually turns the matching test red.
 - `internal/procs/procs_test.go` proves `ProcessStartTime` produces the
   *same* string for the same instant regardless of the calling process's
   ambient `TZ`/`LC_ALL`/`LANG` (`TestProcessStartTime_StableAcrossAmbientLocaleAndTZ`)
@@ -879,6 +906,22 @@ releases the lock on SIGKILL with no cleanup step":
   that silently re-routes companions through the generic `ConsumerPGID`
   messaging (which would falsely claim the process was "left running
   untouched") turns the corresponding test red.
+- `doctor_test.go`'s `TestRunDoctor_FlagsOrphanedCompanionAsNeverAutoReclaimed`
+  is the regression test for `doctor` giving structurally false advice on an
+  identity-unverified orphaned companion: the original fix gave `reap`
+  reason-specific messages but left `doctor` on one generic "will be
+  reclaimed automatically ... if its identity can still be verified" line
+  for every poison reason — false for `PoisonedByOrphanedCompanions` once
+  `pool.CompanionDeviceVerified` can't confirm the device, since
+  `deviceBelongsToSlot` can only ever succeed against a device that still
+  exists, making automatic recovery permanently unreachable for that slot,
+  not merely unlucky this run. `doctor` now branches on the poison reason
+  exactly like `reap` already did, pointing at `--disown-poisoned` when
+  that's genuinely the only remedy. The test is pinned to the
+  branch-specific wording ("will NEVER be reclaimed automatically"), not to
+  `poison.String()`'s shared text — a previous round of this exact feature
+  produced a false negative from asserting on text every branch happens to
+  share.
 - `internal/pool/lease_test.go` covers `lease`'s own contract — sticky by
   key, two keys never share a slot, an expired lease is reusable, `--max`
   is a real cap and fails immediately (no polling) — and, symmetrically,

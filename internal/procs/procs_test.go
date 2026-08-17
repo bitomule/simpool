@@ -528,3 +528,73 @@ func TestIsIdbCompanionFor(t *testing.T) {
 		t.Errorf("IsIdbCompanionFor must not match a process that merely mentions the udid without being idb_companion itself (command line: %q)", CommandLine(otherPID))
 	}
 }
+
+// TestIsIdbCompanionFor_RejectsSubstringMatch is the finding #5 (MED,
+// CONFIRMED BY ABLATION) regression test: a reviewer replaced the flag scan
+// with `strings.Contains(cl, udid)` — the substring match the PR body, the
+// README, and IsIdbCompanionFor's own doc comment all single out as
+// insufficient — and the entire suite stayed green, because every existing
+// negative case above (TestIsIdbCompanionFor's "SOME-OTHER-UDID" and
+// "merely mentions the udid" checks) happened to be carried by the
+// binary-name check alone, never by anything that actually distinguishes a
+// substring match from an exact one.
+//
+// This spawns a real idb_companion process whose --udid value is
+// udid+"-extra" — the shorter udid is a genuine SUBSTRING of that value
+// (and of --grpc-domain-sock's path, which embeds it too, exactly like a
+// real companion's argv always carries its udid twice — see
+// IsIdbCompanionFor's own doc comment). strings.Contains(cl, udid) would
+// read this as a match; only an EXACT comparison against --udid's own
+// value may ever identify a companion.
+func TestIsIdbCompanionFor_RejectsSubstringMatch(t *testing.T) {
+	bin := buildFakeIdbCompanion(t)
+	const udid = "3A8339E4-TEST-UDID-0000-000000000000"
+	longer := udid + "-EXTRA-SUFFIX"
+
+	cmd := exec.Command(bin, "--udid", longer, "--grpc-domain-sock", "/tmp/idb/"+longer)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	pid := cmd.Process.Pid
+	waitUntil(t, 3*time.Second, func() bool { return Alive(pid) })
+
+	if IsIdbCompanionFor(pid, udid) {
+		t.Fatalf("IsIdbCompanionFor must not match on a bare substring of --udid's own value — only an exact match (command line: %q)", CommandLine(pid))
+	}
+	if !IsIdbCompanionFor(pid, longer) {
+		t.Fatalf("sanity check failed: the real, exact --udid value should still match (command line: %q)", CommandLine(pid))
+	}
+}
+
+// TestIsIdbCompanionFor_HeadlessBootFormNeverMatches is finding #4's
+// (MED, SUSPECTED) regression test: idb_companion's own --help documents a
+// second invocation shape, `--headless VALUE`, under which "the Simulator
+// boot's lifecycle will be tied to the lifecycle of this invocation" — a
+// companion whose death takes the boot down with it, spawned in practice as
+// `--headless 1 --boot <udid>` with NO --udid flag at all. That makes it
+// categorically different from the `--udid <udid> --grpc-domain-sock
+// /tmp/idb/<udid>` shape PoisonedByOrphanedCompanions is scoped to: this
+// form is not disposable, respawnable infrastructure the way the
+// --udid-pinned companion is (see IsIdbCompanionFor's own doc comment), so
+// it must stay unmatched, not because of any special-case exclusion but
+// simply because IsIdbCompanionFor's own --udid flag scan finds nothing to
+// match. This proves that deliberately, on a real spawned process, so it
+// stays true if idb_companion's argv parsing or IsIdbCompanionFor's own
+// logic ever changes.
+func TestIsIdbCompanionFor_HeadlessBootFormNeverMatches(t *testing.T) {
+	bin := buildFakeIdbCompanion(t)
+	const udid = "3A8339E4-TEST-UDID-0000-000000000000"
+
+	cmd := exec.Command(bin, "--headless", "1", "--boot", udid)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	pid := cmd.Process.Pid
+	waitUntil(t, 3*time.Second, func() bool { return Alive(pid) })
+
+	if IsIdbCompanionFor(pid, udid) {
+		t.Fatalf("IsIdbCompanionFor must never match idb_companion's --headless/--boot form — it has no --udid flag at all, and is not the disposable, respawnable infrastructure PoisonedByOrphanedCompanions is scoped to (command line: %q)", CommandLine(pid))
+	}
+}

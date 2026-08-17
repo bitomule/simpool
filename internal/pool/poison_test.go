@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -510,41 +511,95 @@ func TestDisownPoisonedSlot_RefusesNonWithMode(t *testing.T) {
 // exists to fix: three production pool slots stuck FAIL, one companion
 // still holding the UDID of a simulator deleted nine days earlier).
 //
-// None of these tests create or boot a real simulator: companionDeviceFind
-// (the `simctl.Find` seam) is swapped for a fake for the duration of each
+// None of these tests create or boot a real simulator: companionDeviceList
+// (the `simctl.ListDevices` seam) and deviceBelongsToSlotFind (the
+// `simctl.Find` seam) are both swapped for fakes for the duration of each
 // test, exactly like withFakeRunContext does one layer down in package
 // simctl.
 
-// withCompanionDeviceFind points companionDeviceFind at fn for the
+// withCompanionDeviceList points companionDeviceList at fn for the
 // duration of the test and restores the real one on cleanup.
-func withCompanionDeviceFind(t *testing.T, fn func(udid string) (simctl.DeviceEntry, bool, error)) {
+func withCompanionDeviceList(t *testing.T, fn func() ([]simctl.DeviceEntry, error)) {
 	t.Helper()
-	orig := companionDeviceFind
-	companionDeviceFind = fn
-	t.Cleanup(func() { companionDeviceFind = orig })
+	orig := companionDeviceList
+	companionDeviceList = fn
+	t.Cleanup(func() { companionDeviceList = orig })
 }
 
-func fakeBooted(name string) func(string) (simctl.DeviceEntry, bool, error) {
-	return func(string) (simctl.DeviceEntry, bool, error) {
-		return simctl.DeviceEntry{Name: name, State: "Booted"}, true, nil
+// fakeDeviceList returns a companionDeviceList stub reporting a POPULATED
+// device set (one unrelated device, so the set is never suspiciously empty)
+// that includes udid with the given state — standing in for a healthy
+// `simctl list devices` that genuinely knows about this exact device.
+func fakeDeviceList(udid, state string) func() ([]simctl.DeviceEntry, error) {
+	return func() ([]simctl.DeviceEntry, error) {
+		return []simctl.DeviceEntry{
+			{UDID: "simpool-test-unrelated-device", Name: "some other simulator", State: "Booted"},
+			{UDID: udid, Name: "irrelevant to companionDeviceOffline", State: state},
+		}, nil
 	}
 }
 
-func fakeShutdown(name string) func(string) (simctl.DeviceEntry, bool, error) {
-	return func(string) (simctl.DeviceEntry, bool, error) {
-		return simctl.DeviceEntry{Name: name, State: "Shutdown"}, true, nil
+// fakeDeviceDeleted returns a companionDeviceList stub reporting a
+// POPULATED device set that specifically does NOT include udid — the
+// table's deleted-device row: conclusive proof of absence, not an empty
+// listing's ambiguity.
+func fakeDeviceDeleted() func() ([]simctl.DeviceEntry, error) {
+	return func() ([]simctl.DeviceEntry, error) {
+		return []simctl.DeviceEntry{
+			{UDID: "simpool-test-unrelated-device", Name: "some other simulator", State: "Booted"},
+		}, nil
 	}
 }
 
-func fakeDeleted() func(string) (simctl.DeviceEntry, bool, error) {
-	return func(string) (simctl.DeviceEntry, bool, error) {
-		return simctl.DeviceEntry{}, false, nil
+// fakeDeviceListEmpty returns a companionDeviceList stub simulating the
+// finding #2 probe: a successful `xcrun` call (err == nil) that reports
+// ZERO devices — reproduced directly against a fake xcrun printing
+// `{"devices":{}}`, exactly what a degraded or mid-restart CoreSimulator can
+// produce even though every device, including the user's own, still exists.
+func fakeDeviceListEmpty() func() ([]simctl.DeviceEntry, error) {
+	return func() ([]simctl.DeviceEntry, error) {
+		return nil, nil
 	}
 }
 
-func fakeUnreadable(err error) func(string) (simctl.DeviceEntry, bool, error) {
+// fakeDeviceListUnreadable returns a companionDeviceList stub simulating an
+// outright listing failure (the real xcrun call itself erroring).
+func fakeDeviceListUnreadable(err error) func() ([]simctl.DeviceEntry, error) {
+	return func() ([]simctl.DeviceEntry, error) {
+		return nil, err
+	}
+}
+
+// withDeviceBelongsToSlotFind points deviceBelongsToSlotFind at fn for the
+// duration of the test and restores the real one on cleanup.
+func withDeviceBelongsToSlotFind(t *testing.T, fn func(udid string) (simctl.DeviceEntry, bool, error)) {
+	t.Helper()
+	orig := deviceBelongsToSlotFind
+	deviceBelongsToSlotFind = fn
+	t.Cleanup(func() { deviceBelongsToSlotFind = orig })
+}
+
+// fakeSlotOwnDevice returns a deviceBelongsToSlotFind stub reporting the
+// queried udid as found and named EXACTLY for testRoot/testSlotDev/
+// testSlotOSVer/testSlotN (see DeviceNameForGroup) — standing in for "this
+// slot's own device, positively confirmed by name" without a real
+// simulator.
+func fakeSlotOwnDevice(state string) func(string) (simctl.DeviceEntry, bool, error) {
+	name := DeviceNameForGroup(testRoot, GroupName(testSlotDev, testSlotOSVer), testSlotN)
 	return func(string) (simctl.DeviceEntry, bool, error) {
-		return simctl.DeviceEntry{}, false, err
+		return simctl.DeviceEntry{Name: name, State: state}, true, nil
+	}
+}
+
+// fakeSlotForeignDevice returns a deviceBelongsToSlotFind stub reporting the
+// queried udid as found, genuinely existing, and Shutdown — but named for
+// something that is NOT this slot (a developer's own, entirely unrelated
+// simulator, not even pool-prefixed) — the exact probe finding #3 was
+// demonstrated with: "David's own iPhone 17 Pro", Shutdown, not
+// pool-prefixed, not this slot's name.
+func fakeSlotForeignDevice(state string) func(string) (simctl.DeviceEntry, bool, error) {
+	return func(string) (simctl.DeviceEntry, bool, error) {
+		return simctl.DeviceEntry{Name: "David's own iPhone 17 Pro", State: state}, true, nil
 	}
 }
 
@@ -610,7 +665,7 @@ func TestCheckPoison_CompanionOnBootedDevice_NeverReclaimed(t *testing.T) {
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceFind(t, fakeBooted("irrelevant"))
+	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -625,20 +680,68 @@ func TestCheckPoison_CompanionOnBootedDevice_NeverReclaimed(t *testing.T) {
 	}
 }
 
-// TestCheckPoison_CompanionOnShutdownDevice_Reclaimed proves the table's
-// second row and the primary fix: a companion pinned to a device confirmed
-// Shutdown is inert (idb respawns it on demand) and safe to kill —
-// regardless of Meta.Mode, since idb_companion residue has nothing to do
-// with which subcommand held the slot.
-func TestCheckPoison_CompanionOnShutdownDevice_Reclaimed(t *testing.T) {
-	for _, mode := range []string{"lease", "acquire", "with", ""} {
-		t.Run(mode, func(t *testing.T) {
+// TestCheckPoison_CompanionOnNonShutdownNonBootedStates_NeverReclaimed is
+// the ALLOWLIST regression test (finding #1, HIGH): companionDeviceOffline
+// used to be `entry.State != "Booted"`, a DENYLIST under which "Booting",
+// "Shutting Down", "Creating", an unrecognized future state, and even ""
+// (what a JSON response omitting the field would parse as) all classified
+// as reclaimable. "Booting" in particular names a device whose launchd_sim
+// is already up and whose boot is actively underway — reachable in
+// production via a lease-renewal race (TTL 3m, renewed only on the next
+// `simpool lease` call; mav's launch recipe boots the device while a
+// concurrent acquire/lease sees the expired lease, no live ConsumerPGID for
+// an acquire/lease slot, and a live companion — "not Booted" under the old
+// code would kill it and hand the device to a second consumer). Only
+// State == "Shutdown" may ever be treated as offline.
+func TestCheckPoison_CompanionOnNonShutdownNonBootedStates_NeverReclaimed(t *testing.T) {
+	for _, state := range []string{"Booting", "Shutting Down", "Creating", "Unknown", ""} {
+		t.Run("state="+state, func(t *testing.T) {
 			dir := t.TempDir()
-			udid := "simpool-test-companion-shutdown-" + mode
+			// The udid itself must never contain whitespace: IsIdbCompanionFor
+			// (correctly) tokenizes the companion's command line on
+			// strings.Fields, so a udid embedding a literal space (as
+			// "Shutting Down" would, pasted in unsanitized) breaks the exact
+			// --udid flag match test fixtures rely on — real UDIDs are plain
+			// hex UUIDs and never contain spaces, so this is purely a test
+			// fixture concern, not a production one.
+			udid := "simpool-test-companion-transitional-" + strings.ReplaceAll(state, " ", "_")
 			pid, cleanup := spawnIdbCompanion(t, udid)
 			defer cleanup()
 			waitForLiveConsumer(t, udid)
-			withCompanionDeviceFind(t, fakeShutdown("irrelevant"))
+			withCompanionDeviceList(t, fakeDeviceList(udid, state))
+
+			meta := Meta{UDID: udid, Mode: "lease"}
+			poison := CheckPoison(meta)
+			if poison.Reason != PoisonedByLiveConsumers {
+				t.Fatalf("state=%q: expected PoisonedByLiveConsumers (never PoisonedByOrphanedCompanions for anything but a positively confirmed Shutdown), got %v", state, poison.Reason)
+			}
+			if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+				t.Fatalf("state=%q: AttemptRecovery must never reclaim a companion whose device is not positively confirmed Shutdown", state)
+			}
+			if syscall.Kill(pid, 0) != nil {
+				t.Fatalf("state=%q: the companion process must still be alive", state)
+			}
+		})
+	}
+}
+
+// TestCheckPoison_CompanionOnShutdownDevice_AutoReclaimedWhenIdentityVerified
+// proves the primary fix, WITH the identity guard satisfied: a companion
+// pinned to a device confirmed Shutdown, AND independently confirmed (by
+// name, via deviceBelongsToSlot) to be this exact slot's own device, is
+// inert (idb respawns it on demand) and safe to kill automatically —
+// regardless of Meta.Mode, since idb_companion residue has nothing to do
+// with which subcommand held the slot.
+func TestCheckPoison_CompanionOnShutdownDevice_AutoReclaimedWhenIdentityVerified(t *testing.T) {
+	for _, mode := range []string{"lease", "acquire", "with", ""} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			udid := "simpool-test-companion-shutdown-verified-" + mode
+			pid, cleanup := spawnIdbCompanion(t, udid)
+			defer cleanup()
+			waitForLiveConsumer(t, udid)
+			withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+			withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
 			meta := Meta{UDID: udid, Mode: mode}
 			poison := CheckPoison(meta)
@@ -649,35 +752,109 @@ func TestCheckPoison_CompanionOnShutdownDevice_Reclaimed(t *testing.T) {
 				t.Fatalf("mode=%q: expected CompanionPIDs=[%d], got %v", mode, pid, poison.CompanionPIDs)
 			}
 			if !AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
-				t.Fatalf("mode=%q: AttemptRecovery should have reclaimed the orphaned companion", mode)
+				t.Fatalf("mode=%q: AttemptRecovery should have reclaimed the orphaned companion once identity was verified", mode)
 			}
 			waitForDead(t, pid)
 		})
 	}
 }
 
-// TestCheckPoison_CompanionOnDeletedDevice_Reclaimed proves the table's
-// deleted-device row — the exact real-world incident this exists to fix: a
-// companion still holding the UDID of a simulator that no longer exists at
-// all cannot even be asked its boot state, but "no device by this UDID
-// exists" is itself conclusive proof it isn't Booted.
-func TestCheckPoison_CompanionOnDeletedDevice_Reclaimed(t *testing.T) {
+// TestCheckPoison_CompanionOnShutdownDevice_NotAutoReclaimedWithoutIdentity
+// is the finding #3 (HIGH) regression test: a companion pinned to a UDID
+// that is genuinely Shutdown is NOT enough by itself — meta.UDID is
+// advisory and can be stale or corrupt, so AttemptRecovery must refuse to
+// kill unless deviceBelongsToSlot can positively confirm, by name, that
+// this Shutdown device is actually this slot's own. Two ways identity can
+// fail to confirm: the device isn't found at all under this UDID (default
+// deviceBelongsToSlotFind against a synthetic UDID — mirrors the existing
+// ConsumerPGID tests' own testRoot convention), and the device IS found but
+// is named for something else entirely — reproducing the review's own
+// probe: a companion pinned to "David's own iPhone 17 Pro", Shutdown, not
+// pool-prefixed, not this slot's name.
+func TestCheckPoison_CompanionOnShutdownDevice_NotAutoReclaimedWithoutIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		fake func(string) (simctl.DeviceEntry, bool, error)
+	}{
+		{"udid not found at all", nil}, // deliberately leaves the real simctl.Find in place
+		{"udid names a foreign, unrelated device", fakeSlotForeignDevice("Shutdown")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			udid := "simpool-test-companion-shutdown-unverified-" + strings.ReplaceAll(tc.name, " ", "-")
+			pid, cleanup := spawnIdbCompanion(t, udid)
+			defer cleanup()
+			waitForLiveConsumer(t, udid)
+			withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+			if tc.fake != nil {
+				withDeviceBelongsToSlotFind(t, tc.fake)
+			}
+
+			meta := Meta{UDID: udid, Mode: "lease"}
+			poison := CheckPoison(meta)
+			if poison.Reason != PoisonedByOrphanedCompanions {
+				t.Fatalf("expected PoisonedByOrphanedCompanions (the device state condition alone is satisfied), got %v", poison.Reason)
+			}
+			if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+				t.Fatal("AttemptRecovery must refuse to kill a companion whose target device's identity as THIS slot's own could not be verified, even though the device is genuinely Shutdown")
+			}
+			if syscall.Kill(pid, 0) != nil {
+				t.Fatal("the companion process must still be alive — an unverifiable kill target must never be touched")
+			}
+
+			// The explicit, operator-opt-in escape hatch must still be able
+			// to reach it, exactly like the ConsumerPGID case's own
+			// --disown-poisoned role.
+			if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); err != nil {
+				t.Fatalf("DisownPoisonedSlot should have killed the identity-unverifiable companion on explicit request: %v", err)
+			}
+			waitForDead(t, pid)
+			if meta.UDID != "" {
+				t.Errorf("DisownPoisonedSlot should have forgotten the stale UDID, got %+v", meta)
+			}
+		})
+	}
+}
+
+// TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired
+// proves finding #3's resolved tension for the exact real-world incident
+// this whole feature exists to fix: a companion still holding the UDID of a
+// simulator that no longer exists at all. Unlike the Shutdown case,
+// deviceBelongsToSlot can NEVER be satisfied here — there is no device left
+// to name-check — so this is now, deliberately, unreachable via the fully
+// automatic AttemptRecovery path. It remains reachable only through the
+// explicit, operator-opt-in `--disown-poisoned` escape hatch (see
+// DisownPoisonedSlot's PoisonedByOrphanedCompanions branch), exactly the
+// same role that flag already plays for an unverifiable ConsumerPGID.
+func TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired(t *testing.T) {
 	dir := t.TempDir()
 	udid := "simpool-test-companion-deleted"
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceFind(t, fakeDeleted())
+	withCompanionDeviceList(t, fakeDeviceDeleted())
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
 	if poison.Reason != PoisonedByOrphanedCompanions {
 		t.Fatalf("expected PoisonedByOrphanedCompanions for a companion on a deleted device, got %v", poison.Reason)
 	}
-	if !AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
-		t.Fatal("AttemptRecovery should have reclaimed the companion attached to a deleted device")
+
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+		t.Fatal("AttemptRecovery must never automatically reclaim a companion on a deleted device — there is no device left to confirm this slot owns it, so this is structurally an unverifiable kill")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the companion process must still be alive after the refused automatic attempt")
+	}
+
+	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); err != nil {
+		t.Fatalf("DisownPoisonedSlot should have reclaimed the deleted-device companion on explicit request: %v", err)
 	}
 	waitForDead(t, pid)
+	if meta.UDID != "" {
+		t.Errorf("DisownPoisonedSlot should have forgotten the stale (deleted) UDID, got %+v", meta)
+	}
 }
 
 // TestCheckPoison_NonCompanionOnShutdownDevice_NeverReclaimed proves the
@@ -691,7 +868,7 @@ func TestCheckPoison_NonCompanionOnShutdownDevice_NeverReclaimed(t *testing.T) {
 	pid, cleanup := spawnLiveConsumerWithToken(t, token)
 	defer cleanup()
 	waitForLiveConsumer(t, token)
-	withCompanionDeviceFind(t, fakeShutdown("irrelevant"))
+	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -729,7 +906,8 @@ func TestCheckPoison_MixedCompanionAndNonCompanion_NeverReclaimed(t *testing.T) 
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	withCompanionDeviceFind(t, fakeShutdown("irrelevant"))
+	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -746,15 +924,16 @@ func TestCheckPoison_MixedCompanionAndNonCompanion_NeverReclaimed(t *testing.T) 
 
 // TestCheckPoison_CompanionDeviceStateUnreadable_NeverReclaimed proves the
 // "couldn't verify must read as busy, don't touch" rule applies here too: if
-// simctl.Find itself fails, that must never be read as "confirmed offline",
-// even though the process is a genuine idb_companion for this exact udid.
+// the device listing itself fails, that must never be read as "confirmed
+// offline", even though the process is a genuine idb_companion for this
+// exact udid.
 func TestCheckPoison_CompanionDeviceStateUnreadable_NeverReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	udid := "simpool-test-companion-unreadable"
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceFind(t, fakeUnreadable(errors.New("xcrun simctl list devices -j: boom")))
+	withCompanionDeviceList(t, fakeDeviceListUnreadable(errors.New("xcrun simctl list devices -j: boom")))
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -766,5 +945,144 @@ func TestCheckPoison_CompanionDeviceStateUnreadable_NeverReclaimed(t *testing.T)
 	}
 	if syscall.Kill(pid, 0) != nil {
 		t.Fatal("the companion process must still be alive")
+	}
+}
+
+// TestCheckPoison_CompanionDeviceListEmpty_NeverReclaimed is the finding #2
+// (HIGH) regression test: a SUCCESSFUL simctl call reporting ZERO devices
+// must never be read as "udid was verified deleted" — reproduced directly
+// against a fake `xcrun` exiting 0 and printing `{"devices":{}}`, exactly
+// what a degraded or mid-restart CoreSimulator can report even though every
+// device (the user's own included) genuinely still exists. Before this fix,
+// companionDeviceOffline's `!found` branch could not tell this apart from a
+// populated listing that specifically excludes udid (the real deleted-device
+// case, still exercised by
+// TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired).
+func TestCheckPoison_CompanionDeviceListEmpty_NeverReclaimed(t *testing.T) {
+	dir := t.TempDir()
+	udid := "simpool-test-companion-empty-listing"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForLiveConsumer(t, udid)
+	withCompanionDeviceList(t, fakeDeviceListEmpty())
+
+	meta := Meta{UDID: udid, Mode: "lease"}
+	poison := CheckPoison(meta)
+	if poison.Reason != PoisonedByLiveConsumers {
+		t.Fatalf("expected PoisonedByLiveConsumers for a successful-but-empty device listing — it is not proof of deletion, got %v", poison.Reason)
+	}
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+		t.Fatal("AttemptRecovery must never act on a successful-but-empty device listing")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the companion process must still be alive")
+	}
+}
+
+// TestReclaimOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling is the
+// finding #7 "no re-verify before acting" regression test, applied to the
+// device-offline condition: CheckPoison's own determination and
+// AttemptRecovery's kill are not the same instant, so this proves the
+// device state is checked again, immediately before killing, not trusted
+// from the Poison value alone. A hand-built Poison claims
+// PoisonedByOrphanedCompanions (as if CheckPoison had determined this
+// earlier), but companionDeviceList is set to report the device BOOTED at
+// the moment AttemptRecovery actually runs — simulating the device coming
+// back up in the window between determination and action.
+func TestReclaimOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling(t *testing.T) {
+	dir := t.TempDir()
+	udid := "simpool-test-companion-reverify-device"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForLiveConsumer(t, udid)
+	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
+	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted")) // device is back up NOW
+
+	meta := Meta{UDID: udid, Mode: "lease"}
+	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: []int{pid}}
+
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+		t.Fatal("AttemptRecovery must re-check the device is still offline immediately before killing, not trust an earlier determination")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the companion process must still be alive")
+	}
+}
+
+// TestReclaimOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling is
+// finding #7's re-verify rule applied to the per-PID companion-identity
+// condition: a hand-built Poison lists a pid that is, at the moment
+// AttemptRecovery actually runs, NOT (or no longer) a genuine idb_companion
+// for udid — simulating that pid having exited and been recycled by an
+// unrelated process in the window between CheckPoison and this call.
+func TestReclaimOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *testing.T) {
+	dir := t.TempDir()
+	token := "simpool-test-companion-reverify-identity"
+	pid, cleanup := spawnLiveConsumerWithToken(t, token) // genuinely NOT idb_companion
+	defer cleanup()
+	waitForLiveConsumer(t, token)
+	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
+	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+
+	meta := Meta{UDID: token, Mode: "lease"}
+	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: []int{pid}}
+
+	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
+		t.Fatal("AttemptRecovery must re-verify every pid is still a genuine idb_companion immediately before killing, not trust an earlier determination")
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the non-companion process must still be alive")
+	}
+}
+
+// TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors is
+// the finding #7 "partial kill then return false" regression test: with
+// several PIDs, an earlier version of this code returned false the instant
+// procs.Kill reported an error for ANY one of them — leaving that one
+// already dead while the loop never even reached the rest, which then
+// stayed alive despite the function reporting "nothing changed". Three real
+// companion processes are spawned; companionKill is overridden to actually
+// kill each one (via the real procs.Kill) while ALSO reporting a fake EPERM
+// for the first pid specifically — the one way procs.Kill itself can ever
+// genuinely fail. All three must still end up dead, proving every pid gets
+// a kill attempt regardless of an earlier one's reported error.
+func TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *testing.T) {
+	dir := t.TempDir()
+	udid := "simpool-test-companion-partial-kill"
+	var pids []int
+	for i := 0; i < 3; i++ {
+		pid, cleanup := spawnIdbCompanion(t, udid)
+		defer cleanup()
+		pids = append(pids, pid)
+	}
+	// All three share the same udid deliberately: CheckPoison's own
+	// allOrphanedIdbCompanions groups every live PID referencing one udid
+	// together, so a real multi-PID poisoned set looks exactly like this.
+	waitForLiveConsumer(t, udid)
+	withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
+
+	origKill := companionKill
+	defer func() { companionKill = origKill }()
+	var attempted []int
+	firstPID := pids[0]
+	companionKill = func(pid int, sig syscall.Signal) error {
+		attempted = append(attempted, pid)
+		realErr := procs.Kill(pid, sig) // actually kill it regardless
+		if pid == firstPID {
+			return syscall.EPERM // ...but report a fake permission failure
+		}
+		return realErr
+	}
+
+	meta := Meta{UDID: udid, Mode: "lease"}
+	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: pids}
+	AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison)
+
+	if len(attempted) != 3 {
+		t.Fatalf("expected a kill attempt for all 3 pids regardless of the first one's reported error, got attempts for %v", attempted)
+	}
+	for _, pid := range pids {
+		waitForDead(t, pid)
 	}
 }

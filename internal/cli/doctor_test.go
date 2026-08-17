@@ -206,3 +206,67 @@ func TestRunDoctor_CatchesMetaCoherentlyPointingAtAnotherGroupsDevice(t *testing
 		t.Fatalf("doctor should name %s (the slot whose meta.json is wrong), got:\n%s", wantLabel, stdout.String())
 	}
 }
+
+// TestRunDoctor_FlagsOrphanedCompanionAsNeverAutoReclaimed is the regression
+// test for finding #3 (structurally false advice): before this fix, doctor
+// used the same generic message for every poison reason — "will be
+// reclaimed automatically on the next acquisition or `simpool reap` if its
+// identity can still be verified" — even for PoisonedByOrphanedCompanions
+// whose target device's identity as this slot's own could not be confirmed.
+// That is never true for this specific case: deviceBelongsToSlot (what
+// pool.CompanionDeviceVerified checks) can only ever succeed against a
+// device that still exists to name-check, so an unverified companion is
+// permanently unreachable via the automatic path, not merely unlucky on
+// this run — `reap` already says the right thing (see reap.go), doctor did
+// not.
+//
+// Uses the same real-simctl pattern as reap_test.go's own companion-at-the-
+// CLI-layer tests (see that file's own doc comment): a synthetic UDID the
+// real, read-only `xcrun simctl list devices -j` genuinely does not
+// contain, which makes deviceBelongsToSlot's underlying simctl.Find return
+// found=false — landing this squarely in the identity-unverified branch,
+// exactly the deleted-device production incident this whole feature exists
+// to fix.
+//
+// Pinned to the branch-specific wording ("will NEVER be reclaimed
+// automatically"), not to poison.String()'s shared text: poison.String()
+// mentions "idb_companion" and "orphaned" regardless of which branch
+// renders it, so asserting on that alone would pass even if doctor's
+// message hadn't actually changed — a previous round of this exact feature
+// produced a false negative exactly that way (see reap_test.go's own
+// comment on "companion pid(s)" for the established precedent of pinning to
+// branch-unique substrings).
+func TestRunDoctor_FlagsOrphanedCompanionAsNeverAutoReclaimed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	groupDir := pool.GroupDir(home, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	udid := "simpool-test-udid-doctor-companion-unverified"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForCompanionLiveConsumer(t, udid)
+
+	if err := pool.WriteMeta(dir, pool.Meta{UDID: udid, Mode: "lease"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunDoctor(nil, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doctor should flag an orphaned-companion slot as a problem, got exit 0:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("will NEVER be reclaimed automatically")) {
+		t.Fatalf("doctor should give the companion-specific, structurally-honest message for an identity-unverified orphaned companion, got:\n%s", stdout.String())
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("--disown-poisoned")) {
+		t.Errorf("doctor should point at --disown-poisoned as the actual remedy, got:\n%s", stdout.String())
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("doctor is read-only — the companion process must never be touched")
+	}
+}

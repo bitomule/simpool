@@ -608,3 +608,225 @@ func TestReapHeldSlot_NeverKillsAcquireHolder(t *testing.T) {
 		t.Errorf("reap must never treat an `acquire` holder as stuck, got:\n%s", stdout.String())
 	}
 }
+
+// --- Orphaned idb_companion reclaim at the CLI layer (finding #6:
+// observability) ---
+//
+// pool.CheckPoison's device-offline seam (companionDeviceList) is internal
+// to package pool and not reachable from here, so these tests use the same
+// pattern internal/pool/poison_test.go's own ConsumerPGID tests establish:
+// a synthetic UDID that the REAL `xcrun simctl list devices -j` (read-only,
+// never creates/boots/shuts down/deletes anything) genuinely does not
+// contain. As long as this machine has at least one real device already
+// (true of any dev machine with Xcode installed), that listing is
+// non-empty, which makes a synthetic UDID's absence CONCLUSIVE per
+// companionDeviceOffline's own rule — Shutdown-equivalent for the poison
+// classification — while deviceBelongsToSlot can never be satisfied (no
+// real device exists under this UDID to name-check), landing every one of
+// these in the "identity unverified" branch. That is exactly the
+// interesting branch for reap's own messaging/routing logic, which is what
+// these tests exercise — not pool's own guard correctness, already proven
+// exhaustively in internal/pool/poison_test.go.
+
+// buildFakeIdbCompanionBinary compiles a trivial real binary named
+// "idb_companion" that just sleeps, mirroring internal/pool/poison_test.go's
+// identically-named helper in a different package — a shell script won't
+// do (see that helper's own doc comment: `ps` reports a script's
+// *interpreter*, not the script itself, as argv[0]).
+func buildFakeIdbCompanionBinary(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(src, []byte("package main\nimport \"time\"\nfunc main() { time.Sleep(5 * time.Minute) }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "idb_companion")
+	out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, src).CombinedOutput()
+	if err != nil {
+		t.Fatalf("building fake idb_companion binary: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// spawnIdbCompanion starts a real process whose own argv0 is a compiled
+// "idb_companion" binary and whose --udid flag is exactly udid — the same
+// shape LiveConsumers and IsIdbCompanionFor see from the real daemon.
+func spawnIdbCompanion(t *testing.T, udid string) (pid int, cleanup func()) {
+	t.Helper()
+	bin := buildFakeIdbCompanionBinary(t)
+	cmd := exec.Command(bin, "--udid", udid, "--grpc-domain-sock", "/tmp/idb/"+udid)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid = cmd.Process.Pid
+	go func() { _ = cmd.Wait() }()
+	return pid, func() { _ = syscall.Kill(pid, syscall.SIGKILL) }
+}
+
+func waitForCompanionLiveConsumer(t *testing.T, udid string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		live, _ := procs.LiveConsumers(udid)
+		if len(live) > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("companion process never became visible to LiveConsumers")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitForCompanionDead(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("companion pid %d is still alive after the deadline", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReapSlot_SkipsCompanionWithUnverifiableDeviceIdentity proves ordinary
+// `reap` (no --disown-poisoned) reports, but never kills, an orphaned
+// idb_companion whose target device's identity as this slot's own could not
+// be confirmed — the fix for finding #3 applied at the CLI layer: the old
+// code would have reclaimed this the instant the device was found not
+// Booted, with no identity check at all.
+func TestReapSlot_SkipsCompanionWithUnverifiableDeviceIdentity(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	udid := "simpool-test-udid-companion-cli-skip"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForCompanionLiveConsumer(t, udid)
+
+	if err := pool.WriteMeta(dir, pool.Meta{UDID: udid, Mode: "lease"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, false /*disownPoisoned*/, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
+		t.Fatalf("reap should SKIP an identity-unverifiable companion, not RECOVER it, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	// "companion pid(s)" is unique to the companion-specific SKIP message —
+	// unlike a bare "--disown-poisoned" substring (present in BOTH the
+	// companion and the generic ConsumerPGID fallback message, since both
+	// mention the flag), this pins the assertion to the actually-companion-
+	// aware branch having run, not merely to any SKIP path at all.
+	if !bytes.Contains(stdout.Bytes(), []byte("companion pid(s)")) {
+		t.Errorf("the SKIP message should be the companion-specific one, pointing at --disown-poisoned to kill the companion pid(s), got:\n%s", stdout.String())
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("the companion process must still be alive — an unverifiable kill target must never be touched")
+	}
+}
+
+// TestReapSlot_DryRunReportsCompanionWithoutKilling proves --dry-run for a
+// companion whose identity can't be verified reports what --disown-poisoned
+// would do without ever touching the process — mirroring
+// TestReapSlot_DisownPoisonedDryRunNeverMutates's existing role for the
+// ConsumerPGID case.
+func TestReapSlot_DryRunReportsCompanionWithoutKilling(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	udid := "simpool-test-udid-companion-cli-dryrun"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForCompanionLiveConsumer(t, udid)
+
+	if err := pool.WriteMeta(dir, pool.Meta{UDID: udid, Mode: "lease"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
+		t.Fatalf("dry-run must report SKIP, never act, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	// "companion pid(s)" pins this to the companion-specific dry-run
+	// message, not merely any SKIP output mentioning --disown-poisoned.
+	if !bytes.Contains(stdout.Bytes(), []byte("companion pid(s)")) {
+		t.Errorf("dry-run should preview --disown-poisoned killing the companion pid(s), got:\n%s", stdout.String())
+	}
+	if syscall.Kill(pid, 0) != nil {
+		t.Fatal("dry-run must never touch the companion process")
+	}
+	persisted := pool.ReadMeta(dir)
+	if persisted.UDID != udid {
+		t.Fatalf("dry-run must never mutate meta, got %+v", persisted)
+	}
+}
+
+// TestReapSlot_DisownPoisonedKillsUnverifiableCompanion is the finding #3
+// "resolved tension" end-to-end regression test at the CLI layer: unlike
+// the ConsumerPGID case's --disown-poisoned (which never signals the
+// process — see TestReapSlot_DisownPoisonedFreesAnUnverifiableSlotWithoutKilling),
+// disowning an orphaned idb_companion whose device identity could not be
+// confirmed DOES kill it — forgetting alone would leave it running and
+// re-poisoning this slot forever, since idb_companion never self-terminates
+// (see procs.IsIdbCompanionFor's doc comment). This is the explicit,
+// operator-opt-in path that covers exactly what AttemptRecovery's automatic
+// branch now refuses (see TestReapSlot_SkipsCompanionWithUnverifiableDeviceIdentity).
+func TestReapSlot_DisownPoisonedKillsUnverifiableCompanion(t *testing.T) {
+	root := t.TempDir()
+	groupDir := pool.GroupDir(root, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	udid := "simpool-test-udid-companion-cli-disown"
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForCompanionLiveConsumer(t, udid)
+
+	if err := pool.WriteMeta(dir, pool.Meta{UDID: udid, Mode: "lease"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+
+	if !bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
+		t.Fatalf("reap --disown-poisoned should report reclaiming the companion, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	// The word "killed" is unique to the companion-specific DISOWN message
+	// template itself (poison.String() alone already mentions
+	// "idb_companion" regardless of which branch renders it, since the
+	// generic ConsumerPGID message also interpolates %poison — so that
+	// substring can't distinguish the two). The generic branch's own
+	// template never says "killed": it explicitly promises the pgid is
+	// "left running untouched", which would be a lie here — this path
+	// actually kills the companion.
+	if !bytes.Contains(stdout.Bytes(), []byte("killed")) {
+		t.Errorf("the DISOWN message should be the companion-specific one (killed, not merely forgotten), got:\n%s", stdout.String())
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("left running untouched")) {
+		t.Errorf("the companion DISOWN message must never claim anything was left running untouched — it was killed, got:\n%s", stdout.String())
+	}
+	waitForCompanionDead(t, pid)
+
+	persisted := pool.ReadMeta(dir)
+	if persisted.UDID != "" {
+		t.Fatalf("expected the slot's stale device reference to be forgotten, got %+v", persisted)
+	}
+}

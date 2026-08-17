@@ -56,7 +56,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	purgeMinutes := fs.Int("purge", 0, "minutes a slot must have been shut down (already cold) before its simulator is deleted outright, reclaiming disk; 0 disables purging")
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
-	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify (a recycled pid, or a process group owned by another user): forget this slot's identity and delete its device, WITHOUT signaling the process that poisoned it — that process, if actually still alive, is left running untouched. Only ever affects a `with` slot whose poison is an unverifiable process-group fingerprint; never a live lease/acquire consumer or a check that merely failed to run. Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
+	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify: for an unverifiable `with` process-group fingerprint (a recycled pid, or a process group owned by another user), forget this slot's identity and delete its device WITHOUT signaling the process, which if actually still alive is left running untouched; for an orphaned idb_companion daemon whose target device's identity as this slot's own could not be confirmed (deleted, or named for something else), KILL the already narrowly-verified companion pid(s) and forget the stale device reference — unlike the first case, forgetting alone would leave it running and re-poisoning this slot forever, since idb_companion never self-terminates. Never a live lease/acquire consumer or a check that merely failed to run. Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
@@ -420,19 +420,37 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	meta := pool.ReadMeta(dir)
 	if poison := pool.CheckPoison(meta); poison.Poisoned() {
 		if dryRun {
-			msg := fmt.Sprintf("SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery", label, meta.UDID, poison)
-			if disownPoisoned && meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID {
-				msg += fmt.Sprintf("; if recovery still can't verify identity on a real run, --disown-poisoned would then forget pgid %d's fingerprint and delete device %s (pgid itself left completely untouched, not killed)", meta.ConsumerPGID, meta.UDID)
+			var msg string
+			switch {
+			case poison.Reason == pool.PoisonedByOrphanedCompanions && pool.CompanionDeviceVerified(root, filepath.Base(groupDir), n, meta):
+				msg = fmt.Sprintf("SKIP  %s  %s — device confirmed this slot's own; dry-run, would kill %d orphaned idb_companion daemon(s), device itself left untouched", label, poison, len(poison.CompanionPIDs))
+			case poison.Reason == pool.PoisonedByOrphanedCompanions:
+				msg = fmt.Sprintf("SKIP  %s  %s — device %s's identity as this slot's own could not be confirmed (deleted, or named for something else); dry-run, recovery would quarantine rather than auto-kill", label, poison, meta.UDID)
+				if disownPoisoned {
+					msg += fmt.Sprintf("; --disown-poisoned would then kill %d companion pid(s) %v and forget this slot's stale device reference", len(poison.CompanionPIDs), poison.CompanionPIDs)
+				}
+			default:
+				msg = fmt.Sprintf("SKIP  %s  lock free but its consumer is still alive (device %s, %s) — dry-run, not attempting recovery", label, meta.UDID, poison)
+				if disownPoisoned && meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID {
+					msg += fmt.Sprintf("; if recovery still can't verify identity on a real run, --disown-poisoned would then forget pgid %d's fingerprint and delete device %s (pgid itself left completely untouched, not killed)", meta.ConsumerPGID, meta.UDID)
+				}
 			}
 			fmt.Fprintln(stdout, msg)
 			return
 		}
 		if pool.AttemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison) {
-			// Only ever true for a verified `with`-spawned orphan (see
-			// AttemptRecovery) — never for a LiveConsumers-only signal,
-			// which for a leased slot is the healthy case, not an orphan,
-			// and never for a failed liveness check.
-			fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
+			// True either for a verified `with`-spawned orphan (see
+			// AttemptRecovery's ConsumerPGID branch) — never for a plain
+			// LiveConsumers-only signal, which for a leased slot is the
+			// healthy case, not an orphan — or for a verified-inert
+			// idb_companion daemon reclaimed regardless of Mode (see
+			// PoisonedByOrphanedCompanions); never for a failed liveness
+			// check either way.
+			if poison.Reason == pool.PoisonedByOrphanedCompanions {
+				fmt.Fprintf(stdout, "RECOVER %s  killed %d orphaned idb_companion daemon(s) attached to device %s — device left untouched, it was already confirmed not running\n", label, len(poison.CompanionPIDs), meta.UDID)
+			} else {
+				fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
+			}
 			// Return immediately rather than falling through to this same
 			// pass's idle/cold/--purge accounting: AttemptRecovery's
 			// simctl.Shutdown call is measured SYNCHRONOUS (5-7.5s wall
@@ -453,6 +471,19 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			return
 		}
 		if disownPoisoned {
+			if poison.Reason == pool.PoisonedByOrphanedCompanions {
+				companionPIDs, udid := append([]int(nil), poison.CompanionPIDs...), meta.UDID
+				if err := pool.DisownPoisonedSlot(root, dir, n, filepath.Base(groupDir), &meta, poison); err != nil {
+					if errors.Is(err, pool.ErrNotDisownable) {
+						fmt.Fprintf(stdout, "SKIP  %s  %s — not eligible for --disown-poisoned (a companion pid could not be re-verified against device %s), not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, poison, udid)
+					} else {
+						fmt.Fprintf(stderr, "reap %s: --disown-poisoned: could not confirm every companion pid was killed: %v\n", label, err)
+					}
+					return
+				}
+				fmt.Fprintf(stdout, "DISOWN %s  device %s's identity as this slot's own could not be confirmed — killed %d orphaned idb_companion daemon(s) (pids %v) and forgot this slot's stale device reference on your explicit --disown-poisoned request\n", label, udid, len(companionPIDs), companionPIDs)
+				return
+			}
 			pgid, udid := meta.ConsumerPGID, meta.UDID
 			if err := pool.DisownPoisonedSlot(root, dir, n, filepath.Base(groupDir), &meta, poison); err != nil {
 				if errors.Is(err, pool.ErrNotDisownable) {
@@ -463,6 +494,10 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 				return
 			}
 			fmt.Fprintf(stdout, "DISOWN %s  could not verify pgid %d's identity (device %s, %s) — forgot this slot's fingerprint and deleted that device on your explicit --disown-poisoned request; if pgid %d is still alive, it is left running untouched, just no longer tracked by simpool\n", label, pgid, udid, poison, pgid)
+			return
+		}
+		if poison.Reason == pool.PoisonedByOrphanedCompanions {
+			fmt.Fprintf(stdout, "SKIP  %s  %s — device %s's identity as this slot's own could not be confirmed (deleted, or named for something else), not touching; rerun `simpool reap --disown-poisoned` to kill %d companion pid(s) and forget this slot's stale device reference\n", label, poison, meta.UDID, len(poison.CompanionPIDs))
 			return
 		}
 		fmt.Fprintf(stdout, "SKIP  %s  lock free but its consumer is still alive (device %s, %s) — could not verify its identity, not touching; the next acquisition (with/acquire/lease) will retry automatically, or rerun `simpool reap --disown-poisoned` to forget this slot's identity (without signaling anything) and free it for reuse\n", label, meta.UDID, poison)

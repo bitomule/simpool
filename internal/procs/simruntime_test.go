@@ -26,10 +26,13 @@ func envLine(pid int, binary, udid string) string {
 }
 
 type fakePS struct {
-	argv     string
-	argvErr  error
-	env      string
-	envErr   error
+	argv    string
+	argvErr error
+	env     string
+	envErr  error
+	// envFor overrides env/envErr when set, so a test can model `ps`
+	// answering differently depending on which pids it was asked about.
+	envFor   func(pids []int) ([]byte, error)
 	envCalls [][]int
 }
 
@@ -40,6 +43,9 @@ func withFakePS(t *testing.T, f *fakePS) *fakePS {
 	argvSnapshotFunc = func() ([]byte, error) { return []byte(f.argv), f.argvErr }
 	envForPIDsFunc = func(pids []int) ([]byte, error) {
 		f.envCalls = append(f.envCalls, append([]int(nil), pids...))
+		if f.envFor != nil {
+			return f.envFor(pids)
+		}
 		return []byte(f.env), f.envErr
 	}
 	return f
@@ -200,14 +206,55 @@ func TestSimRuntimeProcesses_PropagatesArgvSnapshotFailure(t *testing.T) {
 	}
 }
 
-func TestSimRuntimeProcesses_PropagatesEnvPassFailure(t *testing.T) {
-	withFakePS(t, &fakePS{
-		argv:   argvLine(4318, "/usr/libexec/configd_sim") + "\n",
-		envErr: errors.New("fork: resource temporarily unavailable"),
+// Darwin's `ps` refuses an entire `-p` list if any single pid in it has
+// exited — verified against the real command: `ps -p 1,232,431` prints
+// three lines, `ps -p 1,232,431,999999` prints nothing and exits 1. The
+// candidate list is always slightly stale, so on a busy machine this is the
+// normal case, not an edge one: without the per-pid fallback, one exited
+// process blanks the whole sweep exactly when there is most to collect.
+func TestSimRuntimeProcesses_FallsBackToPerPIDWhenBatchRefused(t *testing.T) {
+	f := withFakePS(t, &fakePS{
+		argv: strings.Join([]string{
+			argvLine(101, "/usr/libexec/backboardd"),
+			argvLine(102, "/usr/libexec/configd_sim"),
+		}, "\n") + "\n",
 	})
+	f.envFor = func(pids []int) ([]byte, error) {
+		if len(pids) > 1 {
+			return nil, errors.New("ps: 102: no such process")
+		}
+		if pids[0] == 102 {
+			return nil, errors.New("ps: 102: no such process")
+		}
+		return []byte(envLine(101, "/usr/libexec/backboardd", udidA) + "\n"), nil
+	}
 
-	if got, err := SimRuntimeProcesses(); err == nil {
-		t.Fatalf("got %+v with nil error, want the env-pass failure surfaced", got)
+	got, err := SimRuntimeProcesses()
+	if err != nil {
+		t.Fatalf("SimRuntimeProcesses: %v", err)
+	}
+	if len(got) != 1 || got[0].PID != 101 || got[0].UDID != udidA {
+		t.Fatalf("got %+v, want the surviving process 101 attributed to %s", got, udidA)
+	}
+}
+
+// A process whose environment cannot be read is attributed to no device, and
+// a process attributed to no device is never killed. Under-reporting leaves
+// an orphan for the next run; over-reporting would kill something.
+func TestSimRuntimeProcesses_SkipsUnreadablePIDsRatherThanFailing(t *testing.T) {
+	f := withFakePS(t, &fakePS{
+		argv: argvLine(4318, "/usr/libexec/configd_sim") + "\n",
+	})
+	f.envFor = func(pids []int) ([]byte, error) {
+		return nil, errors.New("fork: resource temporarily unavailable")
+	}
+
+	got, err := SimRuntimeProcesses()
+	if err != nil {
+		t.Fatalf("SimRuntimeProcesses: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want nothing attributed when identity could not be read", got)
 	}
 }
 
@@ -247,7 +294,7 @@ func TestSimRuntimeProcesses_SeparatesDevices(t *testing.T) {
 // Changing the batch size should require deliberately changing this number
 // too.
 func TestSimRuntimeProcesses_ChunksLargeCandidateLists(t *testing.T) {
-	const wantChunk = 500
+	const wantChunk = 128
 
 	var argv []string
 	for i := 0; i < wantChunk+7; i++ {

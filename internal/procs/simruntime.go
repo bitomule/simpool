@@ -78,10 +78,6 @@ var argvSnapshotFunc = func() ([]byte, error) {
 // explicitly reported it for 40 of 40. A scan built on the bulk form finds
 // essentially nothing and reports a machine full of orphans as clean, which
 // is exactly the way this check would fail silently rather than loudly.
-//
-// Explicit pids also keep the cost at one call: `ps` accepts the whole list
-// in a single `-p`, so the second pass is one more fork, not one per
-// process.
 var envForPIDsFunc = func(pids []int) ([]byte, error) {
 	if len(pids) == 0 {
 		return nil, nil
@@ -92,20 +88,21 @@ var envForPIDsFunc = func(pids []int) ([]byte, error) {
 	}
 	cmd := exec.Command("/bin/ps", "-Ewwo", "pid=,command=", "-p", strings.Join(list, ","))
 	cmd.Env = startTimeEnv
-	// A pid that exited between the two passes makes ps exit non-zero even
-	// though it printed every other pid perfectly well, so output is used
-	// whenever there is any, and the error only matters when there is none.
-	out, err := cmd.Output()
-	if len(out) > 0 {
-		return out, nil
-	}
-	return out, err
+	return cmd.Output()
 }
 
-// pidChunk bounds how many pids go into one `ps -p` invocation, so a machine
-// with pathologically many simulator processes cannot push the argument list
-// past ARG_MAX and turn the whole scan into an error.
-const pidChunk = 500
+// pidChunk bounds how many pids go into one `ps -p` invocation.
+//
+// Kept small on purpose. Darwin's `ps` treats one unknown pid as grounds to
+// refuse the ENTIRE query: measured here, `ps -p 1,232,431` prints three
+// lines, and `ps -p 1,232,431,999999` prints nothing at all and exits 1 —
+// not the three live ones and an error, nothing. The candidate list always
+// comes from an earlier snapshot, so on any busy machine some of those
+// processes have exited by the time this runs, and with one big batch a
+// single such pid would blank the whole pass. Small chunks bound both that
+// blast radius and the per-pid retry that follows one, and they keep the
+// argument list far from ARG_MAX for free.
+const pidChunk = 128
 
 // SimRuntimeProcesses returns every live process belonging to some
 // simulator's simulated OS, tagged with the device UDID it was started for.
@@ -152,10 +149,7 @@ func SimRuntimeProcesses() ([]SimRuntimeProcess, error) {
 		if end > len(needEnv) {
 			end = len(needEnv)
 		}
-		envOut, err := envForPIDsFunc(needEnv[start:end])
-		if err != nil {
-			return nil, err
-		}
+		envOut := envForChunk(needEnv[start:end])
 		for _, line := range strings.Split(string(envOut), "\n") {
 			pid, rest, ok := splitPIDLine(line)
 			if !ok {
@@ -174,6 +168,41 @@ func SimRuntimeProcesses() ([]SimRuntimeProcess, error) {
 		}
 	}
 	return found, nil
+}
+
+// envForChunk resolves one batch of candidate pids, falling back to asking
+// about each pid on its own when the batch is refused.
+//
+// The fallback is not defensive padding, it is the normal path on a busy
+// machine: `ps` rejects a whole `-p` list if any single pid in it has
+// exited, and this list was built from a snapshot taken moments earlier.
+// Retrying individually costs one fork per pid in that chunk — measured at
+// well under a second for 40 — and is only paid when a batch actually
+// fails.
+//
+// Unlike the candidate scan, a failure here is deliberately NOT surfaced as
+// an error. Failing to read a process's environment means it is never
+// attributed to a device, and a process attributed to no device is never
+// killed: this pass can only ever under-report, which leaves orphans alive
+// for the next run rather than putting anything extra at risk. Turning it
+// into a hard error would instead let one exited pid abort the whole sweep
+// on precisely the loaded machine that most needs it.
+func envForChunk(pids []int) []byte {
+	if out, err := envForPIDsFunc(pids); err == nil {
+		return out
+	}
+	var buf []byte
+	for _, p := range pids {
+		out, err := envForPIDsFunc([]int{p})
+		if err != nil {
+			continue
+		}
+		buf = append(buf, out...)
+		if len(out) > 0 && out[len(out)-1] != '\n' {
+			buf = append(buf, '\n')
+		}
+	}
+	return buf
 }
 
 // splitPIDLine parses one `pid <rest>` line of ps output. pid 1 is the

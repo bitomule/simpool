@@ -60,6 +60,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
+	purgeOrphanRuntimes := fs.Bool("purge-orphan-runtimes", false, "kill the still-running processes of simulators that no longer exist. Deleting a booted device does not stop the userland it booted: its launchd_sim tree is reparented to launchd and runs forever (measured here: 452 processes across 19 deleted devices, oldest 18 days, the machine paging itself to a standstill). Every `simpool reap` already REPORTS these; this flag is what kills them. Only ever touches processes whose device is absent from a device listing that succeeded and returned other devices — never one belonging to a live device, and nothing at all if that listing could not be trusted. Respects --dry-run")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -91,6 +92,14 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	if *orphans || *purgeOrphans {
 		reapOrphans(root, *purgeOrphans, *dryRun, stdout, stderr)
 	}
+
+	// Unconditional, unlike --orphans. A deleted device's surviving userland
+	// belongs to no slot and no pool root, so no flag a caller happens to
+	// have passed makes it more or less relevant — and it accumulated
+	// unnoticed for 18 days precisely because nothing ever mentioned it.
+	// Reporting costs one `ps` and prints nothing when there is nothing to
+	// say; killing still requires asking.
+	reapOrphanRuntimes(*purgeOrphanRuntimes, *dryRun, stdout, stderr)
 	return 0
 }
 

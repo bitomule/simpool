@@ -88,7 +88,7 @@ simpool status
     List every slot: lock state, holder (best-effort), lease, device
     boot state.
 
-simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--disown-poisoned] [--dry-run]
+simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -135,6 +135,16 @@ simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--
     process still references each device, and only on this explicit
     request — never automatically, and never as a side effect of an
     ordinary scheduled `reap`.
+
+    --purge-orphan-runtimes kills the still-running processes of
+    simulators that no longer exist. Deleting a device does not reliably
+    stop the userland it booted: if the device loses its parent first
+    (CoreSimulator crashing, a force-kill, a delete racing a boot), its
+    entire launchd_sim tree — ~25 processes per device — is reparented to
+    launchd and keeps running forever, and nothing on the machine ever
+    collects it. Every `reap` REPORTS these without being asked, and
+    `doctor` warns about them; this flag is what actually kills them. See
+    "Orphaned simulator userlands" below.
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
@@ -740,6 +750,69 @@ to act on.
 
 Respects `--dry-run` for both branches (reports what it would do — forget,
 or forget-and-kill — without touching anything).
+
+### Orphaned simulator userlands
+
+A simulator is not a VM. Everything "inside" it — SpringBoard, backboardd,
+configd_sim, the app under test, ~25 processes per booted device — is an
+ordinary host process, parented to a per-device `launchd_sim`.
+
+Shutting a device down cleanly tears that tree down with it. Losing the
+parent first does not: if CoreSimulator crashes, something force-kills
+`launchd_sim`, or a delete races a boot, every process in the tree is
+reparented to launchd and keeps running with no device behind it. Nothing
+on the machine ever collects them — not CoreSimulator, not Xcode, not a
+reboot-free cleanup of any kind.
+
+Measured on the development machine that prompted this: **452 such
+processes across 19 deleted devices, the oldest 18 days old**. 1774 host
+processes in total, 15.3 GB of swap in use, free memory at 19%, and the
+machine paging itself to a standstill — while `simctl list devices` showed
+four booted simulators and looked entirely healthy. Every one of the 19
+devices was already gone.
+
+Every `simpool reap` now reports these, and `simpool doctor` warns about
+them, without being asked for either — this accumulated unnoticed for 18
+days precisely because nothing ever mentioned it. Killing still requires
+`--purge-orphan-runtimes`.
+
+What makes killing them safe is narrow and worth stating exactly:
+
+- A process is a candidate only if it is executing from inside a runtime's
+  `RuntimeRoot`. That excludes host-side CoreSimulator infrastructure
+  (`SimRenderServer`, `CoreSimulatorBridge`, `simdiskimaged`), and it
+  excludes the dangerous false positive: an ordinary process that merely
+  *mentions* a UDID — `simctl spawn <udid> log stream`, a mav run, a shell
+  whose title carries the path — which is someone's live work.
+- Its device identity comes from `XPC_SIMULATOR_LAUNCHD_NAME`, the tag
+  CoreSimulator itself stamps on every process it starts inside a device.
+  The command line cannot supply this: every device on one iOS version
+  executes byte-identical paths, so path matching cannot tell one device's
+  backboardd from another's.
+- It is swept only if that UDID is **absent** from a device listing that
+  both succeeded and returned other devices. An empty listing is not proof
+  that everything was deleted, it is proof the listing could not be
+  trusted — the same rule the poison checks apply. A live device is by
+  definition present in a listing that just worked, so its userland can
+  never be reached.
+
+Reading that identity needs care that is easy to get wrong: on Darwin `-E`
+and `-A` do not compose. A bulk `ps -Aewwo` silently drops the environment
+and prints argv alone — measured here, it reported the device tag for 1
+process out of 804, while querying the same pids explicitly reported it for
+40 of 40. So the scan runs in two passes: one full listing to find
+candidates by path, then one batched `ps -E -p <list>` over just those pids.
+A scan built on the bulk form finds nothing and calls a machine full of
+orphans clean, which is the failure mode that hides rather than shouts;
+`TestSimRuntimeProcesses_Live` exists to catch exactly that, because no
+amount of mocked `ps` output can.
+
+`launchd_sim` is handled from its command line alone (it names the device's
+data directory, and its argv[0] is a bare name outside any RuntimeRoot), so
+the tree's leader is never missed even if the second pass fails. Within a
+device, pids are signalled in ascending order: `launchd_sim` necessarily
+holds a lower pid than anything it started, and it is the only member still
+able to spawn more.
 
 ## Testing
 

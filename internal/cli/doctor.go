@@ -192,6 +192,23 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Reported, but deliberately not folded into `problems`: the exit code
+	// documents pool coherence, and a deleted device's surviving userland
+	// belongs to no slot and no pool root — it is machine-wide debris that
+	// says nothing about whether this pool is consistent. Failing on it
+	// would make `doctor` start returning non-zero for something no caller
+	// of it is asking about, which is how a useful signal gets suppressed
+	// with `|| true`.
+	if orphaned, ok := findOrphanedRuntimes(stderr); ok {
+		total := 0
+		for _, g := range orphaned {
+			total += len(g.PIDs)
+		}
+		if total > 0 {
+			fmt.Fprintf(stdout, "WARN %d process(es) from %d deleted simulator(s) are still running — they belong to no device any more and nothing else will ever collect them; run `simpool reap --purge-orphan-runtimes` to kill them\n", total, len(orphaned))
+		}
+	}
+
 	if len(problems) == 0 {
 		fmt.Fprintln(stdout, "OK   pool is coherent:", root)
 		return 0

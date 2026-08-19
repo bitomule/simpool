@@ -807,6 +807,12 @@ orphans clean, which is the failure mode that hides rather than shouts;
 `TestSimRuntimeProcesses_Live` exists to catch exactly that, because no
 amount of mocked `ps` output can.
 
+Nothing runs `reap` on its own — `with` deliberately does not shut simulators
+down on exit — so on a machine with no schedule for it, the only cleanup that
+ever happens is whatever someone types by hand. That is the other half of how
+452 orphans reached 18 days old. `contrib/com.simpool.reap.plist` is a
+ready-to-load launchd agent for it.
+
 `launchd_sim` is handled from its command line alone (it names the device's
 data directory, and its argv[0] is a bare name outside any RuntimeRoot), so
 the tree's leader is never missed even if the second pass fails. Within a

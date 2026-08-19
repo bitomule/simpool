@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Periodic `simpool reap`. Copy to ~/Library/LaunchAgents/ and load it:
+
+      cp contrib/com.simpool.reap.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.simpool.reap.plist
+
+  Why this exists: nothing runs `simpool reap` on its own. `with` deliberately
+  does not shut simulators down on exit (see "Architecture" in the README), so
+  without a schedule the only cleanup that ever happens is whatever a human
+  types. On the machine this was written for, that meant 452 processes from 19
+  deleted simulators surviving 18 days, 15.3 GB of swap in use, and the Mac
+  paging itself to a standstill while `simctl` looked healthy.
+
+  The flags below are one policy, not the only one:
+
+    --purge-orphan-runtimes  kill the userland of devices that no longer
+                             exist — only ever processes whose device is
+                             absent from a device listing that succeeded and
+                             returned other devices.
+    --cold 60                shut down free simulators idle for over an hour.
+                             Drop this if you would rather keep every slot
+                             warm and pay the memory.
+    --warm 2                 keep two booted per device+OS group, so the next
+                             acquisition does not pay a cold boot.
+
+  Deliberately NOT here: --purge (deletes simulators outright) and
+  --purge-orphans (deletes orphaned devices). Both are destructive to devices
+  rather than to dead processes, and neither should run unattended.
+
+  Adjust the simpool path if you did not install via Homebrew: launchd jobs
+  inherit PATH=/usr/bin:/bin:/usr/sbin:/sbin, so it must be absolute.
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.simpool.reap</string>
+  <key>ProgramArguments</key><array>
+    <string>/opt/homebrew/bin/simpool</string>
+    <string>reap</string>
+    <string>--purge-orphan-runtimes</string>
+    <string>--cold</string><string>60</string>
+    <string>--warm</string><string>2</string>
+  </array>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>/tmp/simpool-reap.log</string>
+  <key>StandardErrorPath</key><string>/tmp/simpool-reap.log</string>
+</dict></plist>

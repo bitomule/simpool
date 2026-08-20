@@ -866,8 +866,31 @@ amount of mocked `ps` output can.
 Nothing runs `reap` on its own — `with` deliberately does not shut simulators
 down on exit — so on a machine with no schedule for it, the only cleanup that
 ever happens is whatever someone types by hand. That is the other half of how
-452 orphans reached 18 days old. `contrib/com.simpool.reap.plist` is a
-ready-to-load launchd agent for it.
+452 orphans reached 18 days old, and of how seven pool simulators were later
+found still booted with no holder, four of them idle for 25 to 46 hours, on a
+machine with 24 GB of swap in use against 18 GB of RAM.
+
+Schedule it:
+
+```bash
+brew services start simpool
+```
+
+That installs a launchd agent running, every 30 minutes:
+
+```
+simpool reap --purge-orphan-runtimes --cold 60 --warm 2
+```
+
+— collect dead devices' userlands, shut down free simulators idle over an
+hour, keep two warm per group. Logs to `/tmp/simpool-reap.log`. Stop it with
+`brew services stop simpool`.
+
+It is a service you start rather than something installing simpool sets up on
+its own: putting something on a machine that runs on login is the user's call
+to make explicitly, not a side effect of `brew install`. For a non-Homebrew
+install, or to run it with different flags, `contrib/com.simpool.reap.plist`
+is the same agent as a plain plist to copy into `~/Library/LaunchAgents`.
 
 `launchd_sim` is handled from its command line alone (it names the device's
 data directory, and its argv[0] is a bare name outside any RuntimeRoot), so

@@ -593,8 +593,19 @@ disposable infrastructure, not the consumer itself. The caller (`mav`,
 `axe`, a human running `idb`) is what's doing the work; `idb` respawns the
 companion transparently the moment anything needs to talk to that device
 again, so killing an orphaned one costs nothing but a respawn.
-`pool.CheckPoison` now recognizes this as its own reason,
-`PoisonedByOrphanedCompanions`, but only when **both** hold:
+A companion cannot be told apart from a live one by looking at the process
+itself, and simpool deliberately does not try. `idb` spawns it from the
+short-lived `idb` client under `preexec_fn=os.setpgrp` and records it in
+`/tmp/idb/state` for later reuse (read straight out of `idb`'s own
+`companion_spawner.py`), so **every** companion — busy or abandoned — is
+reparented to `launchd` within seconds of being spawned, keeps its socket
+open, and looks identical from the outside. PPID, age and socket ownership
+are all worthless as evidence here. What *can* be trusted is the state of
+the slot it is attached to.
+
+`pool.CheckPoison` recognizes this as its own reason,
+`PoisonedByOrphanedCompanions`, when condition 1 below holds together with
+**either** form of evidence in condition 2:
 
 1. Every live PID matching the UDID is independently verified
    (`procs.IsIdbCompanionFor`) to be an `idb_companion` binary (not merely
@@ -608,7 +619,12 @@ again, so killing an orphaned one costs nothing but a respawn.
    this whole mechanism is scoped to). One non-companion PID mixed in falls
    the whole set back to ordinary `PoisonedByLiveConsumers` — never
    reclaimed.
-2. The device the companion is pinned to is independently confirmed, by an
+2. There is independent evidence that nothing can be *using* those
+   companions. Two forms count, each conclusive on its own
+   (`pool.CompanionEvidence`):
+
+   **(a) `CompanionTargetNotRunning`** — the device the companion is pinned
+   to is independently confirmed not currently running. Confirmed by an
    **allowlist**, to be genuinely `Shutdown` — never a denylist
    (`!= "Booted"`): `"Booting"`, `"Shutting Down"`, `"Creating"`, an
    unrecognized future state, or `""` (what a JSON response omitting the
@@ -621,30 +637,62 @@ again, so killing an orphaned one costs nothing but a respawn.
    **zero** devices (a degraded or mid-restart CoreSimulator can do this
    even though every device, the user's own included, still genuinely
    exists) is read the same as an outright listing failure, never as proof
-   of deletion. A companion attached to a genuinely Booted (or
-   transitional, or unreadable-listing) device is left exactly where
+   of deletion.
+
+   **(b) `CompanionSlotLongIdle`** — the device IS running, but the slot it
+   belongs to is provably unheld and has not been touched for at least
+   `pool.CompanionIdleGrace` (30 minutes). This is the case a *warm* pool
+   actually hits, and the one (a) structurally cannot cover: simpool's
+   whole purpose is keeping slot devices `Booted` between consumers, so
+   "confirmed not running" is never true for a healthy pool slot. Before
+   this existed, an orphaned companion on a warm slot poisoned it
+   permanently — reported by `doctor`, skipped by `reap`, and rejected by
+   `--disown-poisoned` alike; measured in production as *seven of seven*
+   slots wedged for over a day with no path out.
+
+   "Provably unheld" is not an assumption. Every caller that can act on a
+   poison verdict (`take`, `claimSlotForLease`, `reapSlot`) holds the
+   slot's own flock across the call **and** has already established there
+   is no live lease on it — the documented precondition of
+   `AttemptRecovery`. No `with`, `acquire` or `lease` consumer can be
+   holding a slot in that state. The 30-minute grace covers the one
+   consumer that legitimately does not hold the flock and may have let its
+   lease lapse: a MAV hot loop mid-session, quiet inside a long `mav run`
+   build. `Meta.LastUsed` advances on every single hot-loop call, so a slot
+   untouched for half an hour is a session that has stopped renewing
+   anything simpool can see. A zero `LastUsed` is an *inability to check*,
+   never "infinitely idle" — such a slot stays quarantined.
+
+   A companion whose device is transitional or whose listing is unreadable,
+   on a slot used within the grace, is left exactly where
    `PoisonedByLiveConsumers` leaves it — untouched.
 3. The device's identity as **this exact slot's own** — not just *some*
-   Shutdown device the stale `meta.json` UDID happens to still name — is
+   device the stale `meta.json` UDID happens to still name — is
    independently confirmed the same way every other destructive action in
    this codebase is (`pool.deviceBelongsToSlot`, see below): by exact name
    match derived from the slot's own directory, never trusted from
    `meta.json` alone. This is the guard that stops a companion pinned to
    one of a developer's own, entirely unrelated (not even pool-prefixed)
-   simulators — Shutdown, but not this slot's — from ever being killed on
-   the strength of a stale UDID.
+   simulators — Shutdown *or running*, but not this slot's — from ever
+   being killed on the strength of a stale UDID. It is what carries the
+   safety of evidence (b), where the device's own state proves nothing.
 
-Recovery (`pool.AttemptRecovery`) re-verifies both the device-offline and
-per-PID companion-identity conditions immediately before acting — not
-trusted from `CheckPoison`'s earlier determination — then kills exactly the
+Recovery (`pool.AttemptRecovery`) re-runs the whole determination from
+scratch immediately before acting — including a fresh read of the **live
+consumer set**, not merely a re-check of the PIDs it was handed: the thing
+most worth catching in the window between `CheckPoison` and the kill is not
+a companion that changed identity but a *non-companion* that appeared, the
+`idb` client process of a hot-loop call that just arrived. Any difference
+at all from the recorded set refuses the whole attempt. It then kills exactly the
 verified companion PIDs — individually, never as a process group
 `idb_companion` didn't ask simpool to create, and every PID in the set gets
 a kill attempt regardless of whether an earlier one reported an error — and
 re-verifies each is actually dead before declaring success; a signal that
 doesn't stick leaves the slot quarantined exactly like an unverifiable
-`ConsumerPGID` recovery does. The device itself is never touched: its state
-was already confirmed Shutdown before recovery was ever attempted, so there
-is nothing to shut down, and no `meta.json` field ever records a
+`ConsumerPGID` recovery does. The device itself is never touched, under
+either form of evidence: under (a) there is nothing left to shut down,
+under (b) the device is a warm slot's own simulator that the next consumer
+wants exactly as it is. No `meta.json` field ever records a
 companion's pid in the first place (`idb` spawns it completely outside
 simpool's own bookkeeping), so nothing needs clearing there either.
 
@@ -654,16 +702,24 @@ ones, because companion residue has nothing to do with which subcommand
 held the slot, only with what `idb` itself left behind. It runs
 automatically wherever `AttemptRecovery` already runs (every acquisition —
 `with`, `acquire`, `lease` — and `simpool reap`) **only when condition 3
-above (device identity) can be positively confirmed** — the ordinary
-Shutdown-and-still-existing case. The deleted-device case can *never*
-satisfy that guard automatically (there is no device left to name-check by
-construction), so — unlike an earlier version of this feature — it is not
-treated as "provably safe" and left ungated; it is deliberately made
-unreachable by the automatic path and routed to the same explicit,
+above (device identity) can be positively confirmed** — i.e. whenever the
+device still exists, whether Shutdown or Booted. The deleted-device case
+can *never* satisfy that guard automatically (there is no device left to
+name-check by construction), so — unlike an earlier version of this feature
+— it is not treated as "provably safe" and left ungated; it is deliberately
+made unreachable by the automatic path and routed to the same explicit,
 operator-opt-in `--disown-poisoned` escape hatch described below, which
 DOES kill the already narrowly-verified companion (unlike its
 `ConsumerPGID` role, which never signals anything — see that section for
 why the two differ).
+
+`--disown-poisoned` accepts **only** evidence (a). It skips the
+device-identity guard on purpose, which leaves the device's own
+confirmed-not-running state as the last thing keeping it off a simulator a
+stale `meta.json` merely names — so a companion attached to a *running*
+device is out of its reach entirely (`pool.Poison.CompanionDisownable`).
+That case needs no escape hatch anyway: it is exactly what the automatic
+path now handles, with the identity guard intact.
 
 **Every shutdown or delete validates device identity from the slot's own
 directory, never from `meta.json`.** `pool.deviceBelongsToSlot` computes

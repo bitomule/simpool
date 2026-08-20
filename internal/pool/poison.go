@@ -43,20 +43,89 @@ const (
 	// PoisonedByOrphanedCompanions means every PID procs.LiveConsumers
 	// found is independently verified (procs.IsIdbCompanionFor) to be an
 	// idb_companion daemon pinned, via its own --udid flag, to THIS slot's
-	// device — and that device is independently confirmed not currently
-	// running (simctl reports it Shutdown, or it no longer exists in the
-	// device set at all: the real production incident this exists to fix
-	// was a companion still holding the UDID of a simulator deleted nine
-	// days earlier). Unlike PoisonedByLiveConsumers, this reason IS a kill
-	// candidate for AttemptRecovery, regardless of Meta.Mode: idb_companion
-	// is disposable infrastructure `idb` respawns on demand, never "the
-	// consumer" itself, and it cannot be doing useful work against a
-	// device that is provably not running. A single non-companion PID, or
-	// a companion whose target is still Booted (or whose state could not
-	// be determined), falls back to PoisonedByLiveConsumers instead — see
+	// device — and there is independent evidence that none of them can be
+	// serving live work (see CompanionEvidence for the two forms that
+	// evidence takes). Unlike PoisonedByLiveConsumers, this reason IS a
+	// kill candidate for AttemptRecovery, regardless of Meta.Mode:
+	// idb_companion is disposable infrastructure `idb` respawns on demand,
+	// never "the consumer" itself. A single non-companion PID mixed in —
+	// the `idb` client process itself, an `axe` run, a stray
+	// `simctl spawn <udid>` — means this slot is not narrowly explained by
+	// companion residue alone and falls back to PoisonedByLiveConsumers
+	// instead; so does a companion set with no evidence behind it. See
 	// CheckPoison.
 	PoisonedByOrphanedCompanions
 )
+
+// CompanionEvidence names WHY a set of verified idb_companion daemons was
+// judged reclaimable residue rather than infrastructure something is
+// actively using. The distinction is load-bearing, not cosmetic: only
+// CompanionTargetNotRunning is ever eligible for the operator-driven
+// `--disown-poisoned` path, which deliberately skips the
+// deviceBelongsToSlot identity guard (see DisownPoisonedSlot) and therefore
+// has nothing left but the device's own state to keep it off a simulator
+// that was never this slot's.
+type CompanionEvidence int
+
+const (
+	// NoCompanionEvidence: no grounds to treat companions as residue.
+	NoCompanionEvidence CompanionEvidence = iota
+	// CompanionTargetNotRunning means the companion's target device is
+	// independently confirmed not currently running — simctl reports it
+	// Shutdown, or it no longer exists in a populated device set at all
+	// (the original production incident: a companion still holding the
+	// UDID of a simulator deleted nine days earlier). Nothing can be
+	// talking to a device that is not running, so the companion is inert
+	// by construction.
+	CompanionTargetNotRunning
+	// CompanionSlotLongIdle means the target device IS running, but the
+	// slot it belongs to is provably unheld and has been untouched for at
+	// least CompanionIdleGrace.
+	//
+	// This is the case a warm pool actually hits, and the one the
+	// device-state evidence above structurally cannot cover: simpool's
+	// whole purpose is to keep slot devices Booted between consumers, so
+	// "confirmed not running" is never true for a healthy pool slot, and
+	// before this existed every orphaned companion on a warm slot poisoned
+	// it permanently — reported by `doctor`, skipped by `reap`, and
+	// rejected by `--disown-poisoned` alike.
+	//
+	// "Provably unheld" is not an assumption: every caller that can act on
+	// a Poison (take, claimSlotForLease, reapSlot) holds this slot's own
+	// flock across the call AND has already established there is no live
+	// lease on it — that is the documented precondition of AttemptRecovery
+	// and DisownPoisonedSlot. No `with`, `acquire` or `lease` consumer can
+	// be holding a slot in that state. CompanionIdleGrace then covers the
+	// one consumer that legitimately does not hold the flock and may have
+	// let its lease lapse: an active MAV hot loop mid-session. See that
+	// constant.
+	CompanionSlotLongIdle
+)
+
+// CompanionIdleGrace is how long a slot whose device is still running must
+// have gone untouched — Meta.LastUsed, stamped by EnsureProvisioned on
+// every acquisition AND every lease renewal, so it advances on every single
+// `mav tap`/`mav swipe` in a hot loop — before a live idb_companion
+// attached to it may be treated as residue rather than as infrastructure
+// for a session in progress.
+//
+// Deliberately an order of magnitude above DefaultLeaseTTL (3m) rather than
+// equal to it. A lapsed lease alone already makes a slot available to a new
+// consumer by design, but a companion is the last trace of a MAV session
+// that might merely be quiet — stuck in a long `mav run` build between two
+// calls — and the cost of guessing wrong is reclaiming a slot out from
+// under running work. Half an hour of MAV silence is a session that has
+// stopped renewing anything simpool can see; the real orphans this exists
+// to reclaim sit at hours-to-days of idleness, so nothing is lost by
+// waiting well past any plausible inter-call gap.
+//
+// A zero Meta.LastUsed is NOT treated as "infinitely idle": it means the
+// slot's own bookkeeping never recorded a last use, which is an inability
+// to check, and this codebase's rule for that is uniform — never read a
+// check that could not complete as "confirmed free" (see
+// PoisonedByCheckFailure). Such a slot stays quarantined exactly as it
+// does today.
+const CompanionIdleGrace = 30 * time.Minute
 
 // Poison is the result of CheckPoison: whether a free-looking slot's
 // previous consumer is still alive (or unverifiable), and why.
@@ -68,8 +137,24 @@ type Poison struct {
 	Err error
 	// CompanionPIDs is set only when Reason == PoisonedByOrphanedCompanions:
 	// every live PID CheckPoison verified is an idb_companion daemon
-	// pinned to a target confirmed not currently running.
+	// pinned to this slot's device.
 	CompanionPIDs []int
+	// CompanionEvidence is set only when Reason ==
+	// PoisonedByOrphanedCompanions: why those PIDs were judged residue.
+	CompanionEvidence CompanionEvidence
+}
+
+// CompanionDisownable reports whether this poison is one `--disown-poisoned`
+// may act on via its companion branch. Only CompanionTargetNotRunning
+// qualifies: that path deliberately skips the deviceBelongsToSlot identity
+// guard, leaving the device's own confirmed-not-running state as the only
+// thing standing between it and a simulator a stale meta.UDID happens to
+// name — a developer's own, say — so a companion attached to a device that
+// IS running must never be reachable through it. The running-device case
+// needs no escape hatch anyway: it is exactly the case AttemptRecovery now
+// handles automatically (see CompanionSlotLongIdle).
+func (p Poison) CompanionDisownable() bool {
+	return p.Reason == PoisonedByOrphanedCompanions && p.CompanionEvidence == CompanionTargetNotRunning
 }
 
 // Poisoned reports whether the slot should be treated as unavailable for
@@ -85,7 +170,10 @@ func (p Poison) String() string {
 	case PoisonedByCheckFailure:
 		return fmt.Sprintf("could not verify liveness: %v", p.Err)
 	case PoisonedByOrphanedCompanions:
-		return fmt.Sprintf("orphaned idb_companion daemon(s) attached to a non-running device (pids %v)", p.CompanionPIDs)
+		if p.CompanionEvidence == CompanionTargetNotRunning {
+			return fmt.Sprintf("orphaned idb_companion daemon(s) attached to a non-running device (pids %v)", p.CompanionPIDs)
+		}
+		return fmt.Sprintf("orphaned idb_companion daemon(s) left on a slot with no holder and no use in over %s (pids %v)", CompanionIdleGrace, p.CompanionPIDs)
 	default:
 		return "not poisoned"
 	}
@@ -119,8 +207,8 @@ func CheckPoison(meta Meta) Poison {
 	if len(live) == 0 {
 		return Poison{}
 	}
-	if companions, ok := allOrphanedIdbCompanions(meta.UDID, live); ok {
-		return Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: companions}
+	if companions, evidence, ok := allOrphanedIdbCompanions(meta, live); ok {
+		return Poison{Reason: PoisonedByOrphanedCompanions, CompanionPIDs: companions, CompanionEvidence: evidence}
 	}
 	return Poison{Reason: PoisonedByLiveConsumers}
 }
@@ -184,28 +272,53 @@ func companionDeviceOffline(udid string) (offline, ok bool) {
 	return true, true
 }
 
+// companionSlotLongIdle reports whether meta describes a slot simpool
+// itself has not touched for at least CompanionIdleGrace — the second,
+// independent form of evidence that a live companion attached to it is
+// residue rather than infrastructure for a session in progress. See
+// CompanionSlotLongIdle and CompanionIdleGrace for why a zero LastUsed
+// deliberately fails this rather than reading as "infinitely idle".
+func companionSlotLongIdle(meta Meta) bool {
+	if meta.LastUsed.IsZero() {
+		return false
+	}
+	return time.Since(meta.LastUsed) >= CompanionIdleGrace
+}
+
 // allOrphanedIdbCompanions reports whether every pid in live is verified
-// (procs.IsIdbCompanionFor) to be an idb_companion daemon pinned to udid,
-// AND udid's own device is independently confirmed not currently running
-// (companionDeviceOffline). Both conditions are checked — a companion
-// attached to a genuinely Booted device is doing legitimate work (or at
-// least might be) and must never be reclaimed, and a single non-companion
-// PID mixed in with real companions means this slot is not narrowly
-// explained by companion residue alone, so the whole set falls back to the
-// ordinary, never-a-kill-candidate PoisonedByLiveConsumers reason. The
-// device state is checked first: if it can't be shown offline, there is no
-// need to even look at what the live PIDs are.
-func allOrphanedIdbCompanions(udid string, live []int) ([]int, bool) {
-	offline, ok := companionDeviceOffline(udid)
-	if !ok || !offline {
-		return nil, false
+// (procs.IsIdbCompanionFor) to be an idb_companion daemon pinned to
+// meta.UDID, AND there is independent evidence that none of them can be
+// serving live work — either the device itself is confirmed not running
+// (companionDeviceOffline) or the slot has gone untouched for at least
+// CompanionIdleGrace (companionSlotLongIdle). Both forms are conclusive on
+// their own and neither is required alongside the other; see
+// CompanionEvidence.
+//
+// A single non-companion PID mixed in with real companions means this slot
+// is not narrowly explained by companion residue alone — the `idb` client
+// process itself carries the UDID in its own argv, as does `axe`, a human's
+// `simctl`, or the stray `simctl spawn <udid>` measured alongside these
+// orphans in production — so the whole set falls back to the ordinary,
+// never-a-kill-candidate PoisonedByLiveConsumers reason. That check runs
+// first now, ahead of the device lookup: it is the cheap one, and it is
+// also the one that most often rules the whole branch out, so there is no
+// reason to pay for a `simctl list devices` before it.
+func allOrphanedIdbCompanions(meta Meta, live []int) ([]int, CompanionEvidence, bool) {
+	if len(live) == 0 {
+		return nil, NoCompanionEvidence, false
 	}
 	for _, pid := range live {
-		if !procs.IsIdbCompanionFor(pid, udid) {
-			return nil, false
+		if !procs.IsIdbCompanionFor(pid, meta.UDID) {
+			return nil, NoCompanionEvidence, false
 		}
 	}
-	return live, true
+	if offline, ok := companionDeviceOffline(meta.UDID); ok && offline {
+		return live, CompanionTargetNotRunning, true
+	}
+	if companionSlotLongIdle(meta) {
+		return live, CompanionSlotLongIdle, true
+	}
+	return nil, NoCompanionEvidence, false
 }
 
 // VerifyConsumerIdentity checks meta's recorded consumer fingerprint
@@ -440,27 +553,36 @@ func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 // Gated on deviceBelongsToSlot, exactly like the ConsumerPGID branch's own
 // Shutdown call above, and for the identical reason: meta.UDID is advisory
 // and can be stale or corrupt, and CheckPoison's own verification (a
-// companion pinned to udid via its own --udid flag, attached to a udid
-// confirmed not currently running) proves the COMPANION's identity, never
-// that udid is actually THIS SLOT's own device rather than some other real
-// simulator — including one of a developer's own, entirely unrelated to the
-// pool — that a stale meta.UDID happens to name. deviceBelongsToSlot can
-// only ever succeed when udid's device still exists and is name-matched
-// against THIS slot's own directory (root, groupName, n) — which is exactly
-// the Shutdown case, not the deleted-device one: a deleted device can never
-// be found at all, so this guard can never be satisfied for it. That is
-// deliberate, not a bug to route around — see DisownPoisonedSlot's
-// PoisonedByOrphanedCompanions branch for the explicit, operator-opt-in path
-// that exists specifically to cover the deleted-device case, which this
-// function refuses outright.
+// companion pinned to udid via its own --udid flag, plus evidence that
+// nothing can be using it) proves the COMPANION's identity, never that udid
+// is actually THIS SLOT's own device rather than some other real simulator
+// — including one of a developer's own, entirely unrelated to the pool —
+// that a stale meta.UDID happens to name. This guard is what keeps a
+// long-idle slot pointing (wrongly) at someone else's booted
+// simulator from getting that simulator's companion killed under
+// CompanionSlotLongIdle.
 //
-// Also re-verifies both of CheckPoison's own conditions immediately before
-// killing anything, not from any earlier determination — the same "re-verify
-// right before acting" rule reap --orphans applies to its own device scan
-// (see reapOrphans' doc comment): CheckPoison's determination and this call
-// are not the same instant, so confirm the device is still not running and
-// every PID is still a genuine companion for udid right up to the moment of
-// the kill.
+// deviceBelongsToSlot can only ever succeed when udid's device still exists
+// and is name-matched against THIS slot's own directory (root, groupName,
+// n) — so it covers the Shutdown and still-running cases but never the
+// deleted-device one: a deleted device can never be found at all, so this
+// guard can never be satisfied for it. That is deliberate, not a bug to
+// route around — see DisownPoisonedSlot's PoisonedByOrphanedCompanions
+// branch for the explicit, operator-opt-in path that exists specifically to
+// cover the deleted-device case, which this function refuses outright.
+//
+// Also re-runs CheckPoison's whole companion determination from scratch
+// immediately before killing anything, not from any earlier result — the
+// same "re-verify right before acting" rule reap --orphans applies to its
+// own device scan (see reapOrphans' doc comment). It deliberately re-reads
+// the LIVE CONSUMER SET rather than just re-checking the recorded PIDs:
+// CheckPoison's determination and this call are seconds apart in `reap`,
+// and the thing most worth catching in that window is not a companion that
+// changed identity but a NON-companion that appeared — the `idb` client
+// process of a hot-loop call that arrived just now, carrying the UDID in
+// its own argv. Any difference at all from the recorded set, in either
+// direction, refuses the whole attempt and leaves the next pass to
+// re-evaluate from a coherent snapshot.
 //
 // Every PID gets a kill attempt regardless of whether an earlier one in the
 // loop failed — an early return partway through would leave some PIDs
@@ -470,10 +592,10 @@ func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 // records an idb_companion's pid — `idb` spawns it completely outside
 // simpool's own bookkeeping — so there is nothing to clear or persist here
 // on success: the slot is simply safe to hand out again once every kill is
-// verified to have actually stuck. The device itself is never touched: its
-// state was already independently confirmed not Shutdown-eligible before
-// this was ever called (companionDeviceOffline), so there is nothing to
-// shut down.
+// verified to have actually stuck. The device itself is never touched, in
+// either evidence case — for CompanionTargetNotRunning there is nothing
+// left to shut down, and for CompanionSlotLongIdle the device is a warm
+// pool slot's own simulator that the next consumer wants exactly as it is.
 func reclaimOrphanedCompanions(root, groupName string, n int, meta *Meta, poison Poison) bool {
 	if len(poison.CompanionPIDs) == 0 {
 		return false
@@ -481,19 +603,20 @@ func reclaimOrphanedCompanions(root, groupName string, n int, meta *Meta, poison
 	if meta.UDID == "" || !deviceBelongsToSlot(root, meta.UDID, groupName, n) {
 		return false
 	}
-	if offline, ok := companionDeviceOffline(meta.UDID); !ok || !offline {
-		// Re-verified and no longer holds — the device came back (or its
-		// state became unreadable) in the window between CheckPoison and
-		// this call. Never act on a stale determination.
+	live, err := procs.LiveConsumers(meta.UDID)
+	if err != nil {
+		// The re-verification itself could not complete — never read that
+		// as "still safe to kill", the same rule PoisonedByCheckFailure
+		// applies one layer up.
 		return false
 	}
-	for _, pid := range poison.CompanionPIDs {
-		if !procs.IsIdbCompanionFor(pid, meta.UDID) {
-			// Re-verified and no longer holds for this exact pid — refuse
-			// the whole set rather than guess which of CheckPoison's
-			// original PIDs are still trustworthy.
-			return false
-		}
+	companions, evidence, ok := allOrphanedIdbCompanions(*meta, live)
+	if !ok || evidence != poison.CompanionEvidence || !samePIDSet(companions, poison.CompanionPIDs) {
+		// Re-verified and no longer holds: the device came back (or its
+		// state became unreadable), the slot was used again, a
+		// non-companion consumer appeared, or the PID set moved under us.
+		// Never act on a stale determination.
+		return false
 	}
 	for _, pid := range poison.CompanionPIDs {
 		_ = companionKill(pid, syscall.SIGKILL)
@@ -508,7 +631,32 @@ func reclaimOrphanedCompanions(root, groupName string, n int, meta *Meta, poison
 			return false
 		}
 	}
-	fmt.Fprintf(os.Stderr, "simpool: reclaimed %d orphaned idb_companion daemon(s) attached to device %s (pids %v) — device confirmed not running and confirmed this slot's own\n", len(poison.CompanionPIDs), meta.UDID, poison.CompanionPIDs)
+	why := "device confirmed not running"
+	if poison.CompanionEvidence == CompanionSlotLongIdle {
+		why = fmt.Sprintf("slot unheld and unused for over %s", CompanionIdleGrace)
+	}
+	fmt.Fprintf(os.Stderr, "simpool: reclaimed %d orphaned idb_companion daemon(s) attached to device %s (pids %v) — %s, and device confirmed this slot's own\n", len(poison.CompanionPIDs), meta.UDID, poison.CompanionPIDs, why)
+	return true
+}
+
+// samePIDSet reports whether a and b hold exactly the same PIDs, order
+// independent. Used by reclaimOrphanedCompanions to insist its re-verified
+// live set is byte-for-byte the determination it was handed, rather than
+// silently acting on whichever PIDs happen to be there now.
+func samePIDSet(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[int]int, len(a))
+	for _, p := range a {
+		seen[p]++
+	}
+	for _, p := range b {
+		seen[p]--
+		if seen[p] < 0 {
+			return false
+		}
+	}
 	return true
 }
 
@@ -652,6 +800,17 @@ func DisownPoisonedSlot(root, dir string, n int, groupName string, meta *Meta, p
 // actually asked it to touch.
 func disownOrphanedCompanions(dir string, meta *Meta, poison Poison) error {
 	if len(poison.CompanionPIDs) == 0 || meta.UDID == "" {
+		return ErrNotDisownable
+	}
+	if !poison.CompanionDisownable() {
+		// CompanionSlotLongIdle is deliberately out of reach here: this
+		// function skips the deviceBelongsToSlot identity guard on purpose
+		// (see the doc comment), which leaves the device's own
+		// confirmed-not-running state as the ONLY thing keeping it off a
+		// simulator a stale meta.UDID happens to name. A still-running
+		// device removes that last guard entirely — and needs no escape
+		// hatch anyway, since AttemptRecovery handles it automatically
+		// with the identity guard intact. See Poison.CompanionDisownable.
 		return ErrNotDisownable
 	}
 	if offline, ok := companionDeviceOffline(meta.UDID); !ok || !offline {

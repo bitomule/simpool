@@ -59,6 +59,32 @@ Bazel, below) looks for the Homebrew install path first
 (`/opt/homebrew/bin/simpool` or `/usr/local/bin/simpool`), so that's the
 path of least resistance for CI/agent machines too.
 
+Then start the cleanup service — installing the binary alone leaves the
+pool with no maintenance at all:
+
+```
+brew services start simpool
+```
+
+Every 30 minutes it runs `reap --purge-orphan-runtimes --cold 60 --warm 2`:
+shut down free simulators idle over an hour, keep two warm per group, and
+collect the processes of simulators that no longer exist. Logs to
+`/tmp/simpool-reap.log`; stop with `brew services stop simpool`.
+
+This is not optional housekeeping. `with` deliberately does not shut
+simulators down on exit (see Architecture), so with nothing scheduled the
+only cleanup that ever happens is whatever someone types. On the machine
+this was developed against, that meant seven pool simulators still booted
+with no holder — four of them idle for 25 to 46 hours — 24 GB of swap in
+use against 18 GB of RAM, and the disk down to 0.1 GB free. Starting the
+service and letting one pass run took swap to 8.8 GB.
+
+It is a service you start rather than something `brew install` sets up on
+its own: putting something on a machine that runs on login is a decision to
+make explicitly. Adjust the flags, or run it under a non-Homebrew install,
+by copying `contrib/com.simpool.reap.plist` into `~/Library/LaunchAgents`
+instead.
+
 ## Usage
 
 ```
@@ -870,27 +896,8 @@ ever happens is whatever someone types by hand. That is the other half of how
 found still booted with no holder, four of them idle for 25 to 46 hours, on a
 machine with 24 GB of swap in use against 18 GB of RAM.
 
-Schedule it:
-
-```bash
-brew services start simpool
-```
-
-That installs a launchd agent running, every 30 minutes:
-
-```
-simpool reap --purge-orphan-runtimes --cold 60 --warm 2
-```
-
-— collect dead devices' userlands, shut down free simulators idle over an
-hour, keep two warm per group. Logs to `/tmp/simpool-reap.log`. Stop it with
-`brew services stop simpool`.
-
-It is a service you start rather than something installing simpool sets up on
-its own: putting something on a machine that runs on login is the user's call
-to make explicitly, not a side effect of `brew install`. For a non-Homebrew
-install, or to run it with different flags, `contrib/com.simpool.reap.plist`
-is the same agent as a plain plist to copy into `~/Library/LaunchAgents`.
+Schedule it with `brew services start simpool` — see Build, at the top,
+where anyone installing simpool will actually read it.
 
 `launchd_sim` is handled from its command line alone (it names the device's
 data directory, and its argv[0] is a bare name outside any RuntimeRoot), so

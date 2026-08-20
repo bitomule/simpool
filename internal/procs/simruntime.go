@@ -72,7 +72,7 @@ var argvSnapshotFunc = func() ([]byte, error) {
 //
 // This exists as a second pass, rather than one `ps -Aewwo` over everything,
 // because on Darwin `-E` and `-A` do not compose: a full listing silently
-// drops the environment and prints argv alone. Measured on this machine with
+// drops the environment and prints argv alone. Measured against a host with
 // 804 live simulator-runtime processes — a bulk `ps -Aewwo pid=,command=`
 // reported the device tag for 1 of them, while querying the same pids
 // explicitly reported it for 40 of 40. A scan built on the bulk form finds

@@ -32,8 +32,8 @@ type orphanedRuntime struct {
 // *cleanly*; a device deleted while booted (which is what `simctl delete` on
 // a booted device does, and what any crashed or force-killed tooling leaves
 // behind) loses its parent and keeps its entire userland running, reparented
-// to launchd. Nothing ever collects it: measured on the development machine,
-// 452 such processes across 19 deleted devices, the oldest 18 days old,
+// to launchd. Nothing ever collects it: measured in the wild, 452 such
+// processes across 19 deleted devices, the oldest 18 days old,
 // 1774 host processes in total, 15.3 GB of swap in use and the machine
 // paging itself to a standstill. Every one of those devices was already gone
 // from `simctl list`.

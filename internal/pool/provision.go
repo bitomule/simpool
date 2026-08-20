@@ -199,7 +199,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// knownState carries a device's already-known state (from the Find or
 	// ListDevices lookup below) into the boot decision, so a device this
 	// call can already prove is "Booted" never pays for a redundant
-	// bootstatus round trip (~2s measured on this machine) on top of the
+	// bootstatus round trip (~2s measured) on top of the
 	// lookup that already told us so. Left "" whenever no lookup happened
 	// to report a state (the fresh-create path never has one to report,
 	// since a just-created device is never anything but Shutdown), which
@@ -327,7 +327,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// Only pay for the boot-and-wait round trip when the device isn't
 	// already known-booted. This is the idempotency fix for the hot path:
 	// `simpool lease` on a warm slot used to call simctl.Boot unconditionally
-	// (measured ~2s of pure subprocess overhead on this machine for the
+	// (measured ~2s of pure subprocess overhead for the
 	// no-op "already booted" case) on top of whatever lookup above already
 	// told us the device's state for free. knownState is only ever "Booted"
 	// here when a lookup this call already had to do anyway (deps.find or

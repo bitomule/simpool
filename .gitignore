@@ -1,2 +1,7 @@
 /simpool
 *.test
+
+# Agent worktrees live inside the repo and are separate git repositories;
+# a bare `git add -A` stages them as embedded repos (gitlinks) that clone as
+# empty directories. Happened once — hence this line.
+.claude/

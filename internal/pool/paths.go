@@ -21,15 +21,25 @@ import (
 // touching the real ~/Library/Developer/SimPool tree.
 const EnvPoolHome = "SIMPOOL_HOME"
 
-// forbiddenRoot is the volume the pool must never live on: it is a 40GB
-// quota shared with Bazel's disk cache (see design doc §6).
-const forbiddenRoot = "/Volumes/BazelCache"
-
-// Root returns the pool's root directory, creating it if necessary. The
-// forbidden-volume guard applies to SIMPOOL_HOME overrides too: that is the
-// only way anyone can actually put the pool under the quota-limited Bazel
-// cache volume, so it is the branch that most needs the check, not the one
-// that can be skipped.
+// Root returns the pool's root directory, creating it if necessary.
+// SIMPOOL_HOME is honoured verbatim; no location is special to simpool.
+//
+// There used to be a guard here refusing any root under
+// "/Volumes/BazelCache" — the development machine's quota-limited APFS
+// volume — on the stated grounds that a pool of multi-GB simulators would
+// starve the Bazel disk cache sharing it. That rationale was simply wrong,
+// and measuring it is what showed why: the pool root holds lock files
+// (empty; flock lives on the inode) and small meta.json files, 32 KB in
+// total on a machine running seven slots. The simulators are not here and
+// never were. simpool creates them through `simctl` in the default device
+// set, which lives wherever CoreSimulator puts it — 31 GB in
+// ~/Library/Developer/CoreSimulator/Devices on that same machine. Moving
+// SIMPOOL_HOME moves the bookkeeping, not a single byte of simulator.
+//
+// So the guard could not prevent the harm it named, went untested for its
+// whole life, and on every machine but one silently matched nothing while
+// reading like protection. Please do not reintroduce it: if a pool root
+// ever does need to be refused, the reason will have to be measured first.
 func Root() (string, error) {
 	root := ""
 	if override := os.Getenv(EnvPoolHome); override != "" {
@@ -41,16 +51,11 @@ func Root() (string, error) {
 		}
 		root = filepath.Join(home, "Library", "Developer", "SimPool")
 	}
-	if strings.HasPrefix(root, forbiddenRoot) {
-		return "", errPoolOnForbiddenVolume
-	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", err
 	}
 	return root, nil
 }
-
-var errPoolOnForbiddenVolume = poolPathError("pool root resolved under " + forbiddenRoot + ", which is quota-limited and shared with the Bazel disk cache; refusing to use it")
 
 type poolPathError string
 

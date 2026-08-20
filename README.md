@@ -1,46 +1,67 @@
 # simpool
 
-A broker for iOS simulators shared by several agents on one machine. Every
-slot gets its own simulator in the **default** device set — the same one
-Xcode, the user's own simulators, MAV, axe, and idb already use with no
-special flag — identified by a unique, deterministic name
-(`SIMPOOL_<roottag>_<device>@<os>_slot-<n>`, see "Pool layout" below) rather
-than by a private device set. Arbitration is a real `flock()` held by a
-live process, not a PID-file heuristic or a central daemon: the kernel
-always releases it the instant its holder dies, with no cleanup step of
-its own required. The one gap that leaves is a SIGKILL to `simpool` itself
-(not its whole process group) — the lock frees but the child survives as
-an orphan — and that is not silently unsafe: nothing hands a lock-free slot
-to a new consumer while its old one is provably still alive, so at worst
-the slot sits quarantined, never corrupted. Recovery is automatic where it
-can be proven safe: `simpool with`/`acquire`/`lease` reclaim a poisoned
-slot the moment anything next tries to acquire it, and `simpool reap` does
-the same for anything it walks — all provided the old consumer's identity
-(its process-group leader's own start time, fingerprinted under a fixed,
-locale/timezone-independent environment when it was launched) can still be
-verified, which is what makes killing it safe despite macOS recycling pids
-(see "Architecture" below). There is no automatic idle-simulator sweep —
-shutting one down is still `simpool reap --cold N`'s job, run by a human,
-cron, or CI; see "Architecture" for why that boundary is deliberate.
+
+A broker for iOS simulators shared by several agents, test runners and
+people on one machine.
+
+- **One simulator per slot, in the default device set** — the same set
+  Xcode, your own simulators, MAV, `axe` and `idb` already use, with no
+  special flag. Slots are told apart by a deterministic name,
+  `SIMPOOL_<roottag>_<device>@<os>_slot-<n>` (see [Pool layout](#pool-layout)).
+- **Arbitration is a real `flock()`** held by a live process — not a PID
+  file, not a heuristic, not a central daemon. The kernel releases it the
+  instant its holder dies, with no cleanup step of its own.
+- **A slot is never handed to two consumers.** The one gap `flock` leaves is
+  a `SIGKILL` to `simpool` itself rather than its process group: the lock
+  frees while the child survives. That is not silently unsafe — nothing
+  hands out a lock-free slot whose previous consumer is provably still
+  alive, so at worst a slot sits quarantined, never corrupted.
+- **Recovery is automatic wherever it can be proven safe.**
+  `with`/`acquire`/`lease` reclaim a quarantined slot the moment anything
+  next tries to acquire it, and `reap` does the same for everything it
+  walks — provided the old consumer's identity can still be verified. That
+  identity is its process-group leader's own start time, fingerprinted
+  under a fixed, locale- and timezone-independent environment, which is
+  what makes killing it safe despite macOS recycling pids (see
+  [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away)).
+- **Your own simulators are untouchable.** `reap` and `doctor` refuse to
+  shut down, delete or otherwise act on any device in the default set whose
+  name does not start with `SIMPOOL_`.
+
+Shutting down idle simulators is `reap`'s job, not something `with` does on
+exit — see [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away)
+for why that boundary is deliberate, and [Build](#build) for the Homebrew
+service that runs it on a schedule.
+
+## Contents
+
+- [Build](#build) — install, and start the cleanup service
+- [Usage](#usage) — every subcommand and flag
+- [Bazel](#bazel-simpool_ios_test_runner) — the `simpool_ios_test_runner` rule
+- [Pool layout](#pool-layout) — what lives on disk
+- [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away) —
+  why simpool stays the parent, and how quarantine and recovery work
+- [Testing](#testing)
+- [Out of scope](#whats-out-of-scope-here)
+
+## Why not a private device set
 
 Isolation by private device set was the original design (see git history)
-and was dropped after implementing and running it: `Simulator.app` is
-single-instance and tied to one set at a time, quitting it kills every
-simulator booted from that set, and `axe` — MAV's accessibility-tree and
-tap provider — cannot see a device in a non-default set at all
-(`Simulator with UDID ... not found in set`). None of that is compatible
-with a human occasionally taking the wheel of an agent's simulator, which
-this tool has to support. Isolation is now by name only, enforced by the
-`SIMPOOL_` prefix: reap and doctor refuse to shut down, delete, or
-otherwise act on any device in the default set whose name doesn't start
-with it — the user's own simulators live in that same set and must never
-be touched.
+and was dropped after implementing and running it:
+
+- `Simulator.app` is single-instance and tied to one set at a time, and
+  quitting it kills every simulator booted from that set.
+- `axe` — MAV's accessibility-tree and tap provider — cannot see a device
+  in a non-default set at all (`Simulator with UDID ... not found in set`).
+
+Neither is compatible with a person occasionally taking the wheel of an
+agent's simulator, which this tool has to support. Isolation is by name
+instead, enforced by the `SIMPOOL_` prefix.
 
 See the design doc (§1–§10) for the full rationale. In short: this tool
-exists because five different repos on this machine had the same simulator
-UDID hardcoded, and two agents launching at once would install over each
-other silently.
-
+exists because five different repositories had the same simulator UDID
+hardcoded, and two agents launching at once would install over each other
+silently.
 ## Build
 
 ```
@@ -73,11 +94,11 @@ collect the processes of simulators that no longer exist. Logs to
 
 This is not optional housekeeping. `with` deliberately does not shut
 simulators down on exit (see Architecture), so with nothing scheduled the
-only cleanup that ever happens is whatever someone types. On the machine
-this was developed against, that meant seven pool simulators still booted
-with no holder — four of them idle for 25 to 46 hours — 24 GB of swap in
-use against 18 GB of RAM, and the disk down to 0.1 GB free. Starting the
-service and letting one pass run took swap to 8.8 GB.
+only cleanup that ever happens is whatever someone types. Left unscheduled
+on a busy 18 GB workstation, that produced seven pool simulators still
+booted with no holder — four of them idle for 25 to 46 hours — 24 GB of
+swap in use and the disk down to 0.1 GB free. One pass of the service took
+swap back to 8.8 GB.
 
 It is a service you start rather than something `brew install` sets up on
 its own: putting something on a machine that runs on login is a decision to
@@ -547,7 +568,7 @@ microseconds) is not the same question as checking whether it's safe by
 the fuller `LiveConsumers` scan (a live process referencing the UDID with
 no recorded pgid — the healthy state for an actively-leased slot, not an
 orphan), and that fuller scan is expensive enough (~8.5s measured against
-one booted iOS 26.3 simulator on this machine, all fork/exec overhead —
+a single booted iOS 26.3 simulator, all fork/exec overhead —
 see `internal/procs.Descendants`) that fanning it out across a whole group
 on every single `with`/Bazel test action's exit is the wrong trade: real
 cost on the hot path for a benefit (idle-simulator shutdown) `simpool reap
@@ -846,11 +867,11 @@ reparented to launchd and keeps running with no device behind it. Nothing
 on the machine ever collects them — not CoreSimulator, not Xcode, not a
 reboot-free cleanup of any kind.
 
-Measured on the development machine that prompted this: **452 such
-processes across 19 deleted devices, the oldest 18 days old**. 1774 host
-processes in total, 15.3 GB of swap in use, free memory at 19%, and the
-machine paging itself to a standstill — while `simctl list devices` showed
-four booted simulators and looked entirely healthy. Every one of the 19
+Measured on the workstation that prompted this: **452 such processes
+across 19 deleted devices, the oldest 18 days old**. 1774 host processes in
+total, 15.3 GB of swap in use, free memory at 19%, and the machine paging
+itself to a standstill — while `simctl list devices` showed four booted
+simulators and looked entirely healthy. Every one of the 19
 devices was already gone.
 
 Every `simpool reap` now reports these, and `simpool doctor` warns about
@@ -890,11 +911,11 @@ orphans clean, which is the failure mode that hides rather than shouts;
 amount of mocked `ps` output can.
 
 Nothing runs `reap` on its own — `with` deliberately does not shut simulators
-down on exit — so on a machine with no schedule for it, the only cleanup that
-ever happens is whatever someone types by hand. That is the other half of how
-452 orphans reached 18 days old, and of how seven pool simulators were later
-found still booted with no holder, four of them idle for 25 to 46 hours, on a
-machine with 24 GB of swap in use against 18 GB of RAM.
+down on exit — so with nothing scheduled, the only cleanup that ever happens
+is whatever someone types by hand. That is the other half of how 452 orphans
+reached 18 days old, and of how seven pool simulators were later found still
+booted with no holder, four of them idle for 25 to 46 hours, with 24 GB of
+swap in use.
 
 Schedule it with `brew services start simpool` — see Build, at the top,
 where anyone installing simpool will actually read it.

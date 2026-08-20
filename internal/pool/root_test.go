@@ -8,12 +8,12 @@ import (
 
 // SIMPOOL_HOME is honoured verbatim. This is the test that would have to be
 // deleted to reintroduce a special-cased location, which is the point of
-// writing it: the previous guard refused "/Volumes/BazelCache" on the
-// grounds that a pool of multi-GB simulators would starve the Bazel cache
-// sharing that volume, and no simulator has ever lived in the pool root
-// (see Root's doc comment for the measurement).
+// writing it: the guard that used to live in Root() refused one hardcoded
+// external volume on the grounds that a pool of multi-GB simulators would
+// starve the build cache sharing it, and no simulator has ever lived in the
+// pool root at all (see Root's doc comment for the measurement).
 func TestRoot_HonoursAnyPoolHome(t *testing.T) {
-	for _, name := range []string{"BazelCache", "Volumes", "pool", "weird name"} {
+	for _, name := range []string{"Volumes", "cache", "pool", "weird name"} {
 		sub := filepath.Join(t.TempDir(), name, "SimPool")
 		t.Setenv(EnvPoolHome, sub)
 

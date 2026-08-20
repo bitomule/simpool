@@ -24,22 +24,21 @@ const EnvPoolHome = "SIMPOOL_HOME"
 // Root returns the pool's root directory, creating it if necessary.
 // SIMPOOL_HOME is honoured verbatim; no location is special to simpool.
 //
-// There used to be a guard here refusing any root under
-// "/Volumes/BazelCache" — the development machine's quota-limited APFS
-// volume — on the stated grounds that a pool of multi-GB simulators would
-// starve the Bazel disk cache sharing it. That rationale was simply wrong,
-// and measuring it is what showed why: the pool root holds lock files
-// (empty; flock lives on the inode) and small meta.json files, 32 KB in
-// total on a machine running seven slots. The simulators are not here and
-// never were. simpool creates them through `simctl` in the default device
-// set, which lives wherever CoreSimulator puts it — 31 GB in
-// ~/Library/Developer/CoreSimulator/Devices on that same machine. Moving
-// SIMPOOL_HOME moves the bookkeeping, not a single byte of simulator.
+// There used to be a guard here refusing any root under one hardcoded
+// external volume, on the stated grounds that a pool of multi-GB simulators
+// would starve the build cache sharing that volume. The rationale was
+// wrong, and measuring it is what showed why: the pool root holds lock
+// files (empty — flock lives on the inode) and small meta.json files, 32 KB
+// in total for seven slots. The simulators are not in it and never were.
+// simpool creates them through `simctl` in the default device set, which
+// lives wherever CoreSimulator puts it; that tree measured 31 GB against
+// the pool root's 32 KB. Moving SIMPOOL_HOME moves the bookkeeping, not a
+// single byte of simulator.
 //
 // So the guard could not prevent the harm it named, went untested for its
-// whole life, and on every machine but one silently matched nothing while
-// reading like protection. Please do not reintroduce it: if a pool root
-// ever does need to be refused, the reason will have to be measured first.
+// whole life, and anywhere but one filesystem layout matched nothing at all
+// while reading like protection. Please do not reintroduce it: if a pool
+// root ever does need refusing, measure the reason first.
 func Root() (string, error) {
 	root := ""
 	if override := os.Getenv(EnvPoolHome); override != "" {
@@ -86,7 +85,8 @@ func GroupName(device, osVersion string) string {
 // device set. Every simulator simpool creates gets a name starting with
 // this; reap and doctor must refuse to shut down, delete, or otherwise act
 // on any device whose name doesn't start with it — the default set also
-// holds the user's own simulators (34 on the dev machine at design time),
+// holds the user's own simulators (34 of them on the host this was designed
+// against),
 // and they must never be touched.
 const NamePrefix = "SIMPOOL_"
 

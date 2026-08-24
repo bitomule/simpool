@@ -211,10 +211,10 @@ func TestRunDoctor_CatchesMetaCoherentlyPointingAtAnotherGroupsDevice(t *testing
 // test for finding #3 (structurally false advice): before this fix, doctor
 // used the same generic message for every poison reason — "will be
 // reclaimed automatically on the next acquisition or `simpool reap` if its
-// identity can still be verified" — even for PoisonedByOrphanedCompanions
+// identity can still be verified" — even for PoisonedByOrphanedResidue
 // whose target device's identity as this slot's own could not be confirmed.
 // That is never true for this specific case: deviceBelongsToSlot (what
-// pool.CompanionDeviceVerified checks) can only ever succeed against a
+// pool.ResidueDeviceVerified checks) can only ever succeed against a
 // device that still exists to name-check, so an unverified companion is
 // permanently unreachable via the automatic path, not merely unlucky on
 // this run — `reap` already says the right thing (see reap.go), doctor did

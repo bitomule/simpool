@@ -651,7 +651,7 @@ are all worthless as evidence here. What *can* be trusted is the state of
 the slot it is attached to.
 
 `pool.CheckPoison` recognizes this as its own reason,
-`PoisonedByOrphanedCompanions`, when condition 1 below holds together with
+`PoisonedByOrphanedResidue`, when condition 1 below holds together with
 **either** form of evidence in condition 2:
 
 1. Every live PID matching the UDID is independently verified
@@ -668,9 +668,9 @@ the slot it is attached to.
    reclaimed.
 2. There is independent evidence that nothing can be *using* those
    companions. Two forms count, each conclusive on its own
-   (`pool.CompanionEvidence`):
+   (`pool.ResidueEvidence`):
 
-   **(a) `CompanionTargetNotRunning`** — the device the companion is pinned
+   **(a) `ResidueTargetNotRunning`** — the device the companion is pinned
    to is independently confirmed not currently running. Confirmed by an
    **allowlist**, to be genuinely `Shutdown` — never a denylist
    (`!= "Booted"`): `"Booting"`, `"Shutting Down"`, `"Creating"`, an
@@ -686,9 +686,9 @@ the slot it is attached to.
    exists) is read the same as an outright listing failure, never as proof
    of deletion.
 
-   **(b) `CompanionSlotLongIdle`** — the device IS running, but the slot it
+   **(b) `ResidueSlotLongIdle`** — the device IS running, but the slot it
    belongs to is provably unheld and has not been touched for at least
-   `pool.CompanionIdleGrace` (30 minutes). This is the case a *warm* pool
+   `pool.ResidueIdleGrace` (30 minutes). This is the case a *warm* pool
    actually hits, and the one (a) structurally cannot cover: simpool's
    whole purpose is keeping slot devices `Booted` between consumers, so
    "confirmed not running" is never true for a healthy pool slot. Before
@@ -764,7 +764,7 @@ why the two differ).
 device-identity guard on purpose, which leaves the device's own
 confirmed-not-running state as the last thing keeping it off a simulator a
 stale `meta.json` merely names — so a companion attached to a *running*
-device is out of its reach entirely (`pool.Poison.CompanionDisownable`).
+device is out of its reach entirely (`pool.Poison.ResidueDisownable`).
 That case needs no escape hatch anyway: it is exactly what the automatic
 path now handles, with the identity guard intact.
 
@@ -821,14 +821,14 @@ its device pulled out from under it, and a liveness check that merely
 failed to run (`PoisonedByCheckFailure`) proves nothing is actually wrong,
 so disowning on the strength of it would be reckless, not an escape hatch.
 
-**`--disown-poisoned` also covers `PoisonedByOrphanedCompanions`, and there
+**`--disown-poisoned` also covers `PoisonedByOrphanedResidue`, and there
 it DOES kill** — deliberately the opposite contract from the `ConsumerPGID`
 branch above. That asymmetry is intentional, not an inconsistency: the
 `ConsumerPGID` case's two motivating scenarios (a recycled pid, or an
 `EPERM`-protected process belonging to another user) both mean simpool
 genuinely cannot prove the thing behind the pgid is safe to touch, so
 forgetting without signaling is the only honest option. Neither applies to
-an orphaned companion — `poison.CompanionPIDs` is already positively,
+an orphaned companion — `poison.ResiduePIDs` is already positively,
 narrowly verified (`procs.IsIdbCompanionFor`'s exact binary-plus-flag match,
 re-verified again immediately before the kill) to be `idb_companion`
 daemons, ordinary killable processes, not an identity puzzle. What's
@@ -966,7 +966,7 @@ releases the lock on SIGKILL with no cleanup step":
   scope limit — a process-group leader that has already exited while a
   descendant of it survives under the same pgid is left quarantined
   rather than trusted on bare pgid membership alone. The same file also
-  covers `PoisonedByOrphanedCompanions` end to end, entirely against
+  covers `PoisonedByOrphanedResidue` end to end, entirely against
   synthetic (compiled, never-booted) `idb_companion` processes and faked
   `simctl.ListDevices`/`simctl.Find` seams — no real simulator involved: a
   companion on a genuinely Booted device is left alone; one on any
@@ -995,10 +995,10 @@ releases the lock on SIGKILL with no cleanup step":
   immediately before the kill, not trusted from an earlier determination;
   and every PID in a multi-PID set gets a kill attempt even when an earlier
   one reports an error, proven with 3 real companion processes and a
-  `companionKill` seam that reports a fake `EPERM` for the first while
-  actually killing all three. `disownOrphanedCompanions` (the
+  `residueKill` seam that reports a fake `EPERM` for the first while
+  actually killing all three. `disownOrphanedResidue` (the
   `--disown-poisoned` path) gets the identical set of guard tests as its
-  `reclaimOrphanedCompanions` twin, not just the identity-confirmed
+  `reclaimOrphanedResidue` twin, not just the identity-confirmed
   end-to-end cases above: `TestDisownOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling`
   proves it refuses when the device is confirmed `Booted` at the moment of
   the call (a hand-built `Poison` standing in for `CheckPoison`'s earlier
@@ -1010,7 +1010,7 @@ releases the lock on SIGKILL with no cleanup step":
   per-PID and post-kill guards, and
   `_AttemptsEveryPIDEvenIfAnEarlierOneErrors` mirrors the no-early-return
   kill loop. `TestCompanionDeviceOffline_ErrCheckIsLoadBearingEvenWithAPopulatedList`
-  covers `companionDeviceOffline`'s `err != nil` guard specifically: the
+  covers `residueDeviceOffline`'s `err != nil` guard specifically: the
   real `simctl.ListDevices` always returns a nil device list on its own
   error path, so a test built on that realistic shape can't tell the
   err-check apart from the (also-triggered) empty-listing check — this one
@@ -1020,7 +1020,7 @@ releases the lock on SIGKILL with no cleanup step":
   former name notwithstanding, only ever proved the latter). Every one of
   these guards — the allowlist, the empty-listing distinction, the identity
   guard, every re-verify check on both the reclaim and disown paths, the
-  no-early-return kill loops, and the `companionDeviceOffline` err-check —
+  no-early-return kill loops, and the `residueDeviceOffline` err-check —
   was ablation-verified: reverting the corresponding line of `poison.go`
   individually turns the matching test red.
 - `internal/procs/procs_test.go` proves `ProcessStartTime` produces the
@@ -1097,8 +1097,8 @@ releases the lock on SIGKILL with no cleanup step":
   identity-unverified orphaned companion: the original fix gave `reap`
   reason-specific messages but left `doctor` on one generic "will be
   reclaimed automatically ... if its identity can still be verified" line
-  for every poison reason — false for `PoisonedByOrphanedCompanions` once
-  `pool.CompanionDeviceVerified` can't confirm the device, since
+  for every poison reason — false for `PoisonedByOrphanedResidue` once
+  `pool.ResidueDeviceVerified` can't confirm the device, since
   `deviceBelongsToSlot` can only ever succeed against a device that still
   exists, making automatic recovery permanently unreachable for that slot,
   not merely unlucky this run. `doctor` now branches on the poison reason

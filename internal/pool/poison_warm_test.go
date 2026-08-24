@@ -26,7 +26,7 @@ import (
 // construction — that is what a warm pool IS. So the branch was
 // structurally unreachable for the exact scenario it was written for, and
 // every slot fell through to the never-a-kill-candidate
-// PoisonedByLiveConsumers. See CompanionSlotLongIdle.
+// PoisonedByLiveConsumers. See ResidueSlotLongIdle.
 //
 // Deliberately NOT fixed by looking at the companion process itself: a
 // companion is spawned by the short-lived `idb` client under
@@ -37,7 +37,7 @@ import (
 // tell a live one from residue. The slot's own state can.
 
 // longIdleMeta returns a Meta for a warm slot last used well beyond
-// CompanionIdleGrace — the shape the seven production orphans had, at over
+// ResidueIdleGrace — the shape the seven production orphans had, at over
 // a day of idleness each.
 func longIdleMeta(udid, mode string) Meta {
 	return Meta{UDID: udid, Mode: mode, LastUsed: time.Now().Add(-24 * time.Hour)}
@@ -47,7 +47,7 @@ func longIdleMeta(udid, mode string) Meta {
 // primary regression test for the production incident above: a companion
 // pinned to a device that is still Booted, on a slot whose flock is free
 // (guaranteed by every caller of AttemptRecovery — see that function's
-// documented precondition), unused for far longer than CompanionIdleGrace,
+// documented precondition), unused for far longer than ResidueIdleGrace,
 // and independently confirmed by name to be this exact slot's own device,
 // must be reclaimed automatically — regardless of Meta.Mode, since
 // idb_companion residue has nothing to do with which subcommand held the
@@ -63,19 +63,19 @@ func TestCheckPoison_CompanionOnWarmBootedSlot_ReclaimedOnceLongIdle(t *testing.
 			pid, cleanup := spawnIdbCompanion(t, udid)
 			defer cleanup()
 			waitForLiveConsumer(t, udid)
-			withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+			withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 			withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
 
 			meta := longIdleMeta(udid, mode)
 			poison := CheckPoison(meta)
-			if poison.Reason != PoisonedByOrphanedCompanions {
-				t.Fatalf("mode=%q: expected PoisonedByOrphanedCompanions for a long-idle warm slot's companion, got %v", mode, poison.Reason)
+			if poison.Reason != PoisonedByOrphanedResidue {
+				t.Fatalf("mode=%q: expected PoisonedByOrphanedResidue for a long-idle warm slot's companion, got %v", mode, poison.Reason)
 			}
-			if poison.CompanionEvidence != CompanionSlotLongIdle {
-				t.Fatalf("mode=%q: expected CompanionSlotLongIdle evidence (the device is up), got %v", mode, poison.CompanionEvidence)
+			if poison.ResidueEvidence != ResidueSlotLongIdle {
+				t.Fatalf("mode=%q: expected ResidueSlotLongIdle evidence (the device is up), got %v", mode, poison.ResidueEvidence)
 			}
-			if len(poison.CompanionPIDs) != 1 || poison.CompanionPIDs[0] != pid {
-				t.Fatalf("mode=%q: expected CompanionPIDs=[%d], got %v", mode, pid, poison.CompanionPIDs)
+			if len(poison.ResiduePIDs) != 1 || poison.ResiduePIDs[0] != pid {
+				t.Fatalf("mode=%q: expected ResiduePIDs=[%d], got %v", mode, pid, poison.ResiduePIDs)
 			}
 			if !AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 				t.Fatalf("mode=%q: AttemptRecovery should have reclaimed the orphaned companion on a long-idle warm slot", mode)
@@ -99,7 +99,7 @@ func TestCheckPoison_CompanionOnWarmBootedSlot_ReclaimedOnceLongIdle(t *testing.
 // long `mav run` build is in flight. Killing that companion would be
 // survivable on its own (idb respawns it), but freeing the slot on the
 // strength of it would hand a running session's simulator to someone else.
-// Within CompanionIdleGrace this must stay the ordinary,
+// Within ResidueIdleGrace this must stay the ordinary,
 // never-a-kill-candidate PoisonedByLiveConsumers.
 func TestCheckPoison_CompanionOnWarmBootedSlot_NeverReclaimedWithinGrace(t *testing.T) {
 	dir := t.TempDir()
@@ -107,19 +107,19 @@ func TestCheckPoison_CompanionOnWarmBootedSlot_NeverReclaimedWithinGrace(t *test
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
 
 	// Deliberately just inside the grace, not comfortably inside it: this
 	// is the boundary that decides whether a live-but-quiet MAV session
 	// keeps its slot.
-	meta := Meta{UDID: udid, Mode: "lease", LastUsed: time.Now().Add(-CompanionIdleGrace + time.Minute)}
+	meta := Meta{UDID: udid, Mode: "lease", LastUsed: time.Now().Add(-ResidueIdleGrace + time.Minute)}
 	poison := CheckPoison(meta)
 	if poison.Reason != PoisonedByLiveConsumers {
 		t.Fatalf("expected PoisonedByLiveConsumers for a companion on a slot used %s ago, got %v", time.Since(meta.LastUsed).Round(time.Second), poison.Reason)
 	}
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
-		t.Fatal("AttemptRecovery must never reclaim a companion on a slot still within CompanionIdleGrace — that is a session that may merely be quiet")
+		t.Fatal("AttemptRecovery must never reclaim a companion on a slot still within ResidueIdleGrace — that is a session that may merely be quiet")
 	}
 	if syscall.Kill(pid, 0) != nil {
 		t.Fatal("the companion process must still be alive")
@@ -140,7 +140,7 @@ func TestCheckPoison_CompanionOnWarmBootedSlot_ZeroLastUsedNeverReclaimed(t *tes
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
 
 	meta := Meta{UDID: udid, Mode: "lease"} // LastUsed deliberately zero
@@ -176,15 +176,15 @@ func TestCheckPoison_CompanionOnRunningForeignDevice_NeverTouchedByEitherPath(t 
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 	withDeviceBelongsToSlotFind(t, fakeSlotForeignDevice("Booted"))
 
 	meta := longIdleMeta(udid, "lease")
 	poison := CheckPoison(meta)
-	if poison.Reason != PoisonedByOrphanedCompanions || poison.CompanionEvidence != CompanionSlotLongIdle {
-		t.Fatalf("expected PoisonedByOrphanedCompanions/CompanionSlotLongIdle (classification is identity-blind by design), got %v/%v", poison.Reason, poison.CompanionEvidence)
+	if poison.Reason != PoisonedByOrphanedResidue || poison.ResidueEvidence != ResidueSlotLongIdle {
+		t.Fatalf("expected PoisonedByOrphanedResidue/ResidueSlotLongIdle (classification is identity-blind by design), got %v/%v", poison.Reason, poison.ResidueEvidence)
 	}
-	if poison.CompanionDisownable() {
+	if poison.ResidueDisownable() {
 		t.Fatal("a companion on a RUNNING device must never be reported as disownable")
 	}
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
@@ -218,7 +218,7 @@ func TestCheckPoison_NonCompanionAlongsideCompanionOnWarmSlot_NeverReclaimed(t *
 	otherPID, cleanupOther := spawnLiveConsumerWithToken(t, udid)
 	defer cleanupOther()
 	waitForConsumerCount(t, udid, 2)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
 
 	meta := longIdleMeta(udid, "lease")
@@ -241,7 +241,7 @@ func TestCheckPoison_NonCompanionAlongsideCompanionOnWarmSlot_NeverReclaimed(t *
 // call, and the thing most worth catching in that window is not a companion
 // that changed identity but a NON-companion that appeared — the `idb`
 // client process of a hot-loop call that arrived just now, carrying the
-// UDID in its own argv. Re-checking only poison.CompanionPIDs would be
+// UDID in its own argv. Re-checking only poison.ResiduePIDs would be
 // blind to it and would reclaim the slot anyway.
 func TestReclaimOrphanedCompanions_RefusesWhenANewConsumerAppears(t *testing.T) {
 	dir := t.TempDir()
@@ -249,13 +249,13 @@ func TestReclaimOrphanedCompanions_RefusesWhenANewConsumerAppears(t *testing.T) 
 	companionPID, cleanupCompanion := spawnIdbCompanion(t, udid)
 	defer cleanupCompanion()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
 
 	meta := longIdleMeta(udid, "lease")
 	poison := CheckPoison(meta)
-	if poison.Reason != PoisonedByOrphanedCompanions {
-		t.Fatalf("setup: expected PoisonedByOrphanedCompanions, got %v", poison.Reason)
+	if poison.Reason != PoisonedByOrphanedResidue {
+		t.Fatalf("setup: expected PoisonedByOrphanedResidue, got %v", poison.Reason)
 	}
 
 	// The window opens here: a live client arrives after the determination

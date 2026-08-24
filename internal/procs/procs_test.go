@@ -574,7 +574,7 @@ func TestIsIdbCompanionFor_RejectsSubstringMatch(t *testing.T) {
 // companion whose death takes the boot down with it, spawned in practice as
 // `--headless 1 --boot <udid>` with NO --udid flag at all. That makes it
 // categorically different from the `--udid <udid> --grpc-domain-sock
-// /tmp/idb/<udid>` shape PoisonedByOrphanedCompanions is scoped to: this
+// /tmp/idb/<udid>` shape PoisonedByOrphanedResidue is scoped to: this
 // form is not disposable, respawnable infrastructure the way the
 // --udid-pinned companion is (see IsIdbCompanionFor's own doc comment), so
 // it must stay unmatched, not because of any special-case exclusion but
@@ -595,6 +595,6 @@ func TestIsIdbCompanionFor_HeadlessBootFormNeverMatches(t *testing.T) {
 	waitUntil(t, 3*time.Second, func() bool { return Alive(pid) })
 
 	if IsIdbCompanionFor(pid, udid) {
-		t.Fatalf("IsIdbCompanionFor must never match idb_companion's --headless/--boot form — it has no --udid flag at all, and is not the disposable, respawnable infrastructure PoisonedByOrphanedCompanions is scoped to (command line: %q)", CommandLine(pid))
+		t.Fatalf("IsIdbCompanionFor must never match idb_companion's --headless/--boot form — it has no --udid flag at all, and is not the disposable, respawnable infrastructure PoisonedByOrphanedResidue is scoped to (command line: %q)", CommandLine(pid))
 	}
 }

@@ -612,7 +612,7 @@ func TestReapHeldSlot_NeverKillsAcquireHolder(t *testing.T) {
 // --- Orphaned idb_companion reclaim at the CLI layer (finding #6:
 // observability) ---
 //
-// pool.CheckPoison's device-offline seam (companionDeviceList) is internal
+// pool.CheckPoison's device-offline seam (residueDeviceList) is internal
 // to package pool and not reachable from here, so these tests use the same
 // pattern internal/pool/poison_test.go's own ConsumerPGID tests establish:
 // a synthetic UDID that the REAL `xcrun simctl list devices -j` (read-only,
@@ -620,7 +620,7 @@ func TestReapHeldSlot_NeverKillsAcquireHolder(t *testing.T) {
 // contain. As long as this machine has at least one real device already
 // (true of any dev machine with Xcode installed), that listing is
 // non-empty, which makes a synthetic UDID's absence CONCLUSIVE per
-// companionDeviceOffline's own rule — Shutdown-equivalent for the poison
+// residueDeviceOffline's own rule — Shutdown-equivalent for the poison
 // classification — while deviceBelongsToSlot can never be satisfied (no
 // real device exists under this UDID to name-check), landing every one of
 // these in the "identity unverified" branch. That is exactly the

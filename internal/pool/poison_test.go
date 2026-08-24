@@ -511,22 +511,22 @@ func TestDisownPoisonedSlot_RefusesNonWithMode(t *testing.T) {
 // exists to fix: three production pool slots stuck FAIL, one companion
 // still holding the UDID of a simulator deleted nine days earlier).
 //
-// None of these tests create or boot a real simulator: companionDeviceList
+// None of these tests create or boot a real simulator: residueDeviceList
 // (the `simctl.ListDevices` seam) and deviceBelongsToSlotFind (the
 // `simctl.Find` seam) are both swapped for fakes for the duration of each
 // test, exactly like withFakeRunContext does one layer down in package
 // simctl.
 
-// withCompanionDeviceList points companionDeviceList at fn for the
+// withResidueDeviceList points residueDeviceList at fn for the
 // duration of the test and restores the real one on cleanup.
-func withCompanionDeviceList(t *testing.T, fn func() ([]simctl.DeviceEntry, error)) {
+func withResidueDeviceList(t *testing.T, fn func() ([]simctl.DeviceEntry, error)) {
 	t.Helper()
-	orig := companionDeviceList
-	companionDeviceList = fn
-	t.Cleanup(func() { companionDeviceList = orig })
+	orig := residueDeviceList
+	residueDeviceList = fn
+	t.Cleanup(func() { residueDeviceList = orig })
 }
 
-// fakeDeviceList returns a companionDeviceList stub reporting a POPULATED
+// fakeDeviceList returns a residueDeviceList stub reporting a POPULATED
 // device set (one unrelated device, so the set is never suspiciously empty)
 // that includes udid with the given state — standing in for a healthy
 // `simctl list devices` that genuinely knows about this exact device.
@@ -534,12 +534,12 @@ func fakeDeviceList(udid, state string) func() ([]simctl.DeviceEntry, error) {
 	return func() ([]simctl.DeviceEntry, error) {
 		return []simctl.DeviceEntry{
 			{UDID: "simpool-test-unrelated-device", Name: "some other simulator", State: "Booted"},
-			{UDID: udid, Name: "irrelevant to companionDeviceOffline", State: state},
+			{UDID: udid, Name: "irrelevant to residueDeviceOffline", State: state},
 		}, nil
 	}
 }
 
-// fakeDeviceDeleted returns a companionDeviceList stub reporting a
+// fakeDeviceDeleted returns a residueDeviceList stub reporting a
 // POPULATED device set that specifically does NOT include udid — the
 // table's deleted-device row: conclusive proof of absence, not an empty
 // listing's ambiguity.
@@ -551,7 +551,7 @@ func fakeDeviceDeleted() func() ([]simctl.DeviceEntry, error) {
 	}
 }
 
-// fakeDeviceListEmpty returns a companionDeviceList stub simulating the
+// fakeDeviceListEmpty returns a residueDeviceList stub simulating the
 // finding #2 probe: a successful `xcrun` call (err == nil) that reports
 // ZERO devices — reproduced directly against a fake xcrun printing
 // `{"devices":{}}`, exactly what a degraded or mid-restart CoreSimulator can
@@ -562,13 +562,13 @@ func fakeDeviceListEmpty() func() ([]simctl.DeviceEntry, error) {
 	}
 }
 
-// fakeDeviceListErrorWithDevices returns a companionDeviceList stub
+// fakeDeviceListErrorWithDevices returns a residueDeviceList stub
 // reporting BOTH a non-nil, non-empty device list that positively includes
-// udid as Shutdown (which would, on its own, satisfy companionDeviceOffline
+// udid as Shutdown (which would, on its own, satisfy residueDeviceOffline
 // as conclusively offline) AND a non-nil error — a shape the real
 // simctl.ListDevices itself never produces (its own err path always returns
 // nil, err — see simctl.go's ListDevices) but the only shape that actually
-// discriminates companionDeviceOffline's `if err != nil` guard from its
+// discriminates residueDeviceOffline's `if err != nil` guard from its
 // `if len(devices) == 0` guard: a real production error's nil devices slice
 // satisfies BOTH checks identically, so a test built on that shape alone
 // cannot prove the err-check specifically is load-bearing — ablating it
@@ -585,7 +585,7 @@ func fakeDeviceListErrorWithDevices(err error, udid string) func() ([]simctl.Dev
 	}
 }
 
-// fakeDeviceListUnreadable returns a companionDeviceList stub simulating an
+// fakeDeviceListUnreadable returns a residueDeviceList stub simulating an
 // outright listing failure (the real xcrun call itself erroring) with a nil
 // devices slice — exactly what simctl.ListDevices itself always returns on
 // error (see ListDevices in simctl.go), used where a test only needs
@@ -686,14 +686,14 @@ func waitForLiveConsumer(t *testing.T, udid string) {
 // first row: a companion attached to a device that is genuinely Booted may
 // be doing real work (or about to), so it must classify as the ordinary,
 // never-a-kill-candidate PoisonedByLiveConsumers — never
-// PoisonedByOrphanedCompanions — and AttemptRecovery must leave it running.
+// PoisonedByOrphanedResidue — and AttemptRecovery must leave it running.
 func TestCheckPoison_CompanionOnBootedDevice_NeverReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	udid := "simpool-test-companion-booted"
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted"))
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -709,7 +709,7 @@ func TestCheckPoison_CompanionOnBootedDevice_NeverReclaimed(t *testing.T) {
 }
 
 // TestCheckPoison_CompanionOnNonShutdownNonBootedStates_NeverReclaimed is
-// the ALLOWLIST regression test (finding #1, HIGH): companionDeviceOffline
+// the ALLOWLIST regression test (finding #1, HIGH): residueDeviceOffline
 // used to be `entry.State != "Booted"`, a DENYLIST under which "Booting",
 // "Shutting Down", "Creating", an unrecognized future state, and even ""
 // (what a JSON response omitting the field would parse as) all classified
@@ -736,12 +736,12 @@ func TestCheckPoison_CompanionOnNonShutdownNonBootedStates_NeverReclaimed(t *tes
 			pid, cleanup := spawnIdbCompanion(t, udid)
 			defer cleanup()
 			waitForLiveConsumer(t, udid)
-			withCompanionDeviceList(t, fakeDeviceList(udid, state))
+			withResidueDeviceList(t, fakeDeviceList(udid, state))
 
 			meta := Meta{UDID: udid, Mode: "lease"}
 			poison := CheckPoison(meta)
 			if poison.Reason != PoisonedByLiveConsumers {
-				t.Fatalf("state=%q: expected PoisonedByLiveConsumers (never PoisonedByOrphanedCompanions for anything but a positively confirmed Shutdown), got %v", state, poison.Reason)
+				t.Fatalf("state=%q: expected PoisonedByLiveConsumers (never PoisonedByOrphanedResidue for anything but a positively confirmed Shutdown), got %v", state, poison.Reason)
 			}
 			if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 				t.Fatalf("state=%q: AttemptRecovery must never reclaim a companion whose device is not positively confirmed Shutdown", state)
@@ -768,16 +768,16 @@ func TestCheckPoison_CompanionOnShutdownDevice_AutoReclaimedWhenIdentityVerified
 			pid, cleanup := spawnIdbCompanion(t, udid)
 			defer cleanup()
 			waitForLiveConsumer(t, udid)
-			withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+			withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 			withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
 			meta := Meta{UDID: udid, Mode: mode}
 			poison := CheckPoison(meta)
-			if poison.Reason != PoisonedByOrphanedCompanions {
-				t.Fatalf("mode=%q: expected PoisonedByOrphanedCompanions, got %v", mode, poison.Reason)
+			if poison.Reason != PoisonedByOrphanedResidue {
+				t.Fatalf("mode=%q: expected PoisonedByOrphanedResidue, got %v", mode, poison.Reason)
 			}
-			if len(poison.CompanionPIDs) != 1 || poison.CompanionPIDs[0] != pid {
-				t.Fatalf("mode=%q: expected CompanionPIDs=[%d], got %v", mode, pid, poison.CompanionPIDs)
+			if len(poison.ResiduePIDs) != 1 || poison.ResiduePIDs[0] != pid {
+				t.Fatalf("mode=%q: expected ResiduePIDs=[%d], got %v", mode, pid, poison.ResiduePIDs)
 			}
 			if !AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 				t.Fatalf("mode=%q: AttemptRecovery should have reclaimed the orphaned companion once identity was verified", mode)
@@ -814,15 +814,15 @@ func TestCheckPoison_CompanionOnShutdownDevice_NotAutoReclaimedWithoutIdentity(t
 			pid, cleanup := spawnIdbCompanion(t, udid)
 			defer cleanup()
 			waitForLiveConsumer(t, udid)
-			withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+			withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 			if tc.fake != nil {
 				withDeviceBelongsToSlotFind(t, tc.fake)
 			}
 
 			meta := Meta{UDID: udid, Mode: "lease"}
 			poison := CheckPoison(meta)
-			if poison.Reason != PoisonedByOrphanedCompanions {
-				t.Fatalf("expected PoisonedByOrphanedCompanions (the device state condition alone is satisfied), got %v", poison.Reason)
+			if poison.Reason != PoisonedByOrphanedResidue {
+				t.Fatalf("expected PoisonedByOrphanedResidue (the device state condition alone is satisfied), got %v", poison.Reason)
 			}
 			if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 				t.Fatal("AttemptRecovery must refuse to kill a companion whose target device's identity as THIS slot's own could not be verified, even though the device is genuinely Shutdown")
@@ -853,7 +853,7 @@ func TestCheckPoison_CompanionOnShutdownDevice_NotAutoReclaimedWithoutIdentity(t
 // to name-check — so this is now, deliberately, unreachable via the fully
 // automatic AttemptRecovery path. It remains reachable only through the
 // explicit, operator-opt-in `--disown-poisoned` escape hatch (see
-// DisownPoisonedSlot's PoisonedByOrphanedCompanions branch), exactly the
+// DisownPoisonedSlot's PoisonedByOrphanedResidue branch), exactly the
 // same role that flag already plays for an unverifiable ConsumerPGID.
 func TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired(t *testing.T) {
 	dir := t.TempDir()
@@ -861,12 +861,12 @@ func TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired(
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceDeleted())
+	withResidueDeviceList(t, fakeDeviceDeleted())
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
-	if poison.Reason != PoisonedByOrphanedCompanions {
-		t.Fatalf("expected PoisonedByOrphanedCompanions for a companion on a deleted device, got %v", poison.Reason)
+	if poison.Reason != PoisonedByOrphanedResidue {
+		t.Fatalf("expected PoisonedByOrphanedResidue for a companion on a deleted device, got %v", poison.Reason)
 	}
 
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
@@ -896,7 +896,7 @@ func TestCheckPoison_NonCompanionOnShutdownDevice_NeverReclaimed(t *testing.T) {
 	pid, cleanup := spawnLiveConsumerWithToken(t, token)
 	defer cleanup()
 	waitForLiveConsumer(t, token)
-	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(token, "Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -934,7 +934,7 @@ func TestCheckPoison_MixedCompanionAndNonCompanion_NeverReclaimed(t *testing.T) 
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(token, "Shutdown"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
@@ -957,7 +957,7 @@ func TestCheckPoison_MixedCompanionAndNonCompanion_NeverReclaimed(t *testing.T) 
 // exact udid.
 //
 // Renamed from ...DeviceStateUnreadable_NeverReclaimed: that name implied
-// this specifically covers companionDeviceOffline's `err != nil` branch, but
+// this specifically covers residueDeviceOffline's `err != nil` branch, but
 // its stub (fakeDeviceListUnreadable) returns (nil, err) — the exact shape
 // the real simctl.ListDevices itself always produces on error (see
 // simctl.go's ListDevices) — which the `len(devices) == 0` guard ALSO
@@ -973,7 +973,7 @@ func TestCheckPoison_CompanionDeviceListingFails_NeverReclaimed(t *testing.T) {
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceListUnreadable(errors.New("xcrun simctl list devices -j: boom")))
+	withResidueDeviceList(t, fakeDeviceListUnreadable(errors.New("xcrun simctl list devices -j: boom")))
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -989,10 +989,10 @@ func TestCheckPoison_CompanionDeviceListingFails_NeverReclaimed(t *testing.T) {
 }
 
 // TestCompanionDeviceOffline_ErrCheckIsLoadBearingEvenWithAPopulatedList is
-// the guard-5 regression test: companionDeviceOffline's `if err != nil`
+// the guard-5 regression test: residueDeviceOffline's `if err != nil`
 // guard, proven with a shape the `len(devices) == 0` guard cannot also
 // explain — a non-nil, non-empty device list (positively naming udid as
-// Shutdown, which on its own would make companionDeviceOffline report
+// Shutdown, which on its own would make residueDeviceOffline report
 // offline=true) returned ALONGSIDE a non-nil error. The real
 // simctl.ListDevices never produces this shape (see its own err path
 // returning nil, err), but this is deliberately the one shape that isolates
@@ -1002,11 +1002,11 @@ func TestCheckPoison_CompanionDeviceListingFails_NeverReclaimed(t *testing.T) {
 // elsewhere in this file cannot prove.
 func TestCompanionDeviceOffline_ErrCheckIsLoadBearingEvenWithAPopulatedList(t *testing.T) {
 	udid := "simpool-test-companion-err-with-populated-list"
-	withCompanionDeviceList(t, fakeDeviceListErrorWithDevices(errors.New("xcrun simctl list devices -j: boom"), udid))
+	withResidueDeviceList(t, fakeDeviceListErrorWithDevices(errors.New("xcrun simctl list devices -j: boom"), udid))
 
-	offline, ok := companionDeviceOffline(udid)
+	offline, ok := residueDeviceOffline(udid)
 	if ok || offline {
-		t.Fatalf("companionDeviceOffline must report ok=false when the listing call itself errored, even though the (untrustworthy) list it also returned says udid is Shutdown; got offline=%v ok=%v", offline, ok)
+		t.Fatalf("residueDeviceOffline must report ok=false when the listing call itself errored, even though the (untrustworthy) list it also returned says udid is Shutdown; got offline=%v ok=%v", offline, ok)
 	}
 }
 
@@ -1016,7 +1016,7 @@ func TestCompanionDeviceOffline_ErrCheckIsLoadBearingEvenWithAPopulatedList(t *t
 // against a fake `xcrun` exiting 0 and printing `{"devices":{}}`, exactly
 // what a degraded or mid-restart CoreSimulator can report even though every
 // device (the user's own included) genuinely still exists. Before this fix,
-// companionDeviceOffline's `!found` branch could not tell this apart from a
+// residueDeviceOffline's `!found` branch could not tell this apart from a
 // populated listing that specifically excludes udid (the real deleted-device
 // case, still exercised by
 // TestCheckPoison_CompanionOnDeletedDevice_NeverAutoReclaimed_DisownRequired).
@@ -1026,7 +1026,7 @@ func TestCheckPoison_CompanionDeviceListEmpty_NeverReclaimed(t *testing.T) {
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceListEmpty())
+	withResidueDeviceList(t, fakeDeviceListEmpty())
 
 	meta := Meta{UDID: udid, Mode: "lease"}
 	poison := CheckPoison(meta)
@@ -1047,8 +1047,8 @@ func TestCheckPoison_CompanionDeviceListEmpty_NeverReclaimed(t *testing.T) {
 // AttemptRecovery's kill are not the same instant, so this proves the
 // device state is checked again, immediately before killing, not trusted
 // from the Poison value alone. A hand-built Poison claims
-// PoisonedByOrphanedCompanions (as if CheckPoison had determined this
-// earlier), but companionDeviceList is set to report the device BOOTED at
+// PoisonedByOrphanedResidue (as if CheckPoison had determined this
+// earlier), but residueDeviceList is set to report the device BOOTED at
 // the moment AttemptRecovery actually runs — simulating the device coming
 // back up in the window between determination and action.
 func TestReclaimOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling(t *testing.T) {
@@ -1058,10 +1058,10 @@ func TestReclaimOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling(t *testing
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Booted"))
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted")) // device is back up NOW
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted")) // device is back up NOW
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must re-check the device is still offline immediately before killing, not trust an earlier determination")
@@ -1084,10 +1084,10 @@ func TestReclaimOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *t
 	defer cleanup()
 	waitForLiveConsumer(t, token)
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
-	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(token, "Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must re-verify every pid is still a genuine idb_companion immediately before killing, not trust an earlier determination")
@@ -1103,7 +1103,7 @@ func TestReclaimOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *t
 // procs.Kill reported an error for ANY one of them — leaving that one
 // already dead while the loop never even reached the rest, which then
 // stayed alive despite the function reporting "nothing changed". Three real
-// companion processes are spawned; companionKill is overridden to actually
+// companion processes are spawned; residueKill is overridden to actually
 // kill each one (via the real procs.Kill) while ALSO reporting a fake EPERM
 // for the first pid specifically — the one way procs.Kill itself can ever
 // genuinely fail. All three must still end up dead, proving every pid gets
@@ -1118,17 +1118,17 @@ func TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *t
 		pids = append(pids, pid)
 	}
 	// All three share the same udid deliberately: CheckPoison's own
-	// allOrphanedIdbCompanions groups every live PID referencing one udid
+	// allReclaimableResidue groups every live PID referencing one udid
 	// together, so a real multi-PID poisoned set looks exactly like this.
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
-	origKill := companionKill
-	defer func() { companionKill = origKill }()
+	origKill := residueKill
+	defer func() { residueKill = origKill }()
 	var attempted []int
 	firstPID := pids[0]
-	companionKill = func(pid int, sig syscall.Signal) error {
+	residueKill = func(pid int, sig syscall.Signal) error {
 		attempted = append(attempted, pid)
 		realErr := procs.Kill(pid, sig) // actually kill it regardless
 		if pid == firstPID {
@@ -1138,7 +1138,7 @@ func TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *t
 	}
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: pids}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: pids}
 	AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison)
 
 	if len(attempted) != 3 {
@@ -1151,43 +1151,43 @@ func TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *t
 
 // TestReclaimOrphanedCompanions_RefusesWhenKillDoesNotStick proves the
 // post-kill procs.Alive verification actually gates AttemptRecovery's
-// return value: companionKill is stubbed to report success without
+// return value: residueKill is stubbed to report success without
 // actually sending anything, so the companion is provably still alive when
 // the post-kill check runs. Without that check, this function would declare
 // the slot reclaimed while its orphan is still running — regression test
-// for the guard at poison.go's reclaimOrphanedCompanions post-kill loop.
+// for the guard at poison.go's reclaimOrphanedResidue post-kill loop.
 func TestReclaimOrphanedCompanions_RefusesWhenKillDoesNotStick(t *testing.T) {
 	dir := t.TempDir()
 	udid := "simpool-test-companion-kill-doesnt-stick"
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 	withDeviceBelongsToSlotFind(t, fakeSlotOwnDevice("Shutdown"))
 
-	origKill := companionKill
-	defer func() { companionKill = origKill }()
-	companionKill = func(int, syscall.Signal) error { return nil } // "sent" but never actually signals anything
+	origKill := residueKill
+	defer func() { residueKill = origKill }()
+	residueKill = func(int, syscall.Signal) error { return nil } // "sent" but never actually signals anything
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if AttemptRecovery(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison) {
 		t.Fatal("AttemptRecovery must not report success when the companion is still alive after the kill attempt")
 	}
 	if syscall.Kill(pid, 0) != nil {
-		t.Fatal("test setup broken: companionKill was stubbed as a no-op, the companion should still be alive")
+		t.Fatal("test setup broken: residueKill was stubbed as a no-op, the companion should still be alive")
 	}
 }
 
 // TestDisownOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling is finding
-// #1 from the seventh adversarial review: disownOrphanedCompanions used to
+// #1 from the seventh adversarial review: disownOrphanedResidue used to
 // re-verify only the per-PID companion-identity condition immediately before
 // killing, not the device-offline condition CheckPoison also verified — the
-// gap AttemptRecovery's own reclaimOrphanedCompanions already closes (see
+// gap AttemptRecovery's own reclaimOrphanedResidue already closes (see
 // TestReclaimOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling above). A
-// hand-built Poison claims PoisonedByOrphanedCompanions as if CheckPoison had
-// determined this earlier, but companionDeviceList reports the device
+// hand-built Poison claims PoisonedByOrphanedResidue as if CheckPoison had
+// determined this earlier, but residueDeviceList reports the device
 // BOOTED at the moment DisownPoisonedSlot actually runs — the production
 // window is not microscopic: reapSlot makes one to three real `xcrun simctl`
 // calls between CheckPoison and this call (see reap.go), seconds on a loaded
@@ -1200,10 +1200,10 @@ func TestDisownOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling(t *testing.
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Booted")) // device is back up NOW
+	withResidueDeviceList(t, fakeDeviceList(udid, "Booted")) // device is back up NOW
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); !errors.Is(err, ErrNotDisownable) {
 		t.Fatalf("DisownPoisonedSlot must refuse when the device is confirmed Booted at the moment of the call, got err=%v", err)
@@ -1217,8 +1217,8 @@ func TestDisownOrphanedCompanions_ReVerifiesDeviceStateBeforeKilling(t *testing.
 }
 
 // TestDisownOrphanedCompanions_StillWorksForTheDeletedDeviceCase proves the
-// fix above does not regress the one case disownOrphanedCompanions exists
-// to cover: companionDeviceOffline returns (true, true) for a UDID absent
+// fix above does not regress the one case disownOrphanedResidue exists
+// to cover: residueDeviceOffline returns (true, true) for a UDID absent
 // from a populated listing — the flagship deleted-device scenario — so the
 // new re-check must let this proceed exactly as before.
 func TestDisownOrphanedCompanions_StillWorksForTheDeletedDeviceCase(t *testing.T) {
@@ -1227,10 +1227,10 @@ func TestDisownOrphanedCompanions_StillWorksForTheDeletedDeviceCase(t *testing.T
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceDeleted())
+	withResidueDeviceList(t, fakeDeviceDeleted())
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); err != nil {
 		t.Fatalf("DisownPoisonedSlot should still reclaim a companion on a genuinely deleted device: %v", err)
@@ -1242,10 +1242,10 @@ func TestDisownOrphanedCompanions_StillWorksForTheDeletedDeviceCase(t *testing.T
 }
 
 // TestDisownOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling is
-// the guard-2 regression test: disownOrphanedCompanions' per-PID
+// the guard-2 regression test: disownOrphanedResidue' per-PID
 // IsIdbCompanionFor re-verify, immediately before killing, must actually
 // refuse when a listed pid is not (or no longer) a genuine idb_companion for
-// this udid — mirrors reclaimOrphanedCompanions' identical guard (see
+// this udid — mirrors reclaimOrphanedResidue' identical guard (see
 // TestReclaimOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling).
 func TestDisownOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *testing.T) {
 	dir := t.TempDir()
@@ -1253,10 +1253,10 @@ func TestDisownOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *te
 	pid, cleanup := spawnLiveConsumerWithToken(t, token) // genuinely NOT idb_companion
 	defer cleanup()
 	waitForLiveConsumer(t, token)
-	withCompanionDeviceList(t, fakeDeviceList(token, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(token, "Shutdown"))
 
 	meta := Meta{UDID: token, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	if err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison); !errors.Is(err, ErrNotDisownable) {
 		t.Fatalf("DisownPoisonedSlot must refuse when a pid is not (or no longer) a genuine idb_companion, got %v", err)
@@ -1267,14 +1267,14 @@ func TestDisownOrphanedCompanions_ReVerifiesCompanionIdentityBeforeKilling(t *te
 }
 
 // TestDisownOrphanedCompanions_ReportsErrorWhenKillDoesNotStick is the
-// guard-3 regression test: disownOrphanedCompanions' post-kill procs.Alive
-// verification must actually gate the returned error — companionKill is
+// guard-3 regression test: disownOrphanedResidue' post-kill procs.Alive
+// verification must actually gate the returned error — residueKill is
 // stubbed to report success without sending anything, so the companion is
 // provably still alive when the post-kill check runs. Without that check,
 // DisownPoisonedSlot would forget the slot's stale device reference while
 // reporting no error, even though the companion it was supposed to kill is
 // still running and will keep re-poisoning this slot's UDID forever (see
-// disownOrphanedCompanions' own doc comment on why forgetting alone is never
+// disownOrphanedResidue' own doc comment on why forgetting alone is never
 // enough here).
 func TestDisownOrphanedCompanions_ReportsErrorWhenKillDoesNotStick(t *testing.T) {
 	dir := t.TempDir()
@@ -1282,14 +1282,14 @@ func TestDisownOrphanedCompanions_ReportsErrorWhenKillDoesNotStick(t *testing.T)
 	pid, cleanup := spawnIdbCompanion(t, udid)
 	defer cleanup()
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 
-	origKill := companionKill
-	defer func() { companionKill = origKill }()
-	companionKill = func(int, syscall.Signal) error { return nil } // "sent" but never actually signals anything
+	origKill := residueKill
+	defer func() { residueKill = origKill }()
+	residueKill = func(int, syscall.Signal) error { return nil } // "sent" but never actually signals anything
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: []int{pid}}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: []int{pid}}
 
 	err := DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison)
 	if err == nil {
@@ -1302,18 +1302,18 @@ func TestDisownOrphanedCompanions_ReportsErrorWhenKillDoesNotStick(t *testing.T)
 		t.Errorf("meta must not be forgotten when the kill could not be confirmed, got %+v", meta)
 	}
 	if syscall.Kill(pid, 0) != nil {
-		t.Fatal("test setup broken: companionKill was stubbed as a no-op, the companion should still be alive")
+		t.Fatal("test setup broken: residueKill was stubbed as a no-op, the companion should still be alive")
 	}
 }
 
 // TestDisownOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors is
-// the guard-4 regression test: disownOrphanedCompanions' attempt-every-PID
+// the guard-4 regression test: disownOrphanedResidue' attempt-every-PID
 // loop has no test protecting it despite a comment claiming it mirrors
-// reclaimOrphanedCompanions' "identical rationale" — mirrors that function's
+// reclaimOrphanedResidue' "identical rationale" — mirrors that function's
 // own regression test
 // (TestReclaimOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors)
 // applied to the disown path: three real companion processes are spawned;
-// companionKill actually kills each one while reporting a fake EPERM for the
+// residueKill actually kills each one while reporting a fake EPERM for the
 // first pid specifically. All three must still end up dead, proving every
 // pid gets a kill attempt regardless of an earlier one's reported error.
 func TestDisownOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *testing.T) {
@@ -1326,13 +1326,13 @@ func TestDisownOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *te
 		pids = append(pids, pid)
 	}
 	waitForLiveConsumer(t, udid)
-	withCompanionDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
 
-	origKill := companionKill
-	defer func() { companionKill = origKill }()
+	origKill := residueKill
+	defer func() { residueKill = origKill }()
 	var attempted []int
 	firstPID := pids[0]
-	companionKill = func(pid int, sig syscall.Signal) error {
+	residueKill = func(pid int, sig syscall.Signal) error {
 		attempted = append(attempted, pid)
 		realErr := procs.Kill(pid, sig) // actually kill it regardless
 		if pid == firstPID {
@@ -1342,7 +1342,7 @@ func TestDisownOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *te
 	}
 
 	meta := Meta{UDID: udid, Mode: "lease"}
-	poison := Poison{Reason: PoisonedByOrphanedCompanions, CompanionEvidence: CompanionTargetNotRunning, CompanionPIDs: pids}
+	poison := Poison{Reason: PoisonedByOrphanedResidue, ResidueEvidence: ResidueTargetNotRunning, ResiduePIDs: pids}
 	_ = DisownPoisonedSlot(testRoot, dir, testSlotN, GroupName(testSlotDev, testSlotOSVer), &meta, poison)
 
 	if len(attempted) != 3 {

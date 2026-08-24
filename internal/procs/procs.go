@@ -312,7 +312,7 @@ const idbCompanionBinary = "idb_companion"
 // infrastructure `idb` respawns transparently the next time anything needs
 // to talk to that device. That is what makes it narrowly, uniquely safe to
 // reclaim once its target is independently confirmed not running — see
-// pool.CheckPoison's PoisonedByOrphanedCompanions — where a generic "this
+// pool.CheckPoison's PoisonedByOrphanedResidue — where a generic "this
 // process looks idle" heuristic would not be: identification here is by
 // exact binary name plus an exact `--udid` flag match, never by a guess
 // about what the process is doing.

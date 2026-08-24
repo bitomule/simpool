@@ -56,7 +56,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	purgeMinutes := fs.Int("purge", 0, "minutes a slot must have been shut down (already cold) before its simulator is deleted outright, reclaiming disk; 0 disables purging")
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
-	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify: for an unverifiable `with` process-group fingerprint (a recycled pid, or a process group owned by another user), forget this slot's identity and delete its device WITHOUT signaling the process, which if actually still alive is left running untouched; for an orphaned idb_companion daemon whose target device is confirmed NOT RUNNING but whose identity as this slot's own could not be confirmed (deleted, or named for something else), KILL the already narrowly-verified companion pid(s) and forget the stale device reference — unlike the first case, forgetting alone would leave it running and re-poisoning this slot forever, since idb_companion never self-terminates. Never a live lease/acquire consumer, a check that merely failed to run, or a companion attached to a device that is still running (that one is reclaimed automatically instead, with the device-identity guard intact — this flag skips that guard, so it must never act without a not-running device behind it). Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
+	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify: for an unverifiable `with` process-group fingerprint (a recycled pid, or a process group owned by another user), forget this slot's identity and delete its device WITHOUT signaling the process, which if actually still alive is left running untouched; for orphaned residue (an idb_companion daemon, or an orphaned `simctl spawn <udid> log stream`) whose target device is confirmed NOT RUNNING but whose identity as this slot's own could not be confirmed (deleted, or named for something else), KILL the already narrowly-verified residue pid(s) and forget the stale device reference — unlike the first case, forgetting alone would leave them running and re-poisoning this slot forever, since neither self-terminates. Never a live lease/acquire consumer, a check that merely failed to run, or residue attached to a device that is still running (that one is reclaimed automatically instead, with the device-identity guard intact — this flag skips that guard, so it must never act without a not-running device behind it). Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
@@ -432,13 +432,13 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			var msg string
 			switch {
 			case poison.Reason == pool.PoisonedByOrphanedResidue && pool.ResidueDeviceVerified(root, filepath.Base(groupDir), n, meta):
-				msg = fmt.Sprintf("SKIP  %s  %s — device confirmed this slot's own; dry-run, would kill %d orphaned idb_companion daemon(s), device itself left untouched", label, poison, len(poison.ResiduePIDs))
+				msg = fmt.Sprintf("SKIP  %s  %s — device confirmed this slot's own; dry-run, would kill %d orphaned idb_companion / simctl log-stream process(es), device itself left untouched", label, poison, len(poison.ResiduePIDs))
 			case poison.Reason == pool.PoisonedByOrphanedResidue:
 				msg = fmt.Sprintf("SKIP  %s  %s — device %s's identity as this slot's own could not be confirmed (deleted, or named for something else); dry-run, recovery would quarantine rather than auto-kill", label, poison, meta.UDID)
 				if disownPoisoned && poison.ResidueDisownable() {
-					msg += fmt.Sprintf("; --disown-poisoned would then kill %d companion pid(s) %v and forget this slot's stale device reference", len(poison.ResiduePIDs), poison.ResiduePIDs)
+					msg += fmt.Sprintf("; --disown-poisoned would then kill %d residue pid(s) %v and forget this slot's stale device reference", len(poison.ResiduePIDs), poison.ResiduePIDs)
 				} else if disownPoisoned {
-					// The companion's target device is still running, so
+					// The residue's target device is still running, so
 					// --disown-poisoned deliberately refuses too: without
 					// deviceBelongsToSlot (which it skips) and without a
 					// confirmed-not-running device, nothing would be left
@@ -460,7 +460,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 			// AttemptRecovery's ConsumerPGID branch) — never for a plain
 			// LiveConsumers-only signal, which for a leased slot is the
 			// healthy case, not an orphan — or for a verified-inert
-			// idb_companion daemon reclaimed regardless of Mode (see
+			// residue process set reclaimed regardless of Mode (see
 			// PoisonedByOrphanedResidue); never for a failed liveness
 			// check either way.
 			if poison.Reason == pool.PoisonedByOrphanedResidue {
@@ -468,7 +468,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 				if poison.ResidueEvidence == pool.ResidueSlotLongIdle {
 					why = fmt.Sprintf("the slot was unheld and unused for over %s and the device stays warm for the next consumer", pool.ResidueIdleGrace)
 				}
-				fmt.Fprintf(stdout, "RECOVER %s  killed %d orphaned idb_companion daemon(s) attached to device %s — device left untouched, %s\n", label, len(poison.ResiduePIDs), meta.UDID, why)
+				fmt.Fprintf(stdout, "RECOVER %s  killed %d orphaned idb_companion / simctl log-stream process(es) attached to device %s — device left untouched, %s\n", label, len(poison.ResiduePIDs), meta.UDID, why)
 			} else {
 				fmt.Fprintf(stdout, "RECOVER %s  reclaimed a verified orphan (device %s, %s) — killed and shut down\n", label, meta.UDID, poison)
 			}
@@ -493,18 +493,18 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		}
 		if disownPoisoned {
 			if poison.Reason == pool.PoisonedByOrphanedResidue {
-				companionPIDs, udid := append([]int(nil), poison.ResiduePIDs...), meta.UDID
+				residuePIDs, udid := append([]int(nil), poison.ResiduePIDs...), meta.UDID
 				if err := pool.DisownPoisonedSlot(root, dir, n, filepath.Base(groupDir), &meta, poison); err != nil {
 					if errors.Is(err, pool.ErrNotDisownable) && !poison.ResidueDisownable() {
 						fmt.Fprintf(stdout, "SKIP  %s  %s — not eligible for --disown-poisoned: that path skips the device-identity guard, so it only ever acts on a device confirmed not running, and %s is still up. Automatic recovery is the path for this one and it already declined, which means device %s could not be confirmed to be this slot's own — fix or clear meta.json's device reference instead of forcing it\n", label, poison, udid, udid)
 					} else if errors.Is(err, pool.ErrNotDisownable) {
-						fmt.Fprintf(stdout, "SKIP  %s  %s — not eligible for --disown-poisoned (a companion pid could not be re-verified against device %s), not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, poison, udid)
+						fmt.Fprintf(stdout, "SKIP  %s  %s — not eligible for --disown-poisoned (a residue pid could not be re-verified against device %s), not touching; the next acquisition (with/acquire/lease) will retry automatically\n", label, poison, udid)
 					} else {
-						fmt.Fprintf(stderr, "reap %s: --disown-poisoned: could not confirm every companion pid was killed: %v\n", label, err)
+						fmt.Fprintf(stderr, "reap %s: --disown-poisoned: could not confirm every residue pid was killed: %v\n", label, err)
 					}
 					return
 				}
-				fmt.Fprintf(stdout, "DISOWN %s  device %s's identity as this slot's own could not be confirmed — killed %d orphaned idb_companion daemon(s) (pids %v) and forgot this slot's stale device reference on your explicit --disown-poisoned request\n", label, udid, len(companionPIDs), companionPIDs)
+				fmt.Fprintf(stdout, "DISOWN %s  device %s's identity as this slot's own could not be confirmed — killed %d orphaned idb_companion / simctl log-stream process(es) (pids %v) and forgot this slot's stale device reference on your explicit --disown-poisoned request\n", label, udid, len(residuePIDs), residuePIDs)
 				return
 			}
 			pgid, udid := meta.ConsumerPGID, meta.UDID
@@ -521,7 +521,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		}
 		if poison.Reason == pool.PoisonedByOrphanedResidue {
 			if poison.ResidueDisownable() {
-				fmt.Fprintf(stdout, "SKIP  %s  %s — device %s's identity as this slot's own could not be confirmed (deleted, or named for something else), not touching; rerun `simpool reap --disown-poisoned` to kill %d companion pid(s) and forget this slot's stale device reference\n", label, poison, meta.UDID, len(poison.ResiduePIDs))
+				fmt.Fprintf(stdout, "SKIP  %s  %s — device %s's identity as this slot's own could not be confirmed (deleted, or named for something else), not touching; rerun `simpool reap --disown-poisoned` to kill %d residue pid(s) and forget this slot's stale device reference\n", label, poison, meta.UDID, len(poison.ResiduePIDs))
 				return
 			}
 			// Running device: --disown-poisoned refuses this shape on

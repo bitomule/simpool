@@ -35,6 +35,11 @@ import (
 // EVERY companion — healthy or orphaned — ends up reparented to init within
 // seconds of being spawned. PPID, age and socket ownership therefore cannot
 // tell a live one from residue. The slot's own state can.
+//
+// That reasoning is specific to idb_companion and does NOT generalise: an
+// orphaned `simctl spawn <udid> log stream` is an ordinary child of whoever
+// ran it, so for THAT class ppid is real evidence and is required on top of
+// the slot state. See procs.IsOrphanedSimctlLogStreamFor.
 
 // longIdleMeta returns a Meta for a warm slot last used well beyond
 // ResidueIdleGrace — the shape the seven production orphans had, at over
@@ -203,13 +208,18 @@ func TestCheckPoison_CompanionOnRunningForeignDevice_NeverTouchedByEitherPath(t 
 }
 
 // TestCheckPoison_NonCompanionAlongsideCompanionOnWarmSlot_NeverReclaimed
-// reproduces the one production slot of the seven that carried MORE than a
-// companion: an orphaned `simctl spawn <udid> ...` (pid 52024, reparented
-// to launchd, the same age as the companion beside it). A slot is only ever
-// narrowly explained by companion residue when EVERY live consumer is a
-// verified companion; one generic process alongside them means the slot
-// stays quarantined, companion and all. That slot is expected to keep
-// FAILing `doctor` after this fix, and correctly so.
+// holds the all-or-nothing rule: a slot is only ever narrowly explained by
+// residue when EVERY live consumer belongs to a verified disposable class
+// (isReclaimableResidue), and one generic process alongside real residue
+// means the slot stays quarantined, companion and all.
+//
+// This test used to stand in for the production slot that carried an
+// orphaned `simctl spawn <udid> log stream` beside its companion, and its
+// comment said that slot was expected to keep FAILing `doctor` forever "and
+// correctly so". It was not: that slot was 1 of 8 lost permanently, with
+// --disown-poisoned refusing it too. That specific shape is now its own
+// residue class — see poison_logstream_test.go. What is left here is the
+// genuinely generic case: a process this codebase can say nothing about.
 func TestCheckPoison_NonCompanionAlongsideCompanionOnWarmSlot_NeverReclaimed(t *testing.T) {
 	dir := t.TempDir()
 	udid := "simpool-test-companion-warm-mixed"

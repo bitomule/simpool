@@ -613,13 +613,14 @@ slot in particular, that is the *healthy* state (a legitimate
 `axe`/`simctl`/MAV session against the leased device, not an orphan).
 `ConsumerPGID` (a process group `simpool with` itself created via
 `Setpgid`) is a kill candidate only when `meta.Mode == "with"`; the one
-other, much narrower exception — a verified-orphaned `idb_companion`
-daemon — is covered on its own just below. A check that itself fails to
+other, much narrower exception — verified-orphaned residue (an
+`idb_companion` daemon, or an orphaned `simctl spawn <udid> log stream`) —
+is covered on its own just below. A check that itself fails to
 complete (e.g. `pgrep` failing to fork under load) is treated the same as
 "still alive" — never as "confirmed free" — and is likewise never a kill
 candidate.
 
-### Poison and recovery: orphaned `idb_companion` daemons
+### Poison and recovery: orphaned residue (`idb_companion`, `simctl … log stream`)
 
 `idb` — MAV's coordinate-tap backend — spawns one `idb_companion --udid
 <udid> --grpc-domain-sock /tmp/idb/<udid>` daemon per simulator on demand,
@@ -655,7 +656,11 @@ the slot it is attached to.
 **either** form of evidence in condition 2:
 
 1. Every live PID matching the UDID is independently verified
-   (`procs.IsIdbCompanionFor`) to be an `idb_companion` binary (not merely
+   (`pool.isReclaimableResidue`) to belong to one of exactly two disposable
+   classes. One PID outside them falls the whole set back to ordinary
+   `PoisonedByLiveConsumers` — never reclaimed.
+
+   **(a) `procs.IsIdbCompanionFor`** — an `idb_companion` binary (not merely
    a process that mentions the UDID somewhere) pinned to this exact UDID
    via its own `--udid` flag (not merely a substring match against the
    command line as a whole — the `--grpc-domain-sock` path also embeds the
@@ -663,9 +668,30 @@ the slot it is attached to.
    on its own; `idb_companion`'s other invocation shape, `--headless
    1 --boot <udid>` with no `--udid` flag at all, is deliberately never
    matched either — it is not the disposable, respawnable infrastructure
-   this whole mechanism is scoped to). One non-companion PID mixed in falls
-   the whole set back to ordinary `PoisonedByLiveConsumers` — never
-   reclaimed.
+   this whole mechanism is scoped to).
+
+   **(b) `procs.IsOrphanedSimctlLogStreamFor`** — an *orphaned* (`ppid 1`)
+   `simctl spawn <udid> log stream …`: MAV's read-only log tail, which the
+   session that started it leaves behind when it dies. Matched by an exact
+   argv shape — `argv[0]` basename `simctl`, then literally `spawn`, the
+   UDID, `log`, `stream` — so `simctl spawn <udid> /bin/sh`, a flag between
+   `spawn` and the UDID, or any other subcommand never matches. `simctl
+   spawn` can run arbitrary code inside the simulator; only this one
+   read-only invocation is in scope.
+
+   Class (b) additionally requires `ppid == 1` — a condition class (a)
+   deliberately does not use, because every companion is reparented to
+   `launchd` within seconds whether it is healthy or not (see below). A
+   `simctl spawn` is an ordinary child of whoever ran it, so a live MAV
+   session's log tail — or a human's `xcrun simctl spawn <udid> log stream`
+   in their own shell — has a live parent and is never touched. It is
+   *additional* evidence, never a substitute for condition 2.
+
+   Class (b) exists because a dead MAV session leaves **two** orphans on a
+   slot, not one: the companion and its log tail, side by side at the same
+   age. Recognising only the companion left exactly those slots permanently
+   poisoned — 1 of 8 on the machine this was measured on — since the rule
+   above needs the *whole* set to be residue.
 2. There is independent evidence that nothing can be *using* those
    companions. Two forms count, each conclusive on its own
    (`pool.ResidueEvidence`):
@@ -987,9 +1013,9 @@ releases the lock on SIGKILL with no cleanup step":
   `--disown-poisoned`-reclaimable; one pinned to a UDID absent from a
   **successful-but-EMPTY** listing is never treated as deleted at all — the
   finding #2 regression test, since an empty listing can mean a degraded
-  CoreSimulator rather than proof of anything; a single non-companion PID
-  sharing the UDID — alone, or mixed in alongside a real companion — is
-  never reclaimed even though the device is Shutdown; an unreadable device
+  CoreSimulator rather than proof of anything; a single PID outside the
+  residue classes sharing the UDID — alone, or mixed in alongside a real
+  companion — is never reclaimed even though the device is Shutdown; an unreadable device
   state is read as "still poisoned", never as "confirmed offline"; the
   device-offline and per-PID companion-identity conditions are re-verified
   immediately before the kill, not trusted from an earlier determination;
@@ -1023,6 +1049,25 @@ releases the lock on SIGKILL with no cleanup step":
   no-early-return kill loops, and the `residueDeviceOffline` err-check —
   was ablation-verified: reverting the corresponding line of `poison.go`
   individually turns the matching test red.
+- `internal/pool/poison_logstream_test.go` covers the second residue class,
+  the orphaned `simctl spawn <udid> log stream`, against real double-forked
+  ppid-1 processes — the shape that left one production slot unreclaimable
+  by every path the companion work added. A companion **plus** its orphaned
+  log tail on a warm, long-idle, identity-confirmed slot is reclaimed as one
+  set in every `meta.Mode`; the log tail alone is too. The refusals are what
+  the class is scoped by: the byte-identical argv with a **live parent** is
+  never touched (a live MAV session's log tail, or a human watching logs),
+  nor is one on a slot used within `ResidueIdleGrace`, nor one whose device
+  cannot be confirmed by name to be this slot's own. All ablation-verified:
+  dropping `IsOrphanedSimctlLogStreamFor` from `isReclaimableResidue` turns
+  the reclaim tests red with `PoisonedByLiveConsumers`, exactly what the
+  real binary reported against the real pids.
+- `internal/procs/logstream_test.go` covers
+  `IsOrphanedSimctlLogStreamFor`/`ParentPID` directly, likewise on real
+  orphaned processes: the exact argv matches, a different UDID does not, a
+  live-parented one does not, and neither does `simctl spawn <udid>
+  /bin/sh`, a flag between `spawn` and the UDID, a different subcommand, or
+  a UDID appearing anywhere in argv other than as the spawn target.
 - `internal/procs/procs_test.go` proves `ProcessStartTime` produces the
   *same* string for the same instant regardless of the calling process's
   ambient `TZ`/`LC_ALL`/`LANG` (`TestProcessStartTime_StableAcrossAmbientLocaleAndTZ`)

@@ -234,7 +234,7 @@ func TestRunDoctor_CatchesMetaCoherentlyPointingAtAnotherGroupsDevice(t *testing
 // renders it, so asserting on that alone would pass even if doctor's
 // message hadn't actually changed — a previous round of this exact feature
 // produced a false negative exactly that way (see reap_test.go's own
-// comment on "companion pid(s)" for the established precedent of pinning to
+// comment on "residue pid(s)" for the established precedent of pinning to
 // branch-unique substrings).
 func TestRunDoctor_FlagsOrphanedCompanionAsNeverAutoReclaimed(t *testing.T) {
 	home := t.TempDir()

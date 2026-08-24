@@ -337,6 +337,98 @@ func IsIdbCompanionFor(pid int, udid string) bool {
 	return false
 }
 
+// simctlBinary is CoreSimulator's own `simctl` — the binary `xcrun simctl`
+// resolves to and execs, so it is what `ps` reports as argv[0] for a
+// `simctl spawn` process (measured on the real orphan this exists for:
+// "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/
+// Resources/bin/simctl spawn <udid> log stream ...").
+const simctlBinary = "simctl"
+
+// IsOrphanedSimctlLogStreamFor reports whether pid is an ORPHANED
+// `simctl spawn <udid> log stream …` process — MAV's own log tail against a
+// simulator, left behind when the session that started it died.
+//
+// This is the second, and so far only other, verified-disposable residue
+// class alongside IsIdbCompanionFor (see pool.PoisonedByOrphanedResidue).
+// It earns that status on the same two grounds a companion does, plus one
+// a companion cannot supply:
+//
+//   - It is not "the thing doing the work": it is a read-only log tail.
+//     `log stream` writes nothing to the device, mutates no state, and
+//     holds nothing but a stdout pipe nobody is reading any more. Losing it
+//     costs a log capture that MAV starts fresh next session, never a test
+//     result.
+//   - It is identified by an EXACT argv shape, never by a guess about what
+//     the process is doing: argv[0]'s basename is exactly "simctl",
+//     argv[1] is exactly "spawn", argv[2] is exactly udid, and argv[3:5] is
+//     exactly ["log", "stream"]. Any variation at all — a flag before the
+//     udid, `simctl spawn <udid> /bin/sh`, the udid appearing anywhere else
+//     — fails to match and stays quarantined. `simctl spawn` can run
+//     arbitrary code inside the simulator; only this one read-only
+//     invocation is in scope.
+//   - It is ORPHANED: ppid == 1, i.e. reparented to launchd because
+//     whatever started it is gone.
+//
+// That last condition is the one the companion path deliberately does NOT
+// use, and the asymmetry is real rather than an oversight. `idb` spawns
+// every companion under preexec_fn=os.setpgrp and exits, so a companion is
+// reparented to launchd within seconds whether it is healthy or residue —
+// ppid tells you nothing there (see pool's warm-slot tests). A
+// `simctl spawn` is an ordinary child of whoever ran it: a live MAV session
+// or a human watching logs in a terminal has a live parent, and only a
+// dead-parent one reaches ppid 1. So here ppid IS evidence, and it is
+// evidence specifically about the case most worth excluding — a human
+// running `xcrun simctl spawn <udid> log stream` by hand against a pool
+// device without holding the slot.
+//
+// It is additional evidence, not a substitute: the caller still requires
+// everything the companion path requires (slot unheld, no live lease,
+// untouched for pool.ResidueIdleGrace, device confirmed by name to be this
+// slot's own). A ppid-1 log stream on a slot someone is actively using is
+// still never touched.
+func IsOrphanedSimctlLogStreamFor(pid int, udid string) bool {
+	if udid == "" {
+		return false
+	}
+	fields := strings.Fields(CommandLine(pid))
+	if len(fields) < 5 {
+		return false
+	}
+	bin := fields[0]
+	if bin != simctlBinary && !strings.HasSuffix(bin, "/"+simctlBinary) {
+		return false
+	}
+	if fields[1] != "spawn" || fields[2] != udid || fields[3] != "log" || fields[4] != "stream" {
+		return false
+	}
+	ppid, err := ParentPID(pid)
+	if err != nil {
+		// Could not read the parent at all — the same fail-safe rule the
+		// rest of this codebase applies: an inability to verify is never
+		// read as "confirmed orphaned".
+		return false
+	}
+	return ppid == 1
+}
+
+// ParentPID returns pid's parent pid. An error means it could not be read
+// (no such process, or `ps` itself failed) — callers must treat that as
+// "cannot verify", never as a parent of any particular value.
+func ParentPID(pid int) (int, error) {
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pid %d", pid)
+	}
+	out, err := exec.Command("/bin/ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, err
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return 0, fmt.Errorf("no such process %d", pid)
+	}
+	return strconv.Atoi(s)
+}
+
 // CommandLine returns the full command line of pid, best-effort ("" if it
 // can't be read, e.g. the process already exited or belongs to another
 // user).

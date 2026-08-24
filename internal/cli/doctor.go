@@ -123,7 +123,7 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// branching) CAN reclaim this one: the device is
 						// independently confirmed, by name, to be this
 						// exact slot's own — reap's next run (or the next
-						// acquisition) will kill the companion daemon(s)
+						// acquisition) will kill the residue process(es)
 						// without any operator action.
 						note("%s: lock is free but its consumer is still alive (device %s, %s) — device confirmed this slot's own; will be reclaimed automatically on the next acquisition or `simpool reap`", label, meta.UDID, poison)
 					case poison.Reason == pool.PoisonedByOrphanedResidue && !poison.ResidueDisownable():
@@ -148,7 +148,7 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// unlucky on this particular run. Point at the one
 						// path that actually can, `--disown-poisoned` — the
 						// same escape hatch `reap`'s own SKIP message names.
-						note("%s: lock is free but its consumer is still alive (device %s, %s) — device's identity as this slot's own could not be confirmed (deleted, or named for something else), so this will NEVER be reclaimed automatically; run `simpool reap --disown-poisoned` to kill the companion pid(s) and forget this slot's stale device reference", label, meta.UDID, poison)
+						note("%s: lock is free but its consumer is still alive (device %s, %s) — device's identity as this slot's own could not be confirmed (deleted, or named for something else), so this will NEVER be reclaimed automatically; run `simpool reap --disown-poisoned` to kill the residue pid(s) and forget this slot's stale device reference", label, meta.UDID, poison)
 					default:
 						// Not necessarily stuck forever: the next
 						// acquisition (with/acquire/lease) or `simpool

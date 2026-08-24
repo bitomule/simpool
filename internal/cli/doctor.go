@@ -118,27 +118,27 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 			if free {
 				if poison := pool.CheckPoison(meta); poison.Poisoned() {
 					switch {
-					case poison.Reason == pool.PoisonedByOrphanedCompanions && pool.CompanionDeviceVerified(root, group, n, meta):
+					case poison.Reason == pool.PoisonedByOrphanedResidue && pool.ResidueDeviceVerified(root, group, n, meta):
 						// The automatic path (see reap.go's identical
 						// branching) CAN reclaim this one: the device is
 						// independently confirmed, by name, to be this
 						// exact slot's own — reap's next run (or the next
-						// acquisition) will kill the companion daemon(s)
+						// acquisition) will kill the residue process(es)
 						// without any operator action.
 						note("%s: lock is free but its consumer is still alive (device %s, %s) — device confirmed this slot's own; will be reclaimed automatically on the next acquisition or `simpool reap`", label, meta.UDID, poison)
-					case poison.Reason == pool.PoisonedByOrphanedCompanions && !poison.CompanionDisownable():
+					case poison.Reason == pool.PoisonedByOrphanedResidue && !poison.ResidueDisownable():
 						// Running device, identity unconfirmed: neither the
 						// automatic path (which needs deviceBelongsToSlot)
 						// nor --disown-poisoned (which needs a device
 						// confirmed not running — see
-						// pool.Poison.CompanionDisownable) can act. Say so
+						// pool.Poison.ResidueDisownable) can act. Say so
 						// rather than sending the operator to a flag that
 						// will refuse.
 						note("%s: lock is free but its consumer is still alive (device %s, %s) — device is running but could not be confirmed to be this slot's own, and `--disown-poisoned` deliberately will not act on a running device either; fix or clear meta.json's device reference for this slot", label, meta.UDID, poison)
-					case poison.Reason == pool.PoisonedByOrphanedCompanions:
+					case poison.Reason == pool.PoisonedByOrphanedResidue:
 						// deviceBelongsToSlot can only ever succeed against a
 						// device that still exists (see
-						// reclaimOrphanedCompanions' own doc comment) — for a
+						// reclaimOrphanedResidue' own doc comment) — for a
 						// deleted device (the real production incident this
 						// whole feature exists to fix) that guard can NEVER
 						// pass, so the generic "will be reclaimed
@@ -148,7 +148,7 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// unlucky on this particular run. Point at the one
 						// path that actually can, `--disown-poisoned` — the
 						// same escape hatch `reap`'s own SKIP message names.
-						note("%s: lock is free but its consumer is still alive (device %s, %s) — device's identity as this slot's own could not be confirmed (deleted, or named for something else), so this will NEVER be reclaimed automatically; run `simpool reap --disown-poisoned` to kill the companion pid(s) and forget this slot's stale device reference", label, meta.UDID, poison)
+						note("%s: lock is free but its consumer is still alive (device %s, %s) — device's identity as this slot's own could not be confirmed (deleted, or named for something else), so this will NEVER be reclaimed automatically; run `simpool reap --disown-poisoned` to kill the residue pid(s) and forget this slot's stale device reference", label, meta.UDID, poison)
 					default:
 						// Not necessarily stuck forever: the next
 						// acquisition (with/acquire/lease) or `simpool

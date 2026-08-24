@@ -612,7 +612,7 @@ func TestReapHeldSlot_NeverKillsAcquireHolder(t *testing.T) {
 // --- Orphaned idb_companion reclaim at the CLI layer (finding #6:
 // observability) ---
 //
-// pool.CheckPoison's device-offline seam (companionDeviceList) is internal
+// pool.CheckPoison's device-offline seam (residueDeviceList) is internal
 // to package pool and not reachable from here, so these tests use the same
 // pattern internal/pool/poison_test.go's own ConsumerPGID tests establish:
 // a synthetic UDID that the REAL `xcrun simctl list devices -j` (read-only,
@@ -620,7 +620,7 @@ func TestReapHeldSlot_NeverKillsAcquireHolder(t *testing.T) {
 // contain. As long as this machine has at least one real device already
 // (true of any dev machine with Xcode installed), that listing is
 // non-empty, which makes a synthetic UDID's absence CONCLUSIVE per
-// companionDeviceOffline's own rule — Shutdown-equivalent for the poison
+// residueDeviceOffline's own rule — Shutdown-equivalent for the poison
 // classification — while deviceBelongsToSlot can never be satisfied (no
 // real device exists under this UDID to name-check), landing every one of
 // these in the "identity unverified" branch. That is exactly the
@@ -721,13 +721,13 @@ func TestReapSlot_SkipsCompanionWithUnverifiableDeviceIdentity(t *testing.T) {
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP an identity-unverifiable companion, not RECOVER it, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
-	// "companion pid(s)" is unique to the companion-specific SKIP message —
+	// "residue pid(s)" is unique to the residue-specific SKIP message —
 	// unlike a bare "--disown-poisoned" substring (present in BOTH the
 	// companion and the generic ConsumerPGID fallback message, since both
 	// mention the flag), this pins the assertion to the actually-companion-
 	// aware branch having run, not merely to any SKIP path at all.
-	if !bytes.Contains(stdout.Bytes(), []byte("companion pid(s)")) {
-		t.Errorf("the SKIP message should be the companion-specific one, pointing at --disown-poisoned to kill the companion pid(s), got:\n%s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("residue pid(s)")) {
+		t.Errorf("the SKIP message should be the residue-specific one, pointing at --disown-poisoned to kill the residue pid(s), got:\n%s", stdout.String())
 	}
 	if syscall.Kill(pid, 0) != nil {
 		t.Fatal("the companion process must still be alive — an unverifiable kill target must never be touched")
@@ -762,10 +762,10 @@ func TestReapSlot_DryRunReportsCompanionWithoutKilling(t *testing.T) {
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("dry-run must report SKIP, never act, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
-	// "companion pid(s)" pins this to the companion-specific dry-run
+	// "residue pid(s)" pins this to the residue-specific dry-run
 	// message, not merely any SKIP output mentioning --disown-poisoned.
-	if !bytes.Contains(stdout.Bytes(), []byte("companion pid(s)")) {
-		t.Errorf("dry-run should preview --disown-poisoned killing the companion pid(s), got:\n%s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("residue pid(s)")) {
+		t.Errorf("dry-run should preview --disown-poisoned killing the residue pid(s), got:\n%s", stdout.String())
 	}
 	if syscall.Kill(pid, 0) != nil {
 		t.Fatal("dry-run must never touch the companion process")

@@ -102,14 +102,24 @@ func AcquireSlots(root, device, osVersion string, count, max int, waitTimeout ti
 		return nil, fmt.Errorf("--max (%d) must be >= --count (%d)", max, count)
 	}
 
-	deadline := time.Now().Add(waitTimeout)
+	start := time.Now()
+	deadline := start.Add(waitTimeout)
 	for {
 		slots, err := tryAcquireSlots(root, device, osVersion, count, max)
 		if !errors.Is(err, ErrAtCapacity) {
 			return slots, err
 		}
 		if waitTimeout <= 0 || time.Now().After(deadline) {
-			return nil, fmt.Errorf("%w: %s has %d slot(s), all busy — retry later or raise --max/%s", ErrAtCapacity, GroupName(device, osVersion), max, EnvMaxSlots)
+			// tryAcquireSlots' own error already names the group, the cap
+			// and — one line per slot — why each individual slot was
+			// refused (see atCapacityError). It used to be replaced here
+			// with a flat "%s has %d slot(s), all busy", which threw that
+			// away and asserted "all busy" about slots that were often
+			// quarantined or leased rather than busy at all.
+			if waitTimeout > 0 {
+				return nil, fmt.Errorf("%w (waited %s)", err, time.Since(start).Round(time.Second))
+			}
+			return nil, err
 		}
 		time.Sleep(acquirePollInterval)
 	}
@@ -143,6 +153,15 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		resident[n] = true
 	}
 
+	// refusals records why each slot this call could not take was refused,
+	// so ErrAtCapacity can name the actual obstacle per slot — see
+	// atCapacityError.
+	var refusals []SlotRefusal
+	refuse := func(n int, av Availability) (bool, error) {
+		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
+		return false, nil
+	}
+
 	take := func(n int) (bool, error) {
 		dir := SlotDir(groupDir, n)
 
@@ -151,36 +170,33 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			return false, err
 		}
 		if lock == nil {
-			return false, nil // busy
+			return refuse(n, Availability{State: SlotBusy})
 		}
 
-		if lease, err := ReadLease(dir); err != nil {
-			// Could not verify whether this slot carries a live lease for
-			// someone else (EMFILE, a permission error, a truncated file)
-			// — never read that as "no lease". Quarantine this slot for
-			// this attempt exactly like the poisoned-unverifiable path
-			// below and try the next candidate instead.
-			lock.Release()
-			return false, nil
-		} else if lease.Alive() {
-			// The flock was free, but the slot is currently reserved by a
-			// `simpool lease` holder (see lease.go) — a lease deliberately
-			// never holds the flock, so `with`/`acquire` must consult
-			// lease.json explicitly or they would silently steal a slot
-			// out from under an active MAV hot-loop session. Safe to check
-			// here, outside the allocation lock: our TryLock above already
-			// succeeded inside it, so no concurrent AcquireLease call can
-			// write a *new* lease for this slot from this point on (its own
-			// claimSlotForLease would see the flock we now hold as busy) —
-			// only a lease written before we got here can possibly be
-			// found, and the allocation lock's ordering guarantees we'd see
-			// it.
-			lock.Release()
-			return false, nil
-		}
-
-		meta := ReadMeta(dir)
-		if poison := CheckPoison(meta); poison.Poisoned() {
+		// The same computation `simpool status` reports and
+		// claimSlotForLease decides by (see SlotState), minus the flock
+		// this call now holds. Two things it decides here that this path
+		// has always had to decide for itself: an unreadable lease.json is
+		// never read as "no lease" (SlotUnverifiable), and a live lease
+		// belonging to someone else reserves the slot even though a lease
+		// deliberately never holds the flock — `with`/`acquire` would
+		// otherwise silently steal a slot out from under an active MAV
+		// hot-loop session. Safe to check outside the allocation lock: our
+		// TryLock above already succeeded inside it, so no concurrent
+		// AcquireLease call can write a *new* lease for this slot from
+		// here on (its own claimSlotForLease would see the flock we hold as
+		// busy) — only a lease written before we got here can be found, and
+		// the allocation lock's ordering guarantees we would see it.
+		//
+		// The key passed is "": `with`/`acquire` hold no lease of their
+		// own, so they never qualify for ownLeaseResidue's same-key
+		// exemption — a slot carrying a lease session's live residue stays
+		// quarantined against them exactly as before.
+		av := slotAvailabilityLocked(dir, "")
+		meta := av.Meta
+		switch av.State {
+		case SlotFree:
+		case SlotQuarantined:
 			// The previous holder died abruptly (SIGKILL to simpool itself,
 			// not its process group — design doc §4's one accepted failure
 			// window) and its consumer may still be running even though the
@@ -194,13 +210,16 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			// leader process (see AttemptRecovery); never based on
 			// LiveConsumers alone, and never when the liveness check itself
 			// failed to complete (PoisonedByCheckFailure).
-			if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, poison) {
+			if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison) {
 				// Couldn't verify identity (or the kill didn't stick, or
 				// the check itself failed) — quarantine exactly as before
 				// this feature existed and skip to the next candidate slot.
 				lock.Release()
-				return false, nil
+				return refuse(n, av)
 			}
+		default:
+			lock.Release()
+			return refuse(n, av)
 		}
 
 		s := &Slot{
@@ -246,7 +265,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		}
 		if len(resident) >= max {
 			release()
-			return nil, ErrAtCapacity
+			return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 		}
 		ok, err := take(next)
 		if err != nil {

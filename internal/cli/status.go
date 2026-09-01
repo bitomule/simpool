@@ -41,29 +41,36 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "GROUP\tSLOT\tLOCK\tHELD BY\tLEASE\tDEVICE STATE\tUDID")
+	fmt.Fprintln(tw, "GROUP\tSLOT\tAVAILABLE\tWHY\tLEASE\tDEVICE STATE\tUDID")
 	for _, groupDir := range groups {
 		group := filepath.Base(groupDir)
 		for _, n := range pool.ListSlotNumbers(groupDir) {
 			dir := pool.SlotDir(groupDir, n)
 			meta := pool.ReadMeta(dir)
 
-			free, err := pool.IsSlotFree(dir)
-			lockCol := "free"
-			heldBy := "-"
-			if err != nil {
-				lockCol = "error"
-			} else if !free {
-				lockCol = "busy"
+			// The same verdict `simpool lease`/`with`/`acquire` reach, not
+			// a second, flock-only opinion of this command's own: a slot
+			// this column called "free" used to be refused by all three of
+			// them for a reason status never showed, and the refusal then
+			// told the caller to come here and look. Keyless ("") — status
+			// speaks for no particular lease key — so a slot only its own
+			// key can still claim is reported as exactly that, in WHY.
+			av := pool.SlotAvailability(dir, "")
+			availableCol := av.State.String()
+			why := av.Detail()
+			if av.State == pool.SlotBusy {
 				if holders, _ := procs.LockHolders(pool.LockPath(dir)); len(holders) > 0 {
 					var parts []string
 					for _, h := range holders {
 						parts = append(parts, fmt.Sprintf("pid %d", h))
 					}
-					heldBy = strings.Join(parts, ", ")
+					why = strings.Join(parts, ", ")
 				} else if meta.OwnerPID != 0 {
-					heldBy = fmt.Sprintf("pid %d (meta, unverified)", meta.OwnerPID)
+					why = fmt.Sprintf("pid %d (meta, unverified)", meta.OwnerPID)
 				}
+			}
+			if why == "" {
+				why = "-"
 			}
 
 			deviceState := "unprovisioned"
@@ -86,7 +93,7 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 
-			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\n", group, n, lockCol, heldBy, leaseCol, deviceState, meta.UDID)
+			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\n", group, n, availableCol, why, leaseCol, deviceState, meta.UDID)
 		}
 	}
 	tw.Flush()

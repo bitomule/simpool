@@ -30,11 +30,21 @@ type Meta struct {
 	LastUsed  time.Time `json:"lastUsed"`
 	OwnerPID  int       `json:"ownerPid"`
 	OwnerCmd  string    `json:"ownerCmd,omitempty"`
-	// Mode is "with" or "acquire" — which subcommand currently holds (or
-	// last held) this slot. `reap` uses it to tell a legitimately
+	// Mode is "with", "acquire" or "lease" — which subcommand currently
+	// holds (or last held) this slot. `reap` uses it to tell a legitimately
 	// child-less holder (`acquire`, which never spawns anything by design)
 	// apart from a `with` whose consumer already exited out from under it.
 	Mode string `json:"mode,omitempty"`
+	// LeaseKey is the sticky key of the `simpool lease` caller that last
+	// held this slot (empty for `with`/`acquire`, which never lease). It
+	// outlives lease.json on purpose: a `simpool release` removes the
+	// lease but not the live processes that key's session left carrying
+	// this slot's UDID, and ownLeaseResidue needs to know whose residue
+	// those are in order to let that same key have its own slot back. Like
+	// every other Meta field it is advisory — it can only ever widen the
+	// quarantine exemption to one named key, never make a slot look free
+	// to a caller that isn't it.
+	LeaseKey string `json:"leaseKey,omitempty"`
 	// ConsumerPGID is the process-group id of the command `simpool with`
 	// launched (which, thanks to Setpgid, always equals that command's own
 	// pid). AcquireSlots and reap use it to tell whether a free-looking

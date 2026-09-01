@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -100,11 +99,13 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 	acquireStart := time.Now()
 	slot, err := pool.AcquireLease(root, lf.device, lf.os, key, lf.ttl, lf.max)
 	if err != nil {
-		if errors.Is(err, pool.ErrAtCapacity) {
-			fmt.Fprintf(stderr, "simpool lease: %v for key %q — every slot is busy or leased elsewhere; run `simpool status` to see who holds them, or raise --max/%s\n", err, key, pool.EnvMaxSlots)
-		} else {
-			fmt.Fprintln(stderr, "simpool lease:", err)
-		}
+		// No "every slot is busy or leased elsewhere" gloss any more, and
+		// no pointing at `simpool status` for an explanation: the error
+		// itself now names, per slot, the reason that slot was refused
+		// (see pool.atCapacityError), and status reports the same verdict
+		// this path computed rather than a flock-only "free" that
+		// contradicted it.
+		fmt.Fprintln(stderr, "simpool lease:", err)
 		return 1
 	}
 	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond))
@@ -155,6 +156,18 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 	released, err := pool.ReleaseLease(root, k)
 	for _, dir := range released {
 		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
+		// Dropping the lease is not the same as making the slot available,
+		// and saying only the first while the caller reads it as the second
+		// is what made this command look like it succeeded without changing
+		// anything: the reported failure that led here was a slot no lease
+		// held at all — it was quarantined by a live process still
+		// referencing its device — so releasing it truthfully reported
+		// success and the next lease was refused identically. Report what
+		// still stands in the way, from the same computation the
+		// acquisition paths use (keyless: what any OTHER caller now sees).
+		if av := pool.SlotAvailability(dir, ""); av.State != pool.SlotFree {
+			fmt.Fprintf(stdout, "  note: the slot is still %s for other callers — %s\n", av.State, av.Detail())
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "simpool release:", err)

@@ -117,7 +117,16 @@ func RunPreboot(args []string, stdout, stderr io.Writer) int {
 	slots, err := pool.AcquireSlots(root, *device, *osVersion, *count, *max, 0)
 	if err != nil {
 		if errors.Is(err, pool.ErrAtCapacity) {
-			fmt.Fprintf(stdout, "preboot: %s already has %d slot(s), all busy or already warm — nothing to do\n", pool.GroupName(*device, *osVersion), *max)
+			// The wrapped error already names the group, the cap and — one
+			// line per slot — why each slot was refused (busy / leased /
+			// quarantined with its reason / unverifiable); see
+			// pool.atCapacityError. It used to be replaced here with "all
+			// busy or already warm", which asserted about every slot the
+			// one thing the enumeration exists to stop claiming: a
+			// quarantined or unverifiable slot is neither busy nor warm.
+			// The exit code stays 0 — preboot never blocks on capacity and
+			// a group already at --max is left exactly as it is.
+			fmt.Fprintf(stdout, "preboot: nothing to do — %v\n", err)
 			return 0
 		}
 		fmt.Fprintln(stderr, "simpool preboot:", err)

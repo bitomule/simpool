@@ -117,6 +117,14 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 
 			if free {
 				if poison := pool.CheckPoison(meta); poison.Poisoned() {
+					// The one shared computation `status` reports from (see
+					// pool.SlotState): doctor is named in that contract as a
+					// consumer of it and must not reach its own, contradicting
+					// verdict about the same slot. Only av.OwnLeaseResidue is
+					// taken from it here — the arms below say things
+					// SlotAvailability deliberately does not model (which of
+					// the residue recovery paths can act on this slot).
+					av := pool.SlotAvailability(dir, "")
 					switch {
 					case poison.Reason == pool.PoisonedByOrphanedResidue && pool.ResidueDeviceVerified(root, group, n, meta):
 						// The automatic path (see reap.go's identical
@@ -149,17 +157,33 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 						// path that actually can, `--disown-poisoned` — the
 						// same escape hatch `reap`'s own SKIP message names.
 						note("%s: lock is free but its consumer is still alive (device %s, %s) — device's identity as this slot's own could not be confirmed (deleted, or named for something else), so this will NEVER be reclaimed automatically; run `simpool reap --disown-poisoned` to kill the residue pid(s) and forget this slot's stale device reference", label, meta.UDID, poison)
-					default:
-						// Not necessarily stuck forever: the next
-						// acquisition (with/acquire/lease) or `simpool
-						// reap` will reclaim this automatically if the old
-						// consumer's identity can still be verified (see
-						// pool.AttemptRecovery) — but that isn't guaranteed
-						// (an unverifiable fingerprint, a kill that doesn't
-						// stick, or a check that itself failed all leave it
-						// quarantined), so this is still worth flagging
-						// either way.
+					case av.OwnLeaseResidue:
+						// Quarantined against everyone EXCEPT the key whose
+						// own previous lease session left these processes
+						// behind — the exemption pool.ownLeaseResidue exists
+						// for. Reporting this as a slot awaiting automatic
+						// reclaim was doctor contradicting `status` (which
+						// names the key) about the one slot the exemption
+						// targets, and pointing at a recovery path that
+						// cannot fire: pool.AttemptRecovery declines every
+						// non-"with" slot outright.
+						note("%s: lock is free but its consumer is still alive (device %s) — %s; no reclaim is needed or will happen automatically", label, meta.UDID, av.Detail())
+					case meta.Mode == "with" && poison.Reason == pool.PoisonedByConsumerPGID:
+						// The ONLY combination pool.AttemptRecovery's
+						// ConsumerPGID branch can act on: a `with`-launched
+						// process group simpool itself spawned. Even here it
+						// isn't guaranteed (an unverifiable fingerprint or a
+						// kill that doesn't stick leaves it quarantined), so
+						// it is still worth flagging.
 						note("%s: lock is free but its consumer is still alive (device %s, %s) — will be reclaimed automatically on the next acquisition or `simpool reap` if its identity can still be verified", label, meta.UDID, poison)
+					default:
+						// Everything else — a non-"with" slot, or a `with`
+						// slot poisoned by LiveConsumers or by a check that
+						// failed — is refused by pool.AttemptRecovery before
+						// identity is ever considered, so promising
+						// eventual automatic reclaim here would be false for
+						// every one of them.
+						note("%s: lock is free but its consumer is still alive (device %s, %s) — nothing reclaims this automatically (only a `with`-mode slot poisoned by its own process group is ever recovered); it stays quarantined until whatever still holds the device exits", label, meta.UDID, poison)
 					}
 				}
 				continue

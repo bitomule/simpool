@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bitomule/simpool/internal/procs"
+	"github.com/bitomule/simpool/internal/simctl"
 )
 
 // leaseResidueFixture builds the exact situation reported from a MAV hot
@@ -291,5 +292,153 @@ func TestAcquireSlots_NeverExemptsLeaseResidue(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), SlotQuarantined.String()) {
 		t.Errorf("the refusal should name the quarantine rather than assert \"all busy\", got:\n%s", err)
+	}
+}
+
+// TestAcquireLease_ReclaimsOrphanedResidueOnOwnKeyReLease is CORR-1's
+// regression test: a slot last held in lease mode by key, poisoned by
+// PoisonedByOrphanedResidue (its device is confirmed Shutdown — evidence
+// ResidueTargetNotRunning, so it is a kill candidate per that reason's own
+// doc comment), must have that residue actually reclaimed when the OWNING
+// key re-leases it — not merely be exempted from quarantine while the
+// orphaned idb_companion is left running underneath the next consumer.
+//
+// Before the CORR-1 fix, claimSlotForLease's `case SlotFree:` arm never
+// called AttemptRecovery for this reason (only for the never-recoverable
+// PoisonedByLiveConsumers was skipping ever correct), so the lease would
+// succeed but the companion pid would still be alive.
+func TestAcquireLease_ReclaimsOrphanedResidueOnOwnKeyReLease(t *testing.T) {
+	root := t.TempDir()
+	const key = "boxy-orphan-residue-key"
+	const device = "TestDevice"
+	const osVersion = "1.0"
+	udid := "simpool-test-udid-orphan-residue-release"
+
+	groupDir := GroupDir(root, device, osVersion)
+	dir := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// LastUsed is recent, not long-idle: the evidence for
+	// PoisonedByOrphanedResidue here is the device being Shutdown
+	// (ResidueTargetNotRunning), which is independent of idle time (see
+	// allReclaimableResidue) — and a recent LastUsed is what CORR-2's
+	// recency bound on ownLeaseResidue's Meta.LeaseKey fallback requires
+	// for the exemption to apply at all once lease.json is gone.
+	if err := WriteMeta(dir, Meta{
+		UDID:     udid,
+		Mode:     "lease",
+		LeaseKey: key,
+		LastUsed: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pid, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForLiveConsumer(t, udid)
+	withResidueDeviceList(t, fakeDeviceList(udid, "Shutdown"))
+	ownDeviceName := DeviceNameForGroup(root, GroupName(device, osVersion), 0)
+	withDeviceBelongsToSlotFind(t, func(string) (simctl.DeviceEntry, bool, error) {
+		return simctl.DeviceEntry{Name: ownDeviceName, State: "Shutdown"}, true, nil
+	})
+
+	slot, err := AcquireLease(root, device, osVersion, key, time.Hour, 1)
+	if err != nil {
+		t.Fatalf("re-leasing a key's own orphaned-residue slot: want success, got %v", err)
+	}
+	if slot.Dir != dir {
+		t.Fatalf("expected the key's own slot-0 back, got %s", slot.Dir)
+	}
+	lease, err := ReadLease(slot.Dir)
+	if err != nil {
+		t.Fatalf("reading the renewed lease: %v", err)
+	}
+	if lease.Key != key || !lease.Alive() {
+		t.Fatalf("expected a live lease for %q, got %+v", key, lease)
+	}
+	waitForDead(t, pid)
+}
+
+// TestOwnLeaseResidue_MetaLeaseKeyFallback_BoundedByRecency is CORR-2's
+// regression test: once lease.json is gone, Meta.LeaseKey is the only
+// attribution left, and it is written once at provisioning time and never
+// cleared or aged — so trusting it forever would let a stale value
+// attribute an out-of-protocol consumer's live processes (a human driving
+// the same still-booted simulator by hand) to whichever key happened to
+// provision the slot long ago. The fallback must only be trusted while the
+// slot is fresh.
+func TestOwnLeaseResidue_MetaLeaseKeyFallback_BoundedByRecency(t *testing.T) {
+	const key = "repo-a"
+	meta := Meta{Mode: "lease", LeaseKey: key, UDID: "u", LastUsed: time.Now().Add(-24 * time.Hour)}
+	poison := Poison{Reason: PoisonedByLiveConsumers}
+
+	if ownLeaseResidue(meta, Lease{}, poison, key) {
+		t.Fatal("a stale Meta.LeaseKey (LastUsed 24h ago, no lease.json) must not be trusted as attribution")
+	}
+
+	fresh := meta
+	fresh.LastUsed = time.Now().Add(-5 * time.Minute)
+	if !ownLeaseResidue(fresh, Lease{}, poison, key) {
+		t.Fatal("a recent Meta.LeaseKey (LastUsed 5m ago) must still be trusted — this is the mid-build gap the exemption exists to cover")
+	}
+
+	zero := meta
+	zero.LastUsed = time.Time{}
+	if ownLeaseResidue(zero, Lease{}, poison, key) {
+		t.Fatal("a zero LastUsed must fail closed, not be read as infinitely fresh")
+	}
+}
+
+// TestAcquireSlots_AtCapacityMessage_AccountsForSlotsTakenThenReleased is
+// sm-2's regression test: with count=2, max=2, one resident slot free and
+// the other unrecoverably quarantined, the free slot IS taken by take()
+// before the group is found to be one short of count — and then given back
+// by release(). The error must still account for it, or the enumeration
+// silently lists fewer slots than the max the same sentence names.
+func TestAcquireSlots_AtCapacityMessage_AccountsForSlotsTakenThenReleased(t *testing.T) {
+	root := t.TempDir()
+	const device = "TestDevice"
+	const osVersion = "1.0"
+	groupDir := GroupDir(root, device, osVersion)
+
+	// slot-0: free, nothing standing between it and a new consumer.
+	dir0 := SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir0, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteMeta(dir0, Meta{LastUsed: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// slot-1: quarantined by a live with-spawned process group whose
+	// recorded ConsumerStartedAt fingerprint is bogus, so
+	// VerifyConsumerIdentity can never match it and AttemptRecovery can
+	// never reclaim it (see PoisonedByConsumerPGID's non-exempt handling).
+	dir1 := SlotDir(groupDir, 1)
+	if err := os.MkdirAll(dir1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pgid, cleanup := spawnRealOrphan(t)
+	defer cleanup()
+	if err := WriteMeta(dir1, Meta{
+		UDID:              "simpool-test-udid-capacity-message-taken-then-released",
+		Mode:              "with",
+		ConsumerPGID:      pgid,
+		ConsumerStartedAt: "not a real timestamp, so identity can never verify",
+		LastUsed:          time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := AcquireSlots(root, device, osVersion, 2, 2, 0)
+	if !errors.Is(err, ErrAtCapacity) {
+		t.Fatalf("count=2 max=2 with one free and one unrecoverably quarantined slot: want ErrAtCapacity, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "slot-0: taken by this call, released when the group came up short") {
+		t.Fatalf("expected the message to account for slot-0 (taken by this call, then released), got:\n%s", err)
+	}
+	if !strings.Contains(err.Error(), "slot-1:") {
+		t.Fatalf("expected the message to still name slot-1's refusal, got:\n%s", err)
 	}
 }

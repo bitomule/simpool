@@ -264,6 +264,15 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			next++
 		}
 		if len(resident) >= max {
+			// Every slot this call already claimed is about to be given
+			// back by release() below, purely because acquisition is
+			// all-or-nothing and the group came up short of count — that
+			// is not a refusal, but atCapacityError's enumeration must
+			// still account for it, or it silently lists fewer slots than
+			// the max it names in the same sentence (see SlotRefusal).
+			for _, s := range acquired {
+				refusals = append(refusals, SlotRefusal{Number: s.Number, TakenThenReleased: true})
+			}
 			release()
 			return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 		}

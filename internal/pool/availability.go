@@ -3,6 +3,7 @@ package pool
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // SlotState is the single verdict on whether a slot can be handed to a new
@@ -224,6 +225,13 @@ func slotAvailabilityLocked(dir, forKey string) Availability {
 type SlotRefusal struct {
 	Number       int
 	Availability Availability
+	// TakenThenReleased is true for a slot this call actually claimed
+	// before giving it back because acquisition is all-or-nothing and the
+	// group came up short of count before reaching max. It is not a
+	// refusal — take() succeeded on it — but atCapacityError still needs
+	// to list it, or the enumeration would silently name fewer slots than
+	// the max the same sentence claims the group is at.
+	TakenThenReleased bool
 }
 
 // atCapacityError is the single failure both acquisition paths return when
@@ -246,10 +254,18 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 	if forKey != "" {
 		fmt.Fprintf(&b, " and none of them can be handed to key %q", forKey)
 	} else {
-		b.WriteString(" and none of them can be handed out")
+		// True on both the all-refused path and the partial-success path
+		// (some slots below were taken by this same call, then released
+		// because acquisition is all-or-nothing): either way, the group
+		// cannot fill the request as it stands.
+		b.WriteString(" and cannot fill the request")
 	}
 	b.WriteString(":")
 	for _, r := range refusals {
+		if r.TakenThenReleased {
+			fmt.Fprintf(&b, "\n  slot-%d: taken by this call, released when the group came up short", r.Number)
+			continue
+		}
 		fmt.Fprintf(&b, "\n  slot-%d: %s", r.Number, r.Availability.State)
 		if detail := r.Availability.Detail(); detail != "" {
 			fmt.Fprintf(&b, " — %s", detail)
@@ -259,6 +275,27 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 	return fmt.Errorf("%w: %s", ErrAtCapacity, b.String())
 }
 
+// ownLeaseResidue decides whether residue found on a lease-mode slot may be
+// treated as the SAME key's own leftovers rather than a genuinely different
+// consumer's. What it cannot do — and must not be read as guaranteeing — is
+// put two DIFFERENT consumers on one simulator, but that guarantee only
+// holds while the attribution evidence is trustworthy.
+//
+// Two different sources of attribution, with two different trust levels.
+// When lease.json is still present (even expired), lease.Key names the
+// holder directly — that is live evidence, unbounded in time. When
+// lease.json is gone, the only signal left is Meta.LeaseKey, which is
+// written once at provisioning time (see ensureProvisioned) and never
+// cleared or aged by ReleaseLease/CleanupExpiredLease — it is deliberately
+// left in place as a paper trail. Trusting it forever would let a stale
+// value attribute a slot's residue to a key that provisioned it long ago,
+// even if an out-of-protocol consumer (a human in Simulator.app, a raw
+// `xcrun simctl`/`axe` invocation) has been driving the same still-booted
+// device since. So the fallback is only trusted while the slot is fresh —
+// bounded by ResidueIdleGrace, the same threshold this package already
+// uses elsewhere for "simpool has not touched this slot in a while" — and,
+// like residueSlotLongIdle, a zero LastUsed fails closed rather than
+// reading as infinitely idle.
 func ownLeaseResidue(meta Meta, lease Lease, poison Poison, forKey string) bool {
 	if forKey == "" || meta.Mode != "lease" {
 		return false
@@ -271,5 +308,5 @@ func ownLeaseResidue(meta Meta, lease Lease, poison Poison, forKey string) bool 
 	if lease.Key != "" {
 		return lease.Key == forKey
 	}
-	return meta.LeaseKey == forKey
+	return meta.LeaseKey == forKey && !meta.LastUsed.IsZero() && time.Since(meta.LastUsed) < ResidueIdleGrace
 }

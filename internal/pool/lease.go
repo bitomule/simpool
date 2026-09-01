@@ -276,8 +276,22 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 	switch av.State {
 	case SlotFree:
 		// Includes the case where av.Poison is non-empty but is this key's
-		// own lease residue (av.OwnLeaseResidue) — nothing to recover, and
-		// nothing there was ever a kill candidate anyway.
+		// own lease residue (av.OwnLeaseResidue). ownLeaseResidue exempts
+		// two reasons from quarantine: PoisonedByLiveConsumers, which has
+		// no recovery path at all (never a kill candidate), and
+		// PoisonedByOrphanedResidue, which IS a kill candidate — its own
+		// doc comment says so regardless of Meta.Mode. Exempting the
+		// latter from quarantine must not also exempt it from
+		// reclamation, or the owning key's own idb_companion / log-stream
+		// residue is never killed on this path. AttemptRecovery returning
+		// false here (e.g. the device was deleted, so identity can't be
+		// verified) only means the residue couldn't be reclaimed — the
+		// owning key still gets its slot back either way, exactly as
+		// before this call was added.
+		if av.OwnLeaseResidue && av.Poison.Reason == PoisonedByOrphanedResidue {
+			meta := av.Meta
+			_ = AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison)
+		}
 	case SlotQuarantined:
 		meta := av.Meta
 		if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison) {

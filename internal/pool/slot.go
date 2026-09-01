@@ -117,7 +117,11 @@ func AcquireSlots(root, device, osVersion string, count, max int, waitTimeout ti
 			// away and asserted "all busy" about slots that were often
 			// quarantined or leased rather than busy at all.
 			if waitTimeout > 0 {
-				return nil, fmt.Errorf("%w (waited %s)", err, time.Since(start).Round(time.Second))
+				// On its own line, not appended to the message's closing
+				// advice sentence: that message is multi-line now, and a
+				// trailing "(waited 30s)" read as if waiting were part of
+				// the remediation rather than what this call just did.
+				return nil, fmt.Errorf("%w\ngave up after waiting %s", err, time.Since(start).Round(time.Second))
 			}
 			return nil, err
 		}

@@ -360,33 +360,41 @@ func TestAcquireLease_ReclaimsOrphanedResidueOnOwnKeyReLease(t *testing.T) {
 	waitForDead(t, pid)
 }
 
-// TestOwnLeaseResidue_MetaLeaseKeyFallback_BoundedByRecency is CORR-2's
-// regression test: once lease.json is gone, Meta.LeaseKey is the only
-// attribution left, and it is written once at provisioning time and never
-// cleared or aged — so trusting it forever would let a stale value
-// attribute an out-of-protocol consumer's live processes (a human driving
-// the same still-booted simulator by hand) to whichever key happened to
-// provision the slot long ago. The fallback must only be trusted while the
-// slot is fresh.
-func TestOwnLeaseResidue_MetaLeaseKeyFallback_BoundedByRecency(t *testing.T) {
-	const key = "repo-a"
-	meta := Meta{Mode: "lease", LeaseKey: key, UDID: "u", LastUsed: time.Now().Add(-24 * time.Hour)}
-	poison := Poison{Reason: PoisonedByLiveConsumers}
+// TestAcquireLease_OwnResidueIsNotAnAbsorbingState pins the property a
+// recency bound on the Meta.LeaseKey fallback would have broken, and which
+// nothing else in this file covers: a key that released its slot and comes
+// back after a LONG gap must still get it back.
+//
+// It is not a hypothetical. Meta.LastUsed has exactly one writer,
+// EnsureProvisioned, which `simpool lease` only reaches once AcquireLease
+// has already succeeded — so any staleness bound on this fallback is
+// self-sealing: the refused key can never make its slot fresh again, and
+// with --max 1 there is no other slot and no in-tool escape (`reap` never
+// kills a LiveConsumers set, `--disown-poisoned` rejects the reason). The
+// old lockout would simply come back for every overnight gap.
+func TestAcquireLease_OwnResidueIsNotAnAbsorbingState(t *testing.T) {
+	root := t.TempDir()
+	const key = "boxy-screenshots-ipad"
+	dir := leaseResidueFixture(t, root, key, "simpool-test-udid-not-absorbing")
 
-	if ownLeaseResidue(meta, Lease{}, poison, key) {
-		t.Fatal("a stale Meta.LeaseKey (LastUsed 24h ago, no lease.json) must not be trusted as attribution")
+	// The state after `simpool release` plus a long night: no lease.json,
+	// Meta.LeaseKey the only attribution left, and the slot untouched for
+	// far longer than any idle grace in this package.
+	if err := RemoveLease(dir); err != nil {
+		t.Fatal(err)
+	}
+	meta := ReadMeta(dir)
+	meta.LastUsed = time.Now().Add(-24 * time.Hour)
+	if err := WriteMeta(dir, meta); err != nil {
+		t.Fatal(err)
 	}
 
-	fresh := meta
-	fresh.LastUsed = time.Now().Add(-5 * time.Minute)
-	if !ownLeaseResidue(fresh, Lease{}, poison, key) {
-		t.Fatal("a recent Meta.LeaseKey (LastUsed 5m ago) must still be trusted — this is the mid-build gap the exemption exists to cover")
+	slot, err := AcquireLease(root, "TestDevice", "1.0", key, time.Hour, 1)
+	if err != nil {
+		t.Fatalf("a key returning to its own slot after a 24h gap at --max 1: want success, got %v", err)
 	}
-
-	zero := meta
-	zero.LastUsed = time.Time{}
-	if ownLeaseResidue(zero, Lease{}, poison, key) {
-		t.Fatal("a zero LastUsed must fail closed, not be read as infinitely fresh")
+	if slot.Dir != dir {
+		t.Fatalf("expected the key's own slot-0 back, got %s", slot.Dir)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -105,14 +106,53 @@ func TestRunStatus_ReportsAPlainlyFreeSlotAsFree(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A UDID, so CheckPoison actually runs its liveness check instead of
+	// returning at its `meta.UDID == ""` guard: an empty slot directory
+	// would exercise none of the path this test claims to guard, and would
+	// go on passing however broken that path became.
+	if err := pool.WriteMeta(dir, pool.Meta{
+		UDID:     "simpool-test-udid-nothing-alive-against-it",
+		Mode:     "lease",
+		LeaseKey: "some-key",
+		LastUsed: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := RunStatus(nil, &stdout, &stderr); code != 0 {
 		t.Fatalf("status: want exit 0, got %d, stderr:\n%s", code, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("free")) {
-		t.Errorf("an unheld, unpoisoned slot must report free, got:\n%s", stdout.String())
+	// On the slot's own row and in the AVAILABLE cell, not anywhere in the
+	// output: "free" appears in enough prose that a whole-output substring
+	// check would pass with the column saying something else entirely.
+	fields := slotRowFields(t, stdout.String(), "slot-0")
+	if fields[2] != "free" {
+		t.Errorf("AVAILABLE for an unheld, unpoisoned slot: want free, got %q (row: %v)", fields[2], fields)
 	}
+	if fields[3] != "-" {
+		t.Errorf("WHY for a free slot should be empty, got %q", fields[3])
+	}
+}
+
+// slotRowFields returns the whitespace-separated cells of the status row
+// for slot, so a test can assert on one column instead of on the whole
+// output. Only usable for rows whose cells are single tokens — which is
+// why the callers that check a multi-word WHY use substring matching on
+// the row instead.
+func slotRowFields(t *testing.T, out, slot string) []string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, slot+" ") || strings.HasSuffix(line, slot) {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				t.Fatalf("status row for %s has too few columns: %q", slot, line)
+			}
+			return fields
+		}
+	}
+	t.Fatalf("no status row for %s in:\n%s", slot, out)
+	return nil
 }
 
 // TestRunLease_RefusalNamesTheRealObstacle proves the refusal a caller

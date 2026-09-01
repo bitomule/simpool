@@ -3,7 +3,6 @@ package pool
 import (
 	"fmt"
 	"strings"
-	"time"
 )
 
 // SlotState is the single verdict on whether a slot can be handed to a new
@@ -81,17 +80,27 @@ type Availability struct {
 }
 
 // Detail is a one-line, human-readable explanation of State, suitable for
-// a `status` column or a line in `lease`'s refusal message. Empty for a
-// plainly free slot.
+// a `status` column or a line in `lease`'s refusal message.
+//
+// Empty for SlotFree, including the keyed view of a slot carrying that
+// key's own exempted residue: there is no caller for that string. `status`
+// and `release` both ask keyless (a keyless view of such a slot is
+// SlotQuarantined, which does carry the explanation), and the one path
+// that has the keyed verdict in hand — claimSlotForLease — is the hot loop
+// mav calls once per action, which must not spend a `pgrep` on printing an
+// explanation nobody asked for. Adding the string back means adding the
+// caller that prints it, not the other way round.
 func (a Availability) Detail() string {
 	switch a.State {
 	case SlotFree:
-		if a.OwnLeaseResidue {
-			return fmt.Sprintf("residue of its own lease key %q (%s)", a.leaseOwner(), a.Poison)
-		}
 		return ""
 	case SlotBusy:
-		return "flock held by a live `with`/`acquire`"
+		// Deliberately not "held by `with`/`acquire`": those are the usual
+		// holders, but `reap` and `preboot` take the same flock too, and
+		// naming only two of them sends a reader looking for a consumer
+		// that was never there. Callers with a way to identify the holder
+		// (status, via procs.LockHolders) print that instead of this.
+		return "its flock is held"
 	case SlotLeased:
 		return fmt.Sprintf("leased by %q", a.Lease.Key)
 	case SlotQuarantined:
@@ -281,21 +290,29 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 // put two DIFFERENT consumers on one simulator, but that guarantee only
 // holds while the attribution evidence is trustworthy.
 //
-// Two different sources of attribution, with two different trust levels.
-// When lease.json is still present (even expired), lease.Key names the
-// holder directly — that is live evidence, unbounded in time. When
-// lease.json is gone, the only signal left is Meta.LeaseKey, which is
-// written once at provisioning time (see ensureProvisioned) and never
-// cleared or aged by ReleaseLease/CleanupExpiredLease — it is deliberately
-// left in place as a paper trail. Trusting it forever would let a stale
-// value attribute a slot's residue to a key that provisioned it long ago,
-// even if an out-of-protocol consumer (a human in Simulator.app, a raw
-// `xcrun simctl`/`axe` invocation) has been driving the same still-booted
-// device since. So the fallback is only trusted while the slot is fresh —
-// bounded by ResidueIdleGrace, the same threshold this package already
-// uses elsewhere for "simpool has not touched this slot in a while" — and,
-// like residueSlotLongIdle, a zero LastUsed fails closed rather than
-// reading as infinitely idle.
+// Two sources of attribution, both deliberately unbounded in time: the
+// lease this slot still carries (expired or not), and — once `simpool
+// release` or reap's CleanupExpiredLease has removed lease.json —
+// Meta.LeaseKey, which is written at provisioning time (see
+// ensureProvisioned) and never cleared, precisely so it can answer this
+// question afterwards.
+//
+// A recency bound on the Meta.LeaseKey half was tried and reverted, and
+// the reason is worth keeping: Meta.LastUsed is advanced by exactly one
+// writer, EnsureProvisioned, which `simpool lease` only reaches AFTER
+// AcquireLease has already succeeded. So a key that releases its slot and
+// comes back after a longer gap than the bound is refused, its LastUsed
+// can never advance (its only writer sits behind the claim that just
+// failed), and with --max 1 the slot is refused forever with no in-tool
+// escape — `reap` never kills a LiveConsumers set and DisownPoisonedSlot
+// rejects the reason outright. That is an absorbing state, and it is
+// exactly the dead end this predicate exists to remove, reintroduced for
+// every inter-session gap. The bound also did not close the hole it was
+// aimed at (a human driving the same still-booted device by hand): a
+// nine-day-old expired lease.json is just as weak a paper trail as
+// Meta.LeaseKey, and that branch was left unbounded — so the outcome hung
+// on whether the user had followed the protocol and released, punishing
+// exactly the caller who did.
 func ownLeaseResidue(meta Meta, lease Lease, poison Poison, forKey string) bool {
 	if forKey == "" || meta.Mode != "lease" {
 		return false
@@ -308,5 +325,5 @@ func ownLeaseResidue(meta Meta, lease Lease, poison Poison, forKey string) bool 
 	if lease.Key != "" {
 		return lease.Key == forKey
 	}
-	return meta.LeaseKey == forKey && !meta.LastUsed.IsZero() && time.Since(meta.LastUsed) < ResidueIdleGrace
+	return meta.LeaseKey == forKey
 }

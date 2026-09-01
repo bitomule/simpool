@@ -184,3 +184,74 @@ func TestRunDoctor_NeverPromisesAutoReclaimForUnrecoverablePoison(t *testing.T) 
 		t.Errorf("doctor should say plainly that nothing reclaims this slot, got:\n%s", stdout.String())
 	}
 }
+
+// TestRunDoctor_OwnLeaseKeyOrphanedResidueMatchesStatus is CORR-R3-1's
+// regression test: pool.ownLeaseResidue exempts BOTH consumer-residue
+// reasons, but doctor consulted its three PoisonedByOrphanedResidue arms
+// BEFORE av.OwnLeaseResidue, so an own-lease-key slot whose residue
+// classifies as orphaned (a genuine idb_companion pinned to this slot's
+// UDID) with an unverifiable device was sent to manual surgery — "will
+// NEVER be reclaimed automatically; run `simpool reap --disown-poisoned`
+// to kill the residue pid(s)" — about a slot claimSlotForLease hands
+// straight back to the owning key on its next `simpool lease` (its own
+// comment says so even when AttemptRecovery returns false). `status`
+// (Availability.Detail) names the key and says it can still claim the
+// slot; doctor must not contradict that with a false operator directive.
+//
+// The residue process is a compiled fake idb_companion (argv shape the
+// real IsIdbCompanionFor matches), the slot is long-idle so the
+// OrphanedResidue classification holds regardless of the machine's device
+// listing, and lease.json is still present (expired) so the attribution
+// is the direct lease.Key evidence — the synthetic UDID exists in no real
+// device set, which is exactly the deleted-device case where
+// pool.ResidueDeviceVerified can never pass.
+func TestRunDoctor_OwnLeaseKeyOrphanedResidueMatchesStatus(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	const key = "hot-repo-lease-key-orphaned"
+	groupDir := pool.GroupDir(home, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	udid := "simpool-test-udid-doctor-own-lease-orphaned-residue"
+	if err := pool.WriteMeta(dir, pool.Meta{
+		UDID:     udid,
+		Mode:     "lease",
+		LeaseKey: key,
+		LastUsed: time.Now().Add(-2 * pool.ResidueIdleGrace),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(dir, pool.Lease{Key: key, ExpiresAt: time.Now().Add(-time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	_, cleanup := spawnIdbCompanion(t, udid)
+	defer cleanup()
+	waitForCompanionLiveConsumer(t, udid)
+
+	av := pool.SlotAvailability(dir, "")
+	if !av.OwnLeaseResidue || av.Poison.Reason != pool.PoisonedByOrphanedResidue {
+		t.Fatalf("test setup broken: this slot must be own-lease residue classified as orphaned, got state=%v poison=%v ownLeaseResidue=%v", av.State, av.Poison, av.OwnLeaseResidue)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunDoctor(nil, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("doctor should still flag a slot carrying live residue, got exit 0:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	doctorOut := stdout.String()
+	if !bytes.Contains(stdout.Bytes(), []byte(key)) {
+		t.Errorf("doctor must name the one lease key that can still claim this slot, got:\n%s", doctorOut)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("can still claim it")) {
+		t.Errorf("doctor must agree with status that the owning key can still claim this slot, got:\n%s", doctorOut)
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("NEVER be reclaimed automatically")) {
+		t.Errorf("doctor must not declare an own-lease-key slot permanently unreclaimable, got:\n%s", doctorOut)
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("disown-poisoned")) {
+		t.Errorf("doctor must not send the operator to `reap --disown-poisoned` for a slot the owning key's next lease resolves, got:\n%s", doctorOut)
+	}
+}

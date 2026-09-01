@@ -270,3 +270,70 @@ func TestRunDoctor_FlagsOrphanedCompanionAsNeverAutoReclaimed(t *testing.T) {
 		t.Fatal("doctor is read-only — the companion process must never be touched")
 	}
 }
+
+// TestRunDoctor_ActivelyLeasedSlotIsHealthy is SM-R3-1's regression test:
+// a slot held by a LIVE lease whose session's own tools carry the UDID in
+// their argv (`simctl spawn <udid> log stream`, `axe --udid`, the booted
+// app — the exact workload pool.ownLeaseResidue's doc describes) is the
+// healthy steady state. Its flock is free (a lease holds no flock) and
+// pool.CheckPoison — which never reads lease.json — reports
+// PoisonedByLiveConsumers, so before this fix doctor fell through to the
+// default arm and announced the slot "stays quarantined" with exit 1,
+// while pool.SlotAvailability for the very same slot said SlotLeased —
+// the exact status contradiction 8b4ebf0 claims to remove. Doctor must
+// consult av.State first and treat a leased slot as healthy.
+func TestRunDoctor_ActivelyLeasedSlotIsHealthy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	groupDir := pool.GroupDir(home, "TestDevice", "1.0")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	udid := "simpool-test-udid-doctor-live-lease-healthy"
+	meta := pool.Meta{
+		Device:    "TestDevice",
+		OSVersion: "1.0",
+		UDID:      udid,
+		Mode:      "lease",
+		LeaseKey:  "hot-repo-live-lease",
+		LastUsed:  time.Now(),
+	}
+	if err := pool.WriteMeta(dir, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(dir, pool.Lease{Key: "hot-repo-live-lease", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	spawnUDIDCarryingProcess(t, udid)
+
+	// The device-reference audit is not what this test is about: report the
+	// device as existing under this slot's own expected name so the only
+	// signal in play is the free-flock + poison block.
+	orig := findDevice
+	t.Cleanup(func() { findDevice = orig })
+	deviceName := pool.DeviceName(home, "TestDevice", "1.0", 0)
+	findDevice = func(u string) (simctl.DeviceEntry, bool, error) {
+		return simctl.DeviceEntry{UDID: u, Name: deviceName, State: "Booted", IsAvailable: true}, true, nil
+	}
+
+	// Preconditions that make a pass meaningful rather than vacuous: the
+	// poison predicate really fires on this slot, and the shared
+	// computation really calls it leased.
+	if poison := pool.CheckPoison(meta); poison.Reason != pool.PoisonedByLiveConsumers {
+		t.Fatalf("test setup broken: expected PoisonedByLiveConsumers, got %v", poison)
+	}
+	if av := pool.SlotAvailability(dir, ""); av.State != pool.SlotLeased {
+		t.Fatalf("test setup broken: expected the shared computation to report SlotLeased, got %v (%s)", av.State, av.Detail())
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunDoctor(nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doctor must not fail a healthy, actively leased slot, got exit %d:\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("quarantined")) {
+		t.Errorf("doctor must not call an actively leased slot quarantined, got:\n%s", stdout.String())
+	}
+}

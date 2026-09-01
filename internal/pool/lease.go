@@ -199,15 +199,21 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
 	})
 
+	// refusals records why each slot this call could not use was refused,
+	// so a failure names the actual obstacle per slot instead of asserting
+	// one blanket reason for the whole group — see atCapacityError.
+	var refusals []SlotRefusal
+
 	for _, n := range existing {
 		dir := SlotDir(groupDir, n)
-		ok, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl)
+		ok, av, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
 		}
+		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
 	}
 
 	next := 0
@@ -216,17 +222,18 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			next++
 		}
 		if len(resident) >= max {
-			return nil, ErrAtCapacity
+			return nil, atCapacityError(GroupName(device, osVersion), key, max, refusals)
 		}
 		dir := SlotDir(groupDir, next)
 		resident[next] = true
-		ok, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl)
+		ok, av, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			return leaseSlotView(root, groupDir, dir, next, device, osVersion), nil
 		}
+		refusals = append(refusals, SlotRefusal{Number: next, Availability: av})
 		next++
 	}
 }
@@ -236,7 +243,9 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 // carries no live lease for a different key, and (mirroring AcquireSlots'
 // take()) its previous consumer isn't a poisoned orphan left behind by a
 // SIGKILL to `simpool` itself — or, if it was, that it can be verified and
-// reclaimed (see AttemptRecovery).
+// reclaimed (see AttemptRecovery). Returns the Availability behind its
+// decision either way, so a caller that ends up refusing the whole group
+// can report per-slot reasons rather than one blanket assertion.
 //
 // claimSlotLock gives this the exact same exclusion take() gets: the
 // group's allocation lock only for the brief mkdir+open+flock-attempt
@@ -250,35 +259,52 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 // holds it long-term — see the Lease doc comment) — mirroring take()'s own
 // lock-then-mutate pattern, and AttemptRecovery's other callers' documented
 // discipline (see poison.go), exactly.
-func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key string, ttl time.Duration) (bool, error) {
+func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key string, ttl time.Duration) (bool, Availability, error) {
 	lock, err := claimSlotLock(groupDir, dir)
 	if err != nil {
-		return false, err
+		return false, Availability{}, err
 	}
 	if lock == nil {
-		return false, nil // busy
+		return false, Availability{State: SlotBusy}, nil
 	}
 	defer lock.Release()
 
-	if lease, err := ReadLease(dir); err != nil {
-		// Could not verify whether this slot already carries a live lease
-		// for someone else — never treat an incomplete check as "free".
-		return false, nil
-	} else if lease.Alive() {
-		return false, nil
-	}
-
-	meta := ReadMeta(dir)
-	if poison := CheckPoison(meta); poison.Poisoned() {
-		if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, poison) {
-			return false, nil
+	// One shared computation with what `simpool status` reports (see
+	// SlotState): everything except the flock, which this call now holds
+	// and therefore already knows the answer to.
+	av := slotAvailabilityLocked(dir, key)
+	switch av.State {
+	case SlotFree:
+		// Includes the case where av.Poison is non-empty but is this key's
+		// own lease residue (av.OwnLeaseResidue). ownLeaseResidue exempts
+		// two reasons from quarantine: PoisonedByLiveConsumers, which has
+		// no recovery path at all (never a kill candidate), and
+		// PoisonedByOrphanedResidue, which IS a kill candidate — its own
+		// doc comment says so regardless of Meta.Mode. Exempting the
+		// latter from quarantine must not also exempt it from
+		// reclamation, or the owning key's own idb_companion / log-stream
+		// residue is never killed on this path. AttemptRecovery returning
+		// false here (e.g. the device was deleted, so identity can't be
+		// verified) only means the residue couldn't be reclaimed — the
+		// owning key still gets its slot back either way, exactly as
+		// before this call was added.
+		if av.OwnLeaseResidue && av.Poison.Reason == PoisonedByOrphanedResidue {
+			meta := av.Meta
+			_ = AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison)
 		}
+	case SlotQuarantined:
+		meta := av.Meta
+		if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison) {
+			return false, av, nil
+		}
+	default:
+		return false, av, nil
 	}
 
 	if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
-		return false, err
+		return false, av, err
 	}
-	return true, nil
+	return true, av, nil
 }
 
 func leaseSlotView(root, groupDir, dir string, n int, device, osVersion string) *Slot {

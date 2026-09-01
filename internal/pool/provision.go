@@ -387,6 +387,12 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	s.Meta.OwnerPID = os.Getpid()
 	s.Meta.OwnerCmd = ownerCmd
 	s.Meta.Mode = mode
+	// Recorded on every mode, including the empty key `with`/`acquire`
+	// pass: a slot moving from `lease` to `with` must not keep naming the
+	// lease key that used to hold it, or ownLeaseResidue would go on
+	// exempting a key whose session is no longer what this slot's residue
+	// belongs to.
+	s.Meta.LeaseKey = leaseKey
 	// Always clear the previous consumer's identity here, regardless of
 	// mode: `with` records its own child's ConsumerPGID/fingerprint AFTER
 	// this call returns (see with.go, right after cmd.Start()), so this

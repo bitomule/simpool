@@ -37,6 +37,8 @@ service that runs it on a schedule.
 
 - [Build](#build) — install, and start the cleanup service
 - [Usage](#usage) — every subcommand and flag
+- [Why a slot can be refused](#why-a-slot-can-be-refused) — what
+  `free`/`busy`/`leased`/`quarantined` mean, and why `--max 1` works
 - [Bazel](#bazel-simpool_ios_test_runner) — the `simpool_ios_test_runner` rule
 - [Pool layout](#pool-layout) — what lives on disk
 - [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away) —
@@ -132,8 +134,11 @@ simpool preboot --device D --os V [--count N] [--max M]
     then release them immediately — see "Warming up ahead of time" above.
 
 simpool status
-    List every slot: lock state, holder (best-effort), lease, device
-    boot state.
+    List every slot: whether it can be handed to a new consumer right
+    now (AVAILABLE) and what stands in the way if not (WHY), plus its
+    lease and device boot state. AVAILABLE is the same computation the
+    acquisition paths decide by, not a separate opinion — see "Why a
+    slot can be refused" below.
 
 simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
@@ -263,6 +268,54 @@ SIGKILLs consumers, which is what creates the orphans `reap`/recovery exist
 to clean up in the first place. The gate is held only for the duration of
 one boot, never for a slot's lifetime, so it can never widen how long
 anything else has to wait on a slot's own lock.
+
+### Why a slot can be refused
+
+`--max` is only one of the reasons a slot doesn't get handed out, and it
+used to be the only one anything said out loud. There is one availability
+verdict per slot, computed in one place (`pool.SlotAvailability`) and used
+by both the commands that report (`status`) and the commands that decide
+(`with`/`acquire`/`lease`):
+
+| AVAILABLE | Meaning |
+| --- | --- |
+| `free` | Nothing stands between this slot and a new consumer. |
+| `busy` | Its `flock` is held — a live `with`/`acquire`. |
+| `leased` | A live `simpool lease` reservation belongs to another key. |
+| `quarantined` | Nobody holds it, but a process that could still be using its simulator is alive (or the check to find out failed) — see "Poison and recovery" below. |
+| `unverifiable` | A check itself could not complete. Never read as free. |
+
+`quarantined` is the one that used to be invisible. A slot in that state
+has a free `flock` and no live lease, so `status` called it **free**, while
+every acquisition path refused it — and, at `--max 1`, refused it with
+`pool at capacity: every slot is busy or leased elsewhere`, which was not
+what had happened, followed by "run `simpool status` to see who holds
+them", which then showed a pool with nothing wrong in it. Both halves of
+that are fixed: `status` reports the same verdict the acquisition paths
+reach, and a refusal names, per slot, the reason that slot was refused.
+
+**Your own lease session's residue never quarantines you.** A `simpool
+lease` hot loop leaves processes behind that carry the slot's UDID in their
+own argv — `simctl spawn <udid> log stream`, `axe describe-ui --udid
+<udid>`, the booted app itself. Those are not orphans simpool may kill (it
+did not spawn them), so the slot they belong to is quarantined against
+other callers for as long as they live. It used to be quarantined against
+the key that created them too, the moment its lease lapsed: with `--max 1`
+there was no second slot to fall back to, so that key could never lease
+again at all, and `simpool release` didn't help, because the lease was
+never what was blocking it. A key is now exempt from *its own* residue —
+identified by the slot's lease (expired or not) and, once `release` has
+removed that, by the lease key recorded in `meta.json`. The exemption is
+narrow on purpose: only for a slot last held in `lease` mode, only for a
+non-empty key that matches, and never for a still-alive `with`-spawned
+process group or a liveness check that failed to complete.
+
+`--max 1` is therefore usable for a repeated single-slot workload, which is
+the point of setting it: it bounds disk (~1.75GB per resident slot), and a
+disk bound that turns into a total block pushes people to raise the cap,
+which is backwards. A *booted* slot has never counted as unavailable and
+still doesn't — booted with no consumer is exactly the warm slot the pool
+exists to hand back.
 
 ### Warming up ahead of time
 

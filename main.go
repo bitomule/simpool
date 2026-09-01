@@ -39,7 +39,10 @@ Usage:
       waits for capacity — a full group is left as-is, not blocked on.
 
   simpool status
-      List every slot: lock state, holder, lease, device boot state.
+      List every slot: whether it can be handed out right now and what
+      stands in the way if not (free/busy/leased/quarantined), plus its
+      lease and device boot state. Same verdict with/acquire/lease
+      decide by — see README "Why a slot can be refused".
 
   simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--dry-run]
       Recycle free+cold slots; never touches one with a live owner or an

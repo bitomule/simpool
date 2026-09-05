@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"time"
@@ -40,11 +41,22 @@ const slotCapGrace = 30 * time.Minute
 // group's `max` places, because the cap can only ever be enforced against
 // what is genuinely idle.
 type capCandidate struct {
-	n       int
-	meta    pool.Meta
-	entry   simctl.DeviceEntry
-	exists  bool
-	blocked string
+	n    int
+	meta pool.Meta
+	// dirMtime is the slot directory's modification time as measured
+	// BEFORE this pass ever locked the slot, and dirMtimeErr the failure if
+	// it could not be read. It is the stand-in idle clock for a slot whose
+	// meta.json has never been written, and it is carried on the candidate
+	// rather than re-read at eviction time because pool.TryLock creates the
+	// lock file when it is missing, which bumps that very mtime: the
+	// re-check under the second lock would otherwise always read a clock
+	// this pass itself had just reset, and no slot without a meta.json
+	// could ever age out of the grace.
+	dirMtime    time.Time
+	dirMtimeErr error
+	entry       simctl.DeviceEntry
+	exists      bool
+	blocked     string
 }
 
 // enforceSlotCap brings a device+OS group back down to `max` slots by
@@ -94,6 +106,8 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 	var blocked, free []capCandidate
 	for _, n := range nums {
 		dir := pool.SlotDir(groupDir, n)
+		// Measured before the lock, and only here — see capCandidate.dirMtime.
+		mtime, mtimeErr := slotDirModTime(dir)
 		lock, err := pool.TryLock(pool.LockPath(dir))
 		if err != nil {
 			if err != pool.ErrBusy {
@@ -102,7 +116,7 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 			blocked = append(blocked, capCandidate{n: n, blocked: "held by a live consumer"})
 			continue
 		}
-		c := classifyCapSlot(root, group, n, dir)
+		c := classifyCapSlot(root, group, n, dir, mtime, mtimeErr)
 		_ = lock.Release()
 		if c.blocked != "" {
 			blocked = append(blocked, c)
@@ -133,6 +147,22 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 		if i < keep {
 			continue
 		}
+		// Re-check the group's real size before every eviction rather than
+		// trusting `keep`, which was computed from a snapshot taken before
+		// the first flock. Nothing serializes two reap processes — launchd
+		// fires every 30 minutes, manual runs are encouraged, and a run
+		// stalled on a slow simctl call overlaps the next — and a peer
+		// reaper holding a slot's flock while it deletes that slot is
+		// classified here as "held by a live consumer", which inflates
+		// len(blocked), shrinks keep, and would have this pass evict one
+		// extra perfectly healthy slot for every slot the peer removes. The
+		// per-slot re-classification below cannot catch that: the extra
+		// victim passes every check. Counting directories again does, and
+		// it self-corrects no matter who else is deleting.
+		if live := pool.ListSlotNumbers(groupDir); len(live) <= max {
+			fmt.Fprintf(stdout, "CAP   %s  group is back within --max %d (%d slots) — stopping\n", group, max, len(live))
+			return
+		}
 		label := fmt.Sprintf("%s/slot-%d", group, c.n)
 		dir := pool.SlotDir(groupDir, c.n)
 
@@ -143,7 +173,12 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 			}
 			continue // became busy since classification — not this pass's to touch
 		}
-		re := classifyCapSlot(root, group, c.n, dir)
+		// c.dirMtime, not a fresh stat: the classification pass above may
+		// have created this slot's lock file and bumped it. Everything else
+		// this re-check reads (lease.json, meta.json, the device set) is
+		// re-read, so a slot that genuinely became busy, leased, poisoned or
+		// was reassigned in between is still caught.
+		re := classifyCapSlot(root, group, c.n, dir, c.dirMtime, c.dirMtimeErr)
 		if re.blocked != "" {
 			fmt.Fprintf(stdout, "CAP   %s  skipped: %s\n", label, re.blocked)
 			_ = lock.Release()
@@ -205,8 +240,8 @@ func describeCapDevice(c capCandidate) string {
 // be stale. A slot whose device is already gone, or that was never
 // provisioned at all, is still evictable: there is nothing to delete but
 // the directory, and the directory is exactly what costs a slot number.
-func classifyCapSlot(root, group string, n int, dir string) capCandidate {
-	c := capCandidate{n: n}
+func classifyCapSlot(root, group string, n int, dir string, dirMtime time.Time, dirMtimeErr error) capCandidate {
+	c := capCandidate{n: n, dirMtime: dirMtime, dirMtimeErr: dirMtimeErr}
 
 	lease, err := pool.ReadLease(dir)
 	if err != nil {
@@ -223,11 +258,26 @@ func classifyCapSlot(root, group string, n int, dir string) capCandidate {
 		c.blocked = fmt.Sprintf("quarantined (%s)", poison)
 		return c
 	}
-	if !c.meta.LastUsed.IsZero() {
-		if idle := time.Since(c.meta.LastUsed); idle < slotCapGrace {
-			c.blocked = fmt.Sprintf("used %s ago (< %s grace)", idle.Round(time.Second), slotCapGrace)
+	// A zero LastUsed must not read as "idle forever". meta.json is written
+	// only once provisioning succeeds, so a slot directory that a concurrent
+	// claimant created seconds ago and is still working on has no LastUsed
+	// at all — exactly the state that most needs the grace, not the one that
+	// should skip it. Fall back to the directory's own mtime, the same
+	// stand-in reapSlot's removeDeadSlotDir already uses for a
+	// never-provisioned slot, and refuse to act if even that cannot be read.
+	// dirMtime is measured by the caller before it locks the slot; see
+	// enforceSlotCap for why reading it here would be self-defeating.
+	since := c.meta.LastUsed
+	if since.IsZero() {
+		if dirMtimeErr != nil {
+			c.blocked = fmt.Sprintf("no recorded last-use and the slot directory could not be stat'ed (%v)", dirMtimeErr)
 			return c
 		}
+		since = dirMtime
+	}
+	if idle := time.Since(since); idle < slotCapGrace {
+		c.blocked = fmt.Sprintf("used %s ago (< %s grace)", idle.Round(time.Second), slotCapGrace)
+		return c
 	}
 	if c.meta.UDID == "" {
 		// meta.json is advisory and can be lost entirely (crash mid-write,
@@ -285,4 +335,16 @@ func classifyCapSlot(root, group string, n int, dir string) capCandidate {
 	c.entry = entry
 	c.exists = true
 	return c
+}
+
+// slotDirModTime reports a slot directory's modification time, the stand-in
+// idle clock for a slot whose meta.json has never been written. Always call
+// it before taking the slot's flock: pool.TryLock creates the lock file when
+// it is missing, and that write bumps the containing directory's mtime.
+func slotDirModTime(dir string) (time.Time, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }

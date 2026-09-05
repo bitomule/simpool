@@ -191,7 +191,16 @@ simpool reap [--max N] [--cold N] [--stuck-after D] [--purge N] [--prune-runs-af
     and its device's real name in the default set matches what this exact
     slot is supposed to own. Slots that fail any of those still count
     against the cap, so the eviction pressure lands on what is genuinely
-    idle rather than being silently dropped.
+    idle rather than being silently dropped. Two things that are less
+    obvious than they look: a slot with no meta.json at all has no recorded
+    last-use, so the grace falls back to its directory's mtime, measured
+    BEFORE the pass locks the slot (taking the flock creates the lock file,
+    which bumps that same mtime — read it afterwards and such a slot looks
+    freshly touched on every run, forever); and the group is re-counted
+    before every eviction rather than trusted from the opening snapshot,
+    because nothing serializes two `reap` processes and a peer reaper
+    holding a flock reads here as a live consumer, which would otherwise
+    cost one healthy slot for every slot the peer removes.
 
     One caveat worth stating plainly: `--max` is resolved independently by
     every process that reads it, and a launchd job inherits almost no

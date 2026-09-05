@@ -15,17 +15,23 @@
 
   The flags below are one policy, not the only one:
 
-    --max 3                  bring any group holding more than three slots
-                             back down to three, deleting the excess
-                             simulators. This is ON BY DEFAULT and is
-                             spelled out here for a reason: `--max` is
-                             resolved independently by every process that
-                             reads it, and a launchd job inherits almost no
-                             environment, so if your acquirers run with
-                             SIMPOOL_MAX_SLOTS set to something else this
-                             number must be changed to match. A 30-minute
-                             idle grace keeps a mismatch loud and slow
-                             rather than silent and immediate.
+  --max is ON BY DEFAULT and is deliberately NOT passed here: bring any group
+  holding more slots than its cap back down to it, deleting the excess
+  simulators. Left off the command line, the flag resolves the same way every
+  other simpool caller resolves it — SIMPOOL_MAX_SLOTS if set, otherwise 3 —
+  so this job agrees with your acquirers by construction. Passing "--max 3"
+  explicitly would look harmless and silently win over SIMPOOL_MAX_SLOTS, which
+  is exactly the reaper-smaller-than-acquirers mismatch that has this job
+  deleting simulators the acquirers immediately recreate. If you do need a
+  different cap here, set it through EnvironmentVariables below rather than as
+  a flag:
+
+      <key>EnvironmentVariables</key>
+      <dict><key>SIMPOOL_MAX_SLOTS</key><string>5</string></dict>
+
+  A 30-minute idle grace keeps a mismatch loud and slow rather than silent and
+  immediate, but it does not make one harmless.
+
     --purge-orphan-runtimes  kill the userland of devices that no longer
                              exist — only ever processes whose device is
                              absent from a device listing that succeeded and
@@ -50,7 +56,6 @@
   <key>ProgramArguments</key><array>
     <string>/opt/homebrew/bin/simpool</string>
     <string>reap</string>
-    <string>--max</string><string>3</string>
     <string>--purge-orphan-runtimes</string>
     <string>--cold</string><string>60</string>
     <string>--warm</string><string>2</string>

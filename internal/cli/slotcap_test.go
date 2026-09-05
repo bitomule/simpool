@@ -23,7 +23,15 @@ type capHarness struct {
 	shutdown []string
 }
 
+// newCapHarness builds every slot with a SHUT-DOWN device. Use
+// newCapHarnessBooted when a test asserts on what the pass does or does not
+// shut down: against an all-shut-down fixture those assertions pass whether
+// the shutdown call exists or not.
 func newCapHarness(t *testing.T, lastUsed map[int]time.Time) *capHarness {
+	return newCapHarnessBooted(t, lastUsed, nil)
+}
+
+func newCapHarnessBooted(t *testing.T, lastUsed map[int]time.Time, booted map[int]bool) *capHarness {
 	t.Helper()
 	h := &capHarness{root: t.TempDir()}
 	h.groupDir = pool.GroupDir(h.root, "TestDevice", "1.0")
@@ -50,10 +58,14 @@ func newCapHarness(t *testing.T, lastUsed map[int]time.Time) *capHarness {
 		if !ok {
 			return simctl.DeviceEntry{}, false, nil
 		}
+		state := "Shutdown"
+		if booted[n] {
+			state = "Booted"
+		}
 		return simctl.DeviceEntry{
 			UDID:        udid,
 			Name:        pool.DeviceNameForGroup(h.root, h.group, n),
-			State:       "Shutdown",
+			State:       state,
 			IsAvailable: true,
 		}, true, nil
 	}
@@ -92,7 +104,10 @@ func TestEnforceSlotCap_TrimsAnOversizedGroupBackToMax(t *testing.T) {
 		// slot-0 oldest ... slot-6 newest, all well past slotCapGrace.
 		lastUsed[n] = now.Add(-time.Duration(10-n) * time.Hour)
 	}
-	h := newCapHarness(t, lastUsed)
+	// slot-0 is still booted: an evicted simulator must be shut down before
+	// it is deleted, and with an all-shut-down fixture nothing would prove
+	// that path runs at all.
+	h := newCapHarnessBooted(t, lastUsed, map[int]bool{0: true})
 
 	var stdout, stderr bytes.Buffer
 	enforceSlotCap(h.root, h.groupDir, 3, false /*dryRun*/, &stdout, &stderr)
@@ -118,6 +133,9 @@ func TestEnforceSlotCap_TrimsAnOversizedGroupBackToMax(t *testing.T) {
 			t.Errorf("simulator for slot-%d was not deleted; deleted=%v", n, h.deleted)
 		}
 	}
+	if !containsStr(h.shutdown, udidFor(0)) {
+		t.Errorf("the one booted evictee was deleted without being shut down first; shutdown=%v", h.shutdown)
+	}
 }
 
 // TestEnforceSlotCap_WithinCapDoesNothing is the other half of the
@@ -126,11 +144,15 @@ func TestEnforceSlotCap_TrimsAnOversizedGroupBackToMax(t *testing.T) {
 // entitled to.
 func TestEnforceSlotCap_WithinCapDoesNothing(t *testing.T) {
 	now := time.Now()
-	h := newCapHarness(t, map[int]time.Time{
+	// Every device is BOOTED here on purpose: against an all-shut-down
+	// fixture the `len(h.shutdown) != 0` assertion below would pass whether
+	// or not the pass ever calls shutdownExcess, since the eviction path
+	// only shuts a device down when its state is not "Shutdown".
+	h := newCapHarnessBooted(t, map[int]time.Time{
 		0: now.Add(-9 * time.Hour),
 		1: now.Add(-8 * time.Hour),
 		2: now.Add(-7 * time.Hour),
-	})
+	}, map[int]bool{0: true, 1: true, 2: true})
 
 	var stdout, stderr bytes.Buffer
 	enforceSlotCap(h.root, h.groupDir, 3, false, &stdout, &stderr)
@@ -173,12 +195,13 @@ func TestEnforceSlotCap_NeverTouchesAnOccupiedSlot(t *testing.T) {
 	defer held.Release()
 
 	var stdout, stderr bytes.Buffer
-	// --max 2 with two hard-untouchable slots (2 leased, 4 locked) plus
-	// slot-3 protected only by slotCapGrace means keep = 2-2 = 0: nothing
-	// but the grace itself keeps slot-3 alive here, so this is the only
-	// case in the file where slotCapGrace is load-bearing rather than
-	// redundant with MRU-first keep.
-	enforceSlotCap(h.root, h.groupDir, 2, false, &stdout, &stderr)
+	// --max 3 with three untouchable slots (2, 3, 4) means both idle ones
+	// are over the cap and must go. Deliberately NOT --max 2: that lands in
+	// the keep<0 clamp, where an off-by-one in `keep := max - len(blocked)`
+	// is absorbed and this test stops noticing it. The case where the grace
+	// alone is load-bearing gets its own fixture below rather than being
+	// traded for this one.
+	enforceSlotCap(h.root, h.groupDir, 3, false, &stdout, &stderr)
 
 	for _, udid := range []string{udidFor(2), udidFor(3), udidFor(4)} {
 		if containsStr(h.deleted, udid) {
@@ -188,6 +211,43 @@ func TestEnforceSlotCap_NeverTouchesAnOccupiedSlot(t *testing.T) {
 	got := h.slotDirs(t)
 	if len(got) != 3 {
 		t.Fatalf("want slots [2 3 4] to survive, got %v\n%s", got, stdout.String())
+	}
+}
+
+// TestEnforceSlotCap_GraceAloneProtectsASlotWhenNoPlaceIsLeft is the case
+// slotCapGrace exists for, isolated so it is genuinely load-bearing rather
+// than shadowed by most-recently-used-first keeping the slot anyway.
+//
+// Two hard-untouchable slots (2 leased, 4 locked) against --max 2 leave
+// keep = 0, so nothing but the grace itself stands between slot-3 — used a
+// minute ago, otherwise a perfectly ordinary free slot — and deletion.
+// Ablating the grace check in classifyCapSlot makes this test fail; it does
+// not make TestEnforceSlotCap_NeverTouchesAnOccupiedSlot fail, which is why
+// both fixtures are here.
+func TestEnforceSlotCap_GraceAloneProtectsASlotWhenNoPlaceIsLeft(t *testing.T) {
+	now := time.Now()
+	h := newCapHarness(t, map[int]time.Time{
+		0: now.Add(-9 * time.Hour),
+		1: now.Add(-8 * time.Hour),
+		2: now.Add(-7 * time.Hour),
+		3: now.Add(-1 * time.Minute), // inside the grace, nothing else protects it
+		4: now.Add(-6 * time.Hour),
+	})
+
+	if err := pool.WriteLease(pool.SlotDir(h.groupDir, 2), pool.Lease{Key: "repo-a", ExpiresAt: now.Add(5 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := pool.TryLock(pool.LockPath(pool.SlotDir(h.groupDir, 4)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	var stdout, stderr bytes.Buffer
+	enforceSlotCap(h.root, h.groupDir, 2, false, &stdout, &stderr)
+
+	if containsStr(h.deleted, udidFor(3)) {
+		t.Fatalf("slot-3 was used a minute ago and only slotCapGrace protects it here; deleted=%v\n%s", h.deleted, stdout.String())
 	}
 	if _, err := os.Stat(pool.SlotDir(h.groupDir, 3)); err != nil {
 		t.Fatalf("slot-3's directory should still exist, protected by slotCapGrace: %v", err)
@@ -273,10 +333,11 @@ func TestEnforceSlotCap_RecoversAZeroUDIDSlotByName(t *testing.T) {
 		1: now.Add(-8 * time.Hour),
 	})
 	// slot-2: a directory with no meta.json at all — never got as far as
-	// recording a UDID.
-	if err := os.MkdirAll(pool.SlotDir(h.groupDir, 2), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// recording a UDID. Backdated past slotCapGrace, because with no
+	// LastUsed to read the pass falls back to the directory's own mtime and
+	// a just-created directory is (correctly) protected as something a
+	// concurrent claimant may still be provisioning.
+	backdatedSlotDir(t, h.groupDir, 2)
 	recoveredUDID := "udid-recovered-slot-2"
 	withFakeDevices(t, []simctl.DeviceEntry{
 		{UDID: recoveredUDID, Name: pool.DeviceNameForGroup(h.root, h.group, 2), State: "Shutdown", IsAvailable: true},
@@ -309,9 +370,9 @@ func TestEnforceSlotCap_RefusesAmbiguousZeroUDIDRecovery(t *testing.T) {
 	h := newCapHarness(t, map[int]time.Time{
 		0: now.Add(-9 * time.Hour),
 	})
-	if err := os.MkdirAll(pool.SlotDir(h.groupDir, 1), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// Backdated so the ambiguity guard — not the mtime fallback of
+	// slotCapGrace — is what keeps this slot alive.
+	backdatedSlotDir(t, h.groupDir, 1)
 	leasedDir := pool.SlotDir(h.groupDir, 2)
 	if err := os.MkdirAll(leasedDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -350,4 +411,20 @@ func containsStr(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// backdatedSlotDir creates a slot directory with no meta.json and an mtime
+// well past slotCapGrace, so a test exercising a zero-UDID path is not
+// silently answered by the grace's mtime fallback instead.
+func backdatedSlotDir(t *testing.T, groupDir string, n int) string {
+	t.Helper()
+	dir := pool.SlotDir(groupDir, n)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-9 * time.Hour)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

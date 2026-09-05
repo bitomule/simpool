@@ -715,7 +715,7 @@ func TestCheckPoison_CompanionOnBootedDevice_NeverReclaimed(t *testing.T) {
 // (what a JSON response omitting the field would parse as) all classified
 // as reclaimable. "Booting" in particular names a device whose launchd_sim
 // is already up and whose boot is actively underway — reachable in
-// production via a lease-renewal race (TTL 3m, renewed only on the next
+// production via a lease-renewal race (the TTL, renewed only on the next
 // `simpool lease` call; mav's launch recipe boots the device while a
 // concurrent acquire/lease sees the expired lease, no live ConsumerPGID for
 // an acquire/lease slot, and a live companion — "not Booted" under the old
@@ -1350,5 +1350,22 @@ func TestDisownOrphanedCompanions_AttemptsEveryPIDEvenIfAnEarlierOneErrors(t *te
 	}
 	for _, pid := range pids {
 		waitForDead(t, pid)
+	}
+}
+
+// TestResidueIdleGrace_ExceedsTheLeaseTTL pins the relationship two
+// separately-tuned constants depend on but neither states in code.
+// ResidueIdleGrace is the window in which a companion process may be
+// treated as residue rather than as infrastructure for a session that is
+// merely quiet; DefaultLeaseTTL is how long that quiet is allowed to last
+// before the session's own reservation lapses. If the TTL ever meets or
+// exceeds the grace, a lease can still be live while its companion is
+// already reclaimable, and the residue path starts killing infrastructure
+// out from under a session that has not given its slot back. Raising the
+// TTL from 3m to 10m narrowed this margin from 10x to 3x without anything
+// noticing; this is what notices next time.
+func TestResidueIdleGrace_ExceedsTheLeaseTTL(t *testing.T) {
+	if ResidueIdleGrace <= DefaultLeaseTTL {
+		t.Fatalf("ResidueIdleGrace=%v must stay comfortably above DefaultLeaseTTL=%v: a companion must never become reclaimable while its session's own lease can still be live", ResidueIdleGrace, DefaultLeaseTTL)
 	}
 }

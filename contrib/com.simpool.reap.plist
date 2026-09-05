@@ -15,6 +15,23 @@
 
   The flags below are one policy, not the only one:
 
+  --max is ON BY DEFAULT and is deliberately NOT passed here: bring any group
+  holding more slots than its cap back down to it, deleting the excess
+  simulators. Left off the command line, the flag resolves the same way every
+  other simpool caller resolves it — SIMPOOL_MAX_SLOTS if set, otherwise 3 —
+  so this job agrees with your acquirers by construction. Passing "--max 3"
+  explicitly would look harmless and silently win over SIMPOOL_MAX_SLOTS, which
+  is exactly the reaper-smaller-than-acquirers mismatch that has this job
+  deleting simulators the acquirers immediately recreate. If you do need a
+  different cap here, set it through EnvironmentVariables below rather than as
+  a flag:
+
+      <key>EnvironmentVariables</key>
+      <dict><key>SIMPOOL_MAX_SLOTS</key><string>5</string></dict>
+
+  A 30-minute idle grace keeps a mismatch loud and slow rather than silent and
+  immediate, but it does not make one harmless.
+
     --purge-orphan-runtimes  kill the userland of devices that no longer
                              exist — only ever processes whose device is
                              absent from a device listing that succeeded and
@@ -25,9 +42,11 @@
     --warm 2                 keep two booted per device+OS group, so the next
                              acquisition does not pay a cold boot.
 
-  Deliberately NOT here: --purge (deletes simulators outright) and
-  --purge-orphans (deletes orphaned devices). Both are destructive to devices
-  rather than to dead processes, and neither should run unattended.
+  Deliberately NOT here: --purge (deletes simulators outright by idle time)
+  and --purge-orphans (deletes orphaned devices). Both are destructive to
+  devices rather than to dead processes, and neither should run unattended.
+  --max also deletes devices, but only ones the pool's own declared cap says
+  should never have existed, which is a different kind of decision.
 
   Adjust the simpool path if you did not install via Homebrew: launchd jobs
   inherit PATH=/usr/bin:/bin:/usr/sbin:/sbin, so it must be absolute.

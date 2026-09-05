@@ -395,6 +395,82 @@ func claimSlotLock(groupDir, dir string) (*Lock, error) {
 	return lock, nil
 }
 
+// LockExistingSlot is claimSlotLock for a caller that must NOT create the
+// slot it is locking: it takes the group allocation lock, confirms dir still
+// exists, and only then opens and flocks its lock file, releasing the
+// allocation lock again before returning. (nil, nil) means "busy, or gone" —
+// neither is an error for the one caller this exists for.
+//
+// The difference from a bare TryLock matters only for a caller that goes on
+// to DELETE the slot, which is why nothing needed it until reap's --max pass.
+// RemoveSlotDir's contract is that a slot's lock file is never unlinked in
+// the window after another process has opened it but before it has flocked
+// it — but that guarantee only covers openers whose open+flock is itself
+// inside the allocation lock, which is exactly what claimSlotLock does and
+// what a bare TryLock does not. Without it: a peer holding slot n's flock
+// RemoveAll's the directory; this caller's TryLock opens the still-linked
+// lock file; the peer unlinks it and releases; this caller's flock then
+// succeeds on an orphaned inode while a fresh claimant takes the recreated
+// slot n through claimSlotLock on the new one — two processes each holding
+// "the" lock for slot n, one of them about to delete its simulator.
+//
+// Deliberately no MkdirAll: resurrecting a directory a peer just removed
+// would recreate the very slot the group is trying to shed.
+func LockExistingSlot(groupDir, dir string) (*Lock, error) {
+	var lock *Lock
+	err := withGroupAllocLock(groupDir, func() error {
+		if _, serr := os.Stat(dir); serr != nil {
+			if os.IsNotExist(serr) {
+				return nil // a peer removed it; nothing to lock
+			}
+			return serr
+		}
+		l, terr := TryLock(lockPath(dir))
+		if terr != nil {
+			if terr == ErrBusy {
+				return nil
+			}
+			return terr
+		}
+		lock = l
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return lock, nil
+}
+
+// RemoveSlotDirAbove deletes dir only if, re-counted INSIDE the group
+// allocation lock at the moment of removal, the group still has more than
+// max slots. Reports whether it removed anything.
+//
+// The re-count has to happen here, under this exact lock, and not in the
+// caller: every peer's RemoveSlotDir funnels through the same allocation
+// lock, so this is the only place where "how many slots does this group
+// have" and "remove one" are a single atomic decision. A caller that counts
+// first and calls RemoveSlotDir second leaves a window in which a peer's
+// removal lands between the two, and the group ends up one slot BELOW its
+// own cap — a healthy simulator deleted for nothing, and an acquisition
+// paying a cold boot to put it back.
+//
+// The caller must still hold dir's own lock across this call, exactly as
+// RemoveSlotDir requires.
+func RemoveSlotDirAbove(groupDir, dir string, max int) (removed bool, err error) {
+	err = withGroupAllocLock(groupDir, func() error {
+		nums, lerr := ListSlotNumbersChecked(groupDir)
+		if lerr != nil {
+			return lerr
+		}
+		if len(nums) <= max {
+			return nil
+		}
+		removed = true
+		return os.RemoveAll(dir)
+	})
+	return removed, err
+}
+
 // RemoveSlotDir deletes a slot directory in its entirety. Callers (reap)
 // must hold that slot's own lock across this call — this only additionally
 // serializes against AcquireSlots' take() via the group allocation lock, so

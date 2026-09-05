@@ -14,15 +14,60 @@ import (
 // before the reservation is considered abandoned and the slot becomes
 // available again. Renewed on every call made with the same key.
 //
-// Kept short (minutes, not tens of minutes) on purpose: the lease is meant
-// to cover the gap between consecutive hot-loop calls (`mav tap`, `mav
-// swipe`, ...), which is seconds, not the gap MAV's own longer-running
-// steps (a build inside `mav run`) can leave between calls, which can be
-// minutes. That longer gap is MAV's problem to solve by reinvoking
-// target_command periodically as a liveness signal (see MAV's README), not
-// this TTL's — a short TTL here is what lets an idle repo give its slot
-// back quickly enough for others to rotate through a small pool.
-const DefaultLeaseTTL = 3 * time.Minute
+// It must be longer than the longest SILENCE a live consumer can produce,
+// not longer than the gap between two consecutive hot-loop calls. Those are
+// very different numbers and getting them the wrong way round is what this
+// value used to do: at three minutes it was shorter than a single MAV run
+// (4-8 minutes on a loaded machine), so a lease routinely expired while its
+// owner was still working — mid-run — and the next `mav open` was handed a
+// different slot and paid a cold boot for a simulator nobody needed. A
+// lease that expires under a live owner protects nothing; it invites the
+// exact double-allocation it exists to prevent. Ten minutes covers a real
+// run with headroom.
+//
+// This is deliberately NOT the "keepalive that proves existence rather than
+// progress" mistake that let a hung process hold a MAV simulator for 6h46.
+// Nothing renews a lease on a timer, and no background thread renews it at
+// all: a lease is extended only by an actual `simpool lease` call, i.e. by
+// the consumer doing another unit of work. A consumer that hangs stops
+// making calls and its lease expires within one TTL, whatever the process
+// is still doing. Lengthening the TTL lengthens how long a DEAD owner's
+// slot stays reserved; it does not create a way for a STUCK owner to keep
+// renewing one.
+//
+// Override with SIMPOOL_LEASE_TTL (a Go duration string, e.g. "15m") or
+// per-call with --ttl.
+const DefaultLeaseTTL = 10 * time.Minute
+
+// EnvLeaseTTL overrides DefaultLeaseTTL.
+const EnvLeaseTTL = "SIMPOOL_LEASE_TTL"
+
+// LeaseTTL resolves the effective default lease TTL: SIMPOOL_LEASE_TTL if
+// set to a valid duration that is positive AND below ResidueIdleGrace, else
+// DefaultLeaseTTL.
+//
+// The upper bound is not tidiness. ResidueIdleGrace is how long a
+// companion process (idb_companion, a `simctl … log stream`) may sit idle
+// before it may be treated as residue rather than as infrastructure for a
+// session that is merely quiet — and "merely quiet" is precisely what a
+// live lease models. A TTL at or above that grace lets a legitimately quiet
+// session's companion age past the grace while its own lease is still
+// alive, which is the one arrangement the two constants were tuned to make
+// impossible (see ResidueIdleGrace's doc comment). A compile-time test pins
+// the relationship for the default; nothing but this pins it for an
+// override, and "15m" is a plausible enough thing to set that the
+// difference between 15m and 45m must not be left to whoever types it.
+//
+// Refusing the value outright, rather than clamping it silently, keeps the
+// resolved TTL something a reader can predict from the two constants alone.
+func LeaseTTL() time.Duration {
+	if v := os.Getenv(EnvLeaseTTL); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d < ResidueIdleGrace {
+			return d
+		}
+	}
+	return DefaultLeaseTTL
+}
 
 // Lease is a time-bounded, key-scoped reservation on a slot, for the "hot"
 // MAV use case: many short, independent `mav tap`/`mav swipe`/

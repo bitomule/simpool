@@ -50,6 +50,14 @@ func TestLeaseTTL_EnvOverride(t *testing.T) {
 		{"nonsense", DefaultLeaseTTL},
 		{"0s", DefaultLeaseTTL},
 		{"-5m", DefaultLeaseTTL},
+		// At or above ResidueIdleGrace the override is refused, not
+		// honoured: it would let a quiet session's companion age into
+		// reclaimable residue while that session's own lease is still
+		// alive, which is the arrangement the two constants exist to rule
+		// out. See LeaseTTL's doc comment.
+		{ResidueIdleGrace.String(), DefaultLeaseTTL},
+		{(ResidueIdleGrace + time.Minute).String(), DefaultLeaseTTL},
+		{(ResidueIdleGrace - time.Minute).String(), ResidueIdleGrace - time.Minute},
 	} {
 		t.Setenv(EnvLeaseTTL, tc.set)
 		if got := LeaseTTL(); got != tc.want {

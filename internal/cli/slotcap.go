@@ -138,7 +138,7 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 		// naming each one, rather than silently doing nothing every half
 		// hour while the group stays oversized.
 		for _, c := range blocked {
-			fmt.Fprintf(stdout, "CAP   %s/slot-%d  group has %d slot(s) over --max %d but this one is not evictable: %s\n", group, c.n, len(nums), max, c.blocked)
+			fmt.Fprintf(stdout, "CAP   %s/slot-%d  group has %d slots, %d over --max %d, but this one is not evictable: %s\n", group, c.n, len(nums), len(nums)-max, max, c.blocked)
 		}
 		return
 	}
@@ -157,21 +157,45 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 		// len(blocked), shrinks keep, and would have this pass evict one
 		// extra perfectly healthy slot for every slot the peer removes. The
 		// per-slot re-classification below cannot catch that: the extra
-		// victim passes every check. Counting directories again does, and
-		// it self-corrects no matter who else is deleting.
-		if live := pool.ListSlotNumbers(groupDir); len(live) <= max {
+		// victim passes every check. Counting directories again does.
+		//
+		// ListSlotNumbersChecked, not ListSlotNumbers: the latter's contract
+		// swallows every failure into an empty slice, which here would read
+		// as "0 slots, back within cap" — an affirmatively false success
+		// line for a group that may still be oversized, with the real error
+		// lost. paths.go says as much: a caller whose deletions hinge on
+		// this list must use the checked form.
+		//
+		// This count is advisory and cheap. The AUTHORITATIVE one is taken
+		// again inside the group allocation lock at removal time (see
+		// pool.RemoveSlotDirAbove), which is the only place where counting
+		// and removing are a single atomic decision against a peer reaper's
+		// own RemoveSlotDir. Stopping early here just avoids doing work that
+		// would be refused later.
+		live, lerr := pool.ListSlotNumbersChecked(groupDir)
+		if lerr != nil {
+			fmt.Fprintf(stderr, "reap %s: --max: listing slots: %v — stopping rather than evicting on a count that did not complete\n", group, lerr)
+			return
+		}
+		if len(live) <= max {
 			fmt.Fprintf(stdout, "CAP   %s  group is back within --max %d (%d slots) — stopping\n", group, max, len(live))
 			return
 		}
 		label := fmt.Sprintf("%s/slot-%d", group, c.n)
 		dir := pool.SlotDir(groupDir, c.n)
 
-		lock, err := pool.TryLock(pool.LockPath(dir))
+		// pool.LockExistingSlot, not a bare TryLock: this is the branch that
+		// deletes, so its open+flock must be atomic against a peer's
+		// RemoveSlotDir, or it can end up flocking an inode that peer has
+		// already unlinked while a fresh claimant holds the recreated slot's
+		// real lock. See LockExistingSlot's doc comment.
+		lock, err := pool.LockExistingSlot(groupDir, dir)
 		if err != nil {
-			if err != pool.ErrBusy {
-				fmt.Fprintf(stderr, "reap %s: --max: %v\n", label, err)
-			}
-			continue // became busy since classification — not this pass's to touch
+			fmt.Fprintf(stderr, "reap %s: --max: %v\n", label, err)
+			continue
+		}
+		if lock == nil {
+			continue // busy since classification, or a peer already removed it
 		}
 		// c.dirMtime, not a fresh stat: the classification pass above may
 		// have created this slot's lock file and bumped it. Everything else
@@ -206,8 +230,16 @@ func enforceSlotCap(root, groupDir string, max int, dryRun bool, stdout, stderr 
 				continue
 			}
 		}
-		if err := pool.RemoveSlotDir(groupDir, dir); err != nil {
+		removed, err := pool.RemoveSlotDirAbove(groupDir, dir, max)
+		if err != nil {
 			fmt.Fprintf(stderr, "reap %s: --max: removing slot directory: %v\n", label, err)
+		} else if !removed {
+			// A peer reaper's own removal landed between this pass's count
+			// and this moment, and the group is already at its cap. The
+			// simulator is gone either way — that cannot be taken back —
+			// but keeping the slot number means the next acquisition reuses
+			// it instead of the group ending up BELOW its own cap.
+			fmt.Fprintf(stdout, "CAP   %s  group reached --max %d before this directory was removed — keeping the slot number\n", label, max)
 		}
 		_ = lock.Release()
 	}

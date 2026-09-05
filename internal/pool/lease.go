@@ -43,10 +43,26 @@ const DefaultLeaseTTL = 10 * time.Minute
 const EnvLeaseTTL = "SIMPOOL_LEASE_TTL"
 
 // LeaseTTL resolves the effective default lease TTL: SIMPOOL_LEASE_TTL if
-// set to a valid positive duration, else DefaultLeaseTTL.
+// set to a valid duration that is positive AND below ResidueIdleGrace, else
+// DefaultLeaseTTL.
+//
+// The upper bound is not tidiness. ResidueIdleGrace is how long a
+// companion process (idb_companion, a `simctl … log stream`) may sit idle
+// before it may be treated as residue rather than as infrastructure for a
+// session that is merely quiet — and "merely quiet" is precisely what a
+// live lease models. A TTL at or above that grace lets a legitimately quiet
+// session's companion age past the grace while its own lease is still
+// alive, which is the one arrangement the two constants were tuned to make
+// impossible (see ResidueIdleGrace's doc comment). A compile-time test pins
+// the relationship for the default; nothing but this pins it for an
+// override, and "15m" is a plausible enough thing to set that the
+// difference between 15m and 45m must not be left to whoever types it.
+//
+// Refusing the value outright, rather than clamping it silently, keeps the
+// resolved TTL something a reader can predict from the two constants alone.
 func LeaseTTL() time.Duration {
 	if v := os.Getenv(EnvLeaseTTL); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 && d < ResidueIdleGrace {
 			return d
 		}
 	}

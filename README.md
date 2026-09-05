@@ -91,7 +91,10 @@ brew services start simpool
 
 Every 30 minutes it runs `reap --purge-orphan-runtimes --cold 60 --warm 2`:
 shut down free simulators idle over an hour, keep two warm per group, and
-collect the processes of simulators that no longer exist. Logs to
+collect the processes of simulators that no longer exist. `reap --max` is
+on by default, so the same pass also brings any group that has drifted
+above its slot cap back down to it — deleting the excess simulators, which
+is the only scheduled thing that ever reclaims simulator disk. Logs to
 `/tmp/simpool-reap.log`; stop with `brew services stop simpool`.
 
 This is not optional housekeeping. `with` deliberately does not shut
@@ -140,7 +143,7 @@ simpool status
     acquisition paths decide by, not a separate opinion — see "Why a
     slot can be refused" below.
 
-simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
+simpool reap [--max N] [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -173,6 +176,30 @@ simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--
     never a live lease/`acquire` consumer, never a liveness check that
     merely failed to run. See "Architecture" for the full reasoning,
     including why this forgets rather than force-kills.
+
+    --max N is the enforcement half of the same `--max` the acquisition
+    paths apply, and the only thing that ever makes the pool a real
+    ceiling rather than a ratchet. `AcquireSlots`/`AcquireLease` refuse to
+    CREATE slot number N+1; nothing else ever removed one, so any moment a
+    group was allowed past the cap — someone raising `--max` or
+    `SIMPOOL_MAX_SLOTS` once to get past an `ErrAtCapacity`, or the
+    default being lowered later — was permanent. This pass deletes the
+    excess: simulator and slot directory both, most-recently-used kept,
+    coldest first. Unlike `--purge` it is ON by default (3, or `SIMPOOL_MAX_SLOTS` if that is set in the reaper's own
+    environment); `0` disables it. A slot is only ever evicted if it is free, carries no
+    live lease, is not quarantined, has been idle for over 30 minutes,
+    and its device's real name in the default set matches what this exact
+    slot is supposed to own. Slots that fail any of those still count
+    against the cap, so the eviction pressure lands on what is genuinely
+    idle rather than being silently dropped.
+
+    One caveat worth stating plainly: `--max` is resolved independently by
+    every process that reads it, and a launchd job inherits almost no
+    environment. If your acquirers run with `SIMPOOL_MAX_SLOTS` set,
+    make the scheduled `reap` resolve the same value — otherwise the
+    reaper will keep collecting simulators the acquirers keep recreating.
+    The 30-minute idle grace is what keeps that misconfiguration loud and
+    slow instead of silent and immediate.
 
     --warm N caps how many free simulators stay booted per device+OS
     group, independent of --max (which caps concurrency, not residue —
@@ -258,6 +285,18 @@ separate knob, `reap --warm N` (see "Recycling" below), because conflating
 the two makes sustained runs slower: a residue cap set as low as the
 concurrency cap means every run past the first pays a fresh cold boot for a
 slot that was needlessly shut down the moment it went idle.
+
+The cap is enforced in both directions, and for a long time it was not.
+The acquisition paths only ever refuse to *create* slot number `--max`+1;
+they are perfectly happy to reuse a group that already has more. Nothing
+else removed a slot either — `reap --purge` deletes by idle time, not by
+cap, and is off by default — so a group that got past the cap once stayed
+past it forever, each extra slot keeping its own multi-gigabyte simulator
+alive. On the machine this was written for, one group sat at seven slots
+against a cap of three for seventeen days: four simulators that should
+never have existed, 2.4 GB each, on a disk with 6.9 GB left. `reap --max`
+(on by default, see "Recycling") is what brings an oversized group back
+down.
 
 Booting itself is throttled machine-wide, separately from either cap: at
 most `SIMPOOL_BOOT_CONCURRENCY` simulators (default `ncpu/2`) boot at once,
@@ -353,25 +392,38 @@ Every `mav tap`/`mav swipe`/`mav screenshot` MAV runs will now call this
 before each action to resolve its target. Leases are **sticky by key** —
 default `--key` is the current git repo's root (or the working directory
 if there's no repo) — so every call from the same repo lands on the same
-slot, renewing a TTL (default ~3 minutes) each time. Two worktrees of the
+slot, renewing a TTL (default 10 minutes, `SIMPOOL_LEASE_TTL`) each time.
+Two worktrees of the
 same repo get two different keys, and therefore two different simulators,
 automatically. Release explicitly with `simpool release` once a session is
 done, or just let the TTL lapse.
 
-The TTL is deliberately short: it only has to cover the gap between
-consecutive hot-loop calls, which is seconds, not the gap a long-running
-`mav run` step (a build) can leave between calls, which can be minutes. A
-short TTL is what lets an idle repo give its slot back within a few
-minutes instead of camping on it for half an hour, which matters when
-there are more repos than slots. Covering that longer gap is deliberately
-not this TTL's job: a `mav run` reinvokes `target_command` periodically on
-its own as a liveness signal for as long as it runs, independent of what
-TTL the pool manager behind it happens to use — see MAV's README
-(`target_command`) for that half of the story. A workload with a real
-long-lived process of its own to attach a lock to (`bazel test`, or `mav
-run` invoked directly rather than through `target_command`) should still
-use `with`, not `lease` — see "Environment `with`/`acquire` export" and
-the top of this section for that distinction.
+**The TTL has to cover the longest silence, not the shortest gap.** This
+used to be three minutes, on the reasoning that a lease only bridges the
+seconds between consecutive hot-loop calls and that a short TTL lets an
+idle repo hand its slot back quickly. That measured the wrong interval. A
+`mav run` step is 4-8 minutes on a loaded machine and makes no calls while
+it runs, so at three minutes the lease expired *under its live owner*,
+mid-run: the next `mav open` was handed a different slot and cold-booted a
+simulator nobody needed — four of them in one session, on a machine that
+had 6.9 GB of disk left. A reservation that lapses while its holder is
+still working is not a reservation.
+
+Ten minutes clears a real run with headroom. That is not the "keepalive
+that proves existence rather than progress" trap: nothing renews a lease on
+a timer and no background thread renews it at all — a lease is extended
+only by an actual `simpool lease` call, which is the consumer doing another
+unit of work. A consumer that hangs stops calling and its lease expires
+within one TTL no matter what the process is still doing. A longer TTL
+lengthens how long a *dead* owner's slot stays reserved; it does not create
+a way for a *stuck* one to keep renewing. Raise or lower it with
+`SIMPOOL_LEASE_TTL` or `--ttl`.
+
+A workload with a real long-lived process of its own to attach a lock to
+(`bazel test`, or `mav run` invoked directly rather than through
+`target_command`) should still use `with`, not `lease` — see "Environment
+`with`/`acquire` export" and the top of this section for that
+distinction.
 
 **A lease is not a flock, and it does not pretend to be one.** `with` and
 `acquire` are backed by a real kernel `flock()`: the instant the holding

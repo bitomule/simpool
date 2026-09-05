@@ -57,6 +57,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
 	dryRun := fs.Bool("dry-run", false, "report what would happen without changing anything")
 	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify: for an unverifiable `with` process-group fingerprint (a recycled pid, or a process group owned by another user), forget this slot's identity and delete its device WITHOUT signaling the process, which if actually still alive is left running untouched; for orphaned residue (an idb_companion daemon, or an orphaned `simctl spawn <udid> log stream`) whose target device is confirmed NOT RUNNING but whose identity as this slot's own could not be confirmed (deleted, or named for something else), KILL the already narrowly-verified residue pid(s) and forget the stale device reference — unlike the first case, forgetting alone would leave them running and re-poisoning this slot forever, since neither self-terminates. Never a live lease/acquire consumer, a check that merely failed to run, or residue attached to a device that is still running (that one is reclaimed automatically instead, with the device-identity guard intact — this flag skips that guard, so it must never act without a not-running device behind it). Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
+	maxSlots := fs.Int("max", pool.MaxSlotsPerGroup(), "maximum slots a device+OS group may have at all: excess slots that are free, unleased, unquarantined and idle are DELETED — simulator and slot directory both — newest kept, coldest first. This is the enforcement half of the same --max that AcquireSlots/AcquireLease apply at claim time; without it --max is a one-way ratchet, since nothing else ever removes a slot and every acquisition happily reuses whatever exists (env "+pool.EnvMaxSlots+"). 0 disables the pass entirely. Unlike --purge this is on by default: a group over its own declared cap is by definition holding simulators that should never have existed. Make sure this process resolves the SAME --max as the acquirers around it — a launchd job inherits almost no environment")
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
@@ -80,6 +81,17 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 		for _, n := range pool.ListSlotNumbers(groupDir) {
 			dir := pool.SlotDir(groupDir, n)
 			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, stdout, stderr)
+		}
+	}
+
+	// Before --warm, and after the per-slot pass above: --cold has by now
+	// shut down whatever was idle, so an excess slot is usually already
+	// cold here and needs no shutdown of its own; and there is no point
+	// deciding which simulators to keep warm among slots this pass is about
+	// to delete.
+	if *maxSlots > 0 {
+		for _, groupDir := range groups {
+			enforceSlotCap(root, groupDir, *maxSlots, *dryRun, stdout, stderr)
 		}
 	}
 

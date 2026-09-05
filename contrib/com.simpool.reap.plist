@@ -15,6 +15,17 @@
 
   The flags below are one policy, not the only one:
 
+    --max 3                  bring any group holding more than three slots
+                             back down to three, deleting the excess
+                             simulators. This is ON BY DEFAULT and is
+                             spelled out here for a reason: `--max` is
+                             resolved independently by every process that
+                             reads it, and a launchd job inherits almost no
+                             environment, so if your acquirers run with
+                             SIMPOOL_MAX_SLOTS set to something else this
+                             number must be changed to match. A 30-minute
+                             idle grace keeps a mismatch loud and slow
+                             rather than silent and immediate.
     --purge-orphan-runtimes  kill the userland of devices that no longer
                              exist — only ever processes whose device is
                              absent from a device listing that succeeded and
@@ -25,9 +36,11 @@
     --warm 2                 keep two booted per device+OS group, so the next
                              acquisition does not pay a cold boot.
 
-  Deliberately NOT here: --purge (deletes simulators outright) and
-  --purge-orphans (deletes orphaned devices). Both are destructive to devices
-  rather than to dead processes, and neither should run unattended.
+  Deliberately NOT here: --purge (deletes simulators outright by idle time)
+  and --purge-orphans (deletes orphaned devices). Both are destructive to
+  devices rather than to dead processes, and neither should run unattended.
+  --max also deletes devices, but only ones the pool's own declared cap says
+  should never have existed, which is a different kind of decision.
 
   Adjust the simpool path if you did not install via Homebrew: launchd jobs
   inherit PATH=/usr/bin:/bin:/usr/sbin:/sbin, so it must be absolute.
@@ -37,6 +50,7 @@
   <key>ProgramArguments</key><array>
     <string>/opt/homebrew/bin/simpool</string>
     <string>reap</string>
+    <string>--max</string><string>3</string>
     <string>--purge-orphan-runtimes</string>
     <string>--cold</string><string>60</string>
     <string>--warm</string><string>2</string>

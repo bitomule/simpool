@@ -12,20 +12,105 @@ import (
 	"github.com/bitomule/simpool/internal/procs"
 )
 
-// TestDefaultLeaseTTL_IsShortEnoughToRotateASmallPool pins DefaultLeaseTTL
-// at 3 minutes so a future change doesn't silently drift back toward the
-// old 30-minute default. The number matters operationally, not just as a
-// magic constant: with --max slots per group shared by several repos, a
-// TTL this short is what lets an idle repo give its slot back quickly
-// enough for others to rotate through a small pool, while still comfortably
-// covering the gap between consecutive hot-loop calls (seconds, not
-// minutes) that it actually exists to bridge. A longer silent gap — the
-// build inside one `mav run` step — is deliberately not this TTL's problem
-// to solve; that is MAV's own target_command keepalive's job (see MAV's
-// README, "MAV in the hot loop" below).
-func TestDefaultLeaseTTL_IsShortEnoughToRotateASmallPool(t *testing.T) {
-	if DefaultLeaseTTL != 3*time.Minute {
-		t.Fatalf("DefaultLeaseTTL=%v, want 3m", DefaultLeaseTTL)
+// longestMeasuredRun is the upper end of a MAV run on a loaded machine
+// (4-8 minutes, measured). The lease TTL has to clear it: see
+// DefaultLeaseTTL's doc comment for why the relevant number is the longest
+// SILENCE a live consumer can produce, not the gap between two consecutive
+// hot-loop calls.
+const longestMeasuredRun = 8 * time.Minute
+
+// TestDefaultLeaseTTL_CoversAWholeRun replaces an earlier test that pinned
+// this constant at 3 minutes for the opposite reason — that a short TTL
+// lets an idle repo rotate its slot back into a small pool quickly. That
+// rationale was measuring the wrong thing. Three minutes is less than one
+// MAV run, so the lease expired UNDER ITS LIVE OWNER, mid-run: the next
+// `mav open` was handed a different slot and cold-booted a simulator
+// nobody needed, four times in one session on the machine this was written
+// against. A lease that expires while its holder is still working is not a
+// reservation at all.
+//
+// The property, not the number, is what this pins: whatever the default
+// becomes, it must clear the longest run it is supposed to protect.
+func TestDefaultLeaseTTL_CoversAWholeRun(t *testing.T) {
+	if DefaultLeaseTTL <= longestMeasuredRun {
+		t.Fatalf("DefaultLeaseTTL=%v does not cover a %v run: a lease that expires under a live owner invites the next caller to take its slot and cold-boot another simulator", DefaultLeaseTTL, longestMeasuredRun)
+	}
+}
+
+// TestLeaseTTL_EnvOverride proves SIMPOOL_LEASE_TTL is honoured and that a
+// junk or non-positive value falls back to the default rather than
+// producing a lease that is already expired when written.
+func TestLeaseTTL_EnvOverride(t *testing.T) {
+	for _, tc := range []struct {
+		set  string
+		want time.Duration
+	}{
+		{"15m", 15 * time.Minute},
+		{"", DefaultLeaseTTL},
+		{"nonsense", DefaultLeaseTTL},
+		{"0s", DefaultLeaseTTL},
+		{"-5m", DefaultLeaseTTL},
+	} {
+		t.Setenv(EnvLeaseTTL, tc.set)
+		if got := LeaseTTL(); got != tc.want {
+			t.Errorf("%s=%q: LeaseTTL()=%v, want %v", EnvLeaseTTL, tc.set, got, tc.want)
+		}
+	}
+}
+
+// TestAcquireLease_ARunOutlivingItsTTLLosesItsSimulator is the ablation for
+// the bug the TTL change fixes, run in both directions against the same
+// scenario: repo A takes a lease and then works for five minutes without
+// making another call (the silent gap inside one `mav run` step), and repo
+// B asks for a slot in the middle of that.
+//
+// With a TTL shorter than the run, A's reservation is already dead when B
+// arrives: B takes A's slot, and A's next call — its next `mav tap` — finds
+// its sticky slot gone and lands somewhere else, which means a cold boot
+// and a different simulator halfway through A's own run. With a TTL that
+// covers the run, A keeps its slot from the first call to the last and B is
+// sent elsewhere, which is the entire point of a reservation.
+func TestAcquireLease_ARunOutlivingItsTTLLosesItsSimulator(t *testing.T) {
+	const runSoFar = 5 * time.Minute
+
+	for _, tc := range []struct {
+		name     string
+		ttl      time.Duration
+		wantKept bool
+	}{
+		{"ttl shorter than the run (the bug)", 3 * time.Minute, false},
+		{"ttl covering the run (the fix)", DefaultLeaseTTL, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+
+			a, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", tc.ttl, 3)
+			if err != nil {
+				t.Fatalf("repo-a's first lease: %v", err)
+			}
+			// Age repo-a's lease by runSoFar without sleeping: rewrite it
+			// exactly as it would read five minutes into the run.
+			if err := WriteLease(a.Dir, Lease{Key: "repo-a", ExpiresAt: time.Now().Add(tc.ttl - runSoFar)}); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := AcquireLease(root, "TestDevice", "1.0", "repo-b", tc.ttl, 3); err != nil {
+				t.Fatalf("repo-b's lease: %v", err)
+			}
+
+			again, err := AcquireLease(root, "TestDevice", "1.0", "repo-a", tc.ttl, 3)
+			if err != nil {
+				t.Fatalf("repo-a's next call: %v", err)
+			}
+
+			kept := again.Number == a.Number
+			if kept != tc.wantKept {
+				if tc.wantKept {
+					t.Fatalf("repo-a started on slot-%d and was moved to slot-%d mid-run: its simulator was taken and the next one has to cold-boot", a.Number, again.Number)
+				}
+				t.Fatalf("repo-a kept slot-%d with a %v TTL across a %v run — the ablation no longer reproduces the bug", a.Number, tc.ttl, runSoFar)
+			}
+		})
 	}
 }
 

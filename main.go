@@ -44,13 +44,15 @@ Usage:
       lease and device boot state. Same verdict with/acquire/lease
       decide by — see README "Why a slot can be refused".
 
-  simpool reap [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--dry-run]
+  simpool reap [--max N] [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--dry-run]
       Recycle free+cold slots; never touches one with a live owner or an
-      active lease. Also clears expired lease files. --warm caps how many
-      free simulators stay booted per group, independent of --max (which
-      caps how many may be resident/locked at once). --orphans reports
-      pool-named simulators no slot references; --purge-orphans deletes
-      them (only on that explicit request).
+      active lease. Also clears expired lease files. --max (on by default)
+      deletes the slots a group holds beyond its cap, newest kept: it is
+      the only thing that ever brings an oversized group back down, since
+      the acquisition paths only refuse to create slot max+1. --warm caps
+      how many free simulators stay booted per group, independent of --max.
+      --orphans reports pool-named simulators no slot references;
+      --purge-orphans deletes them (only on that explicit request).
 
   simpool doctor
       Check pool coherence. Exits non-zero if anything looks wrong.`)

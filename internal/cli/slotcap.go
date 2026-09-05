@@ -230,7 +230,44 @@ func classifyCapSlot(root, group string, n int, dir string) capCandidate {
 		}
 	}
 	if c.meta.UDID == "" {
-		return c // never provisioned: only a directory to remove
+		// meta.json is advisory and can be lost entirely (crash mid-write,
+		// disk full, a human `rm`) without the simulator itself going
+		// anywhere — ensureProvisioned's own by-name recovery path exists
+		// for exactly this. Blindly treating this as "never provisioned"
+		// would delete only the directory and free the slot number for
+		// reuse, orphaning a real, multi-gigabyte simulator that the
+		// scheduled --max pass was supposed to reclaim, and that nothing
+		// else in simpool will ever find again without an opt-in `reap
+		// --orphans/--purge-orphans`. So look for a device already sitting
+		// in the default set under this slot's own deterministic name
+		// before assuming there is nothing to delete.
+		devices, err := listPoolDevices()
+		if err != nil {
+			c.blocked = fmt.Sprintf("device set could not be checked (%v)", err)
+			return c
+		}
+		want := pool.DeviceNameForGroup(root, group, n)
+		var matches []simctl.DeviceEntry
+		for _, d := range devices {
+			if d.Name == want {
+				matches = append(matches, d)
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return c // truly never provisioned: only a directory to remove
+		case 1:
+			c.meta.UDID = matches[0].UDID
+			c.entry = matches[0]
+			c.exists = true
+			return c
+		default:
+			// simctl does not enforce unique names; refuse to guess which
+			// one is this slot's, mirroring ensureProvisioned's own
+			// refuse-to-guess branch.
+			c.blocked = fmt.Sprintf("%d devices named %q in the default set — refusing to guess which is this slot's", len(matches), want)
+			return c
+		}
 	}
 
 	entry, found, err := findDevice(c.meta.UDID)

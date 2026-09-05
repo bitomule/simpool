@@ -173,9 +173,12 @@ func TestEnforceSlotCap_NeverTouchesAnOccupiedSlot(t *testing.T) {
 	defer held.Release()
 
 	var stdout, stderr bytes.Buffer
-	// --max 3 with three untouchable slots (2, 3, 4) means both idle ones
-	// are over the cap and must go.
-	enforceSlotCap(h.root, h.groupDir, 3, false, &stdout, &stderr)
+	// --max 2 with two hard-untouchable slots (2 leased, 4 locked) plus
+	// slot-3 protected only by slotCapGrace means keep = 2-2 = 0: nothing
+	// but the grace itself keeps slot-3 alive here, so this is the only
+	// case in the file where slotCapGrace is load-bearing rather than
+	// redundant with MRU-first keep.
+	enforceSlotCap(h.root, h.groupDir, 2, false, &stdout, &stderr)
 
 	for _, udid := range []string{udidFor(2), udidFor(3), udidFor(4)} {
 		if containsStr(h.deleted, udid) {
@@ -185,6 +188,9 @@ func TestEnforceSlotCap_NeverTouchesAnOccupiedSlot(t *testing.T) {
 	got := h.slotDirs(t)
 	if len(got) != 3 {
 		t.Fatalf("want slots [2 3 4] to survive, got %v\n%s", got, stdout.String())
+	}
+	if _, err := os.Stat(pool.SlotDir(h.groupDir, 3)); err != nil {
+		t.Fatalf("slot-3's directory should still exist, protected by slotCapGrace: %v", err)
 	}
 }
 
@@ -250,6 +256,90 @@ func TestEnforceSlotCap_DryRunChangesNothing(t *testing.T) {
 			t.Fatalf("slot-%d still locked after --dry-run: %v", n, err)
 		}
 		l.Release()
+	}
+}
+
+// TestEnforceSlotCap_RecoversAZeroUDIDSlotByName proves a slot whose
+// meta.json was lost (crash mid-write, disk full, a human `rm`) before a
+// UDID was ever recorded is not treated as "nothing to delete": if a
+// device sitting in the default set under this slot's own deterministic
+// name is found, the pass recovers it and deletes it exactly like any
+// other evictable slot, rather than removing only the directory and
+// leaking the simulator forever.
+func TestEnforceSlotCap_RecoversAZeroUDIDSlotByName(t *testing.T) {
+	now := time.Now()
+	h := newCapHarness(t, map[int]time.Time{
+		0: now.Add(-9 * time.Hour),
+		1: now.Add(-8 * time.Hour),
+	})
+	// slot-2: a directory with no meta.json at all — never got as far as
+	// recording a UDID.
+	if err := os.MkdirAll(pool.SlotDir(h.groupDir, 2), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recoveredUDID := "udid-recovered-slot-2"
+	withFakeDevices(t, []simctl.DeviceEntry{
+		{UDID: recoveredUDID, Name: pool.DeviceNameForGroup(h.root, h.group, 2), State: "Shutdown", IsAvailable: true},
+	})
+
+	var stdout, stderr bytes.Buffer
+	enforceSlotCap(h.root, h.groupDir, 2, false, &stdout, &stderr)
+
+	if !containsStr(h.deleted, recoveredUDID) {
+		t.Fatalf("zero-UDID slot's recovered device was not deleted; deleted=%v\n%s", h.deleted, stdout.String())
+	}
+	got := h.slotDirs(t)
+	want := []int{0, 1}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got slots %v, want %v (slot-2's directory removed along with its recovered device)", got, want)
+	}
+}
+
+// TestEnforceSlotCap_RefusesAmbiguousZeroUDIDRecovery proves that when more
+// than one device in the default set carries this slot's deterministic
+// name, the pass refuses to guess which one is really this slot's, the
+// same refuse-to-guess rule ensureProvisioned's own by-name recovery
+// follows.
+func TestEnforceSlotCap_RefusesAmbiguousZeroUDIDRecovery(t *testing.T) {
+	now := time.Now()
+	// slot-0: idle, evictable free candidate.
+	// slot-2: leased, hard-blocked, forces the group over --max 1 so the
+	// pass actually runs classification instead of exiting early at the
+	// "already within cap" check.
+	h := newCapHarness(t, map[int]time.Time{
+		0: now.Add(-9 * time.Hour),
+	})
+	if err := os.MkdirAll(pool.SlotDir(h.groupDir, 1), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	leasedDir := pool.SlotDir(h.groupDir, 2)
+	if err := os.MkdirAll(leasedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.WriteLease(leasedDir, pool.Lease{Key: "repo-a", ExpiresAt: now.Add(5 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	name := pool.DeviceNameForGroup(h.root, h.group, 1)
+	withFakeDevices(t, []simctl.DeviceEntry{
+		{UDID: "udid-ambiguous-a", Name: name, State: "Shutdown", IsAvailable: true},
+		{UDID: "udid-ambiguous-b", Name: name, State: "Shutdown", IsAvailable: true},
+	})
+
+	var stdout, stderr bytes.Buffer
+	// --max 1 with slot-1 (ambiguous) and slot-2 (leased) both blocked
+	// already meets the cap on its own, so only slot-0 is ever evicted —
+	// isolating the assertion to whether the ambiguous slot was touched.
+	enforceSlotCap(h.root, h.groupDir, 1, false, &stdout, &stderr)
+
+	for _, udid := range []string{"udid-ambiguous-a", "udid-ambiguous-b"} {
+		if containsStr(h.deleted, udid) {
+			t.Fatalf("deleted a device from an ambiguous zero-UDID match: %v\n%s", h.deleted, stdout.String())
+		}
+	}
+	got := h.slotDirs(t)
+	want := []int{1, 2}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("got surviving slots %v, want %v (slot-0 evicted, ambiguous slot-1 and leased slot-2 kept)", got, want)
 	}
 }
 

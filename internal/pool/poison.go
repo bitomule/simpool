@@ -110,8 +110,8 @@ const (
 // it (see isReclaimableResidue) may be treated as residue rather than as
 // infrastructure for a session in progress.
 //
-// Deliberately an order of magnitude above DefaultLeaseTTL (3m) rather than
-// equal to it. A lapsed lease alone already makes a slot available to a new
+// Deliberately several times DefaultLeaseTTL (10m) rather than equal to it.
+// A lapsed lease alone already makes a slot available to a new
 // consumer by design, but a companion is the last trace of a MAV session
 // that might merely be quiet — stuck in a long `mav run` build between two
 // calls — and the cost of guessing wrong is reclaiming a slot out from

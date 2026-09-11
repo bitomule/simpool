@@ -52,6 +52,16 @@ type provisionDeps struct {
 	// adopt-or-create flow.
 	shutdown func(udid string) error
 	delete   func(udid string) error
+	// slim brings a device to the configured slim profile before it is
+	// handed out (see slim.go). Faked in tests for the same reason as
+	// everything else here: the real one boots and reboots a simulator.
+	//
+	// A nil slim is treated as "slimming disabled", not as a crash: the
+	// fakes that predate slimming exercise the adopt/create/boot logic
+	// this field has nothing to do with, and making each of them carry a
+	// no-op would be noise. liveProvisionDeps always sets it, and
+	// TestLiveProvisionDepsSlims guards exactly that.
+	slim func(udid string, timeout time.Duration) (bool, error)
 }
 
 var liveProvisionDeps = provisionDeps{
@@ -62,6 +72,7 @@ var liveProvisionDeps = provisionDeps{
 	bootAndWait:    simctl.BootAndWait,
 	shutdown:       simctl.Shutdown,
 	delete:         simctl.Delete,
+	slim:           SlimDevice,
 }
 
 // EnvStrictSubstance, when set to "0", disables substance verification and
@@ -372,6 +383,40 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		if remaining < simctl.MinBootBudget {
 			_ = gate.Release()
 			return fmt.Errorf("simpool: the boot-concurrency gate took long enough to free up that only %s remained of the %s boot timeout — too little to attempt a real boot; the machine may be overloaded with simultaneous boots, try again or override %s/%s", remaining.Round(time.Millisecond), bootTimeout, EnvBootTimeout, EnvBootConcurrency)
+		}
+		// Slimming happens inside the boot gate, before the boot-and-wait
+		// below, because it boots the device itself (and reboots it, the
+		// one time it has anything to change) — exactly the simultaneous
+		// cold boots the gate exists to keep off a memory-constrained
+		// machine. It gets its own budget rather than a share of
+		// bootTimeout: reconfiguring 170 launchd labels and rebooting is
+		// minutes of work the first time, and charging it to a timeout
+		// sized for a single boot would fail every slot's first
+		// provisioning. Later acquisitions of the same slot read the
+		// overrides, find them already in place, and return in about as
+		// long as a `simctl list` takes.
+		if SlimEnabled() && deps.slim != nil {
+			slimmed, slimErr := deps.slim(udid, SlimTimeout())
+			switch {
+			case slimErr != nil:
+				// A slot that could not be slimmed is still a usable
+				// slot — just a fat one — and failing the acquisition
+				// would take a test run down over an optimisation. Say
+				// so loudly instead: a pool silently running stock is a
+				// pool whose capacity assumptions are wrong.
+				fmt.Fprintf(os.Stderr, "simpool: could not slim %s (%v) — continuing with a stock simulator; it will use several GB more memory than a slim one\n", udid, slimErr)
+			case slimmed:
+				fmt.Fprintf(os.Stderr, "simpool: slimmed %s (disabled the background daemons a test simulator does not need; this happens once per slot)\n", udid)
+			}
+			// The slim step consumed its own budget, not the caller's, so
+			// the boot-and-wait below starts from a full bootTimeout
+			// again rather than from whatever minutes of a 180s budget
+			// the reconfigure left behind (usually none). The bound this
+			// codebase promises therefore becomes SlimTimeout +
+			// bootTimeout, and only on the one acquisition per slot that
+			// actually reconfigures anything; every other path is
+			// unchanged.
+			remaining = bootTimeout
 		}
 		bootErr := deps.bootAndWait(udid, remaining)
 		_ = gate.Release()

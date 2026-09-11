@@ -268,7 +268,24 @@ simpool reap [--max N] [--cold N] [--stuck-after D] [--scrub N] [--purge N] [--p
 
 simpool doctor
     Read-only coherence check. Exits non-zero if anything looks wrong.
+
+simpool version [--short]
+    Print this binary's version, commit, Go version and platform.
+    --short prints only the version, for scripts.
 ```
+
+Worth asking whenever one pool is shared by copies of simpool that were
+not installed together: versions disagree about defaults — `--max` is 6
+for a slim pool since v0.17.0 and 3 before it — so an older reaper can
+delete slots a newer acquirer was entitled to create, which looks like a
+bug in neither of them. Asking the package manager is not the same
+check: it knows what it installed, not what is on `PATH`.
+
+A build that the release workflow did not stamp reports `dev`, never a
+release number. That is deliberate: `go build` from a checkout derives a
+version from the nearest reachable tag, so unreleased work one commit
+past `v0.16.0` would otherwise introduce itself as `v0.16.0`. The commit
+is printed underneath and identifies such a build properly.
 
 ### Provisioning: a UDID is only handed out once it's usable
 
@@ -1253,8 +1270,9 @@ does not need to be installed for any of this to work, though it is
 useful by hand (`simslim measure`, `simslim profiles`, `simslim status`)
 and the docs above point at it for that.
 
-simpool itself ships no LICENSE file. That predates this change and is
-not something a dependency decides; it is worth fixing separately.
+simpool itself is MIT ([`LICENSE`](LICENSE)), which is also what makes
+bundling simslim straightforward: same license, same obligations, one
+`NOTICE` carrying both attributions.
 
 ## Testing
 

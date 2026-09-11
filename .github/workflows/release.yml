@@ -24,8 +24,9 @@ jobs:
       - name: Build
         run: |
           mkdir -p dist
-          GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/simpool-darwin-arm64 .
-          GOOS=darwin GOARCH=amd64 go build -trimpath -o dist/simpool-darwin-amd64 .
+          ldflags="-X github.com/bitomule/simpool/internal/cli.Version=${{ steps.version.outputs.tag }}"
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$ldflags" -o dist/simpool-darwin-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$ldflags" -o dist/simpool-darwin-amd64 .
           cd dist
           shasum -a 256 * > checksums.txt
       - uses: softprops/action-gh-release@v2
@@ -97,6 +98,11 @@ jobs:
 
             test do
               assert_match "simpool", shell_output("#{bin}/simpool status 2>&1", 0)
+              # Not just that it runs: that the binary Homebrew installed
+              # reports the version Homebrew thinks it installed. An
+              # unstamped build says "dev", which would fail here rather
+              # than shipping a copy that cannot identify itself.
+              assert_equal "v#{version}", shell_output("#{bin}/simpool version --short").strip
             end
           end
           EOF

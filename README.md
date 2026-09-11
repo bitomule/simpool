@@ -27,6 +27,12 @@ people on one machine.
 - **Your own simulators are untouchable.** `reap` and `doctor` refuse to
   shut down, delete or otherwise act on any device in the default set whose
   name does not start with `SIMPOOL_`.
+- **Slots are slimmed, so more of them fit.** A stock simulator boots ~265
+  processes of Siri, Spotlight, iCloud and Wallet that no test runner ever
+  talks to. simpool disables them once per slot, which measured here cuts a
+  slot from 265 processes and 4.90GB to 73 and 1.09GB — and that memory is
+  the only reason the pool has a concurrency cap at all (see
+  [Slim slots](#slim-slots-why-the-cap-is-6-and-not-3)).
 
 Shutting down idle simulators is `reap`'s job, not something `with` does on
 exit — see [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away)
@@ -39,6 +45,12 @@ service that runs it on a schedule.
 - [Usage](#usage) — every subcommand and flag
 - [Why a slot can be refused](#why-a-slot-can-be-refused) — what
   `free`/`busy`/`leased`/`quarantined` mean, and why `--max 1` works
+- [Slim slots](#slim-slots-why-the-cap-is-6-and-not-3) — why slots boot
+  slimmed, what it saves, and how to turn it off
+- [Recycling](#recycling-shut-down-scrub-purge) — `--cold`, `--scrub` and
+  `--purge`, and why scrubbing is not purging
+- [Dependencies and licenses](#dependencies-and-licenses) — simslim (MIT),
+  and the Go 1.26 minimum
 - [Bazel](#bazel-simpool_ios_test_runner) — the `simpool_ios_test_runner` rule
 - [Pool layout](#pool-layout) — what lives on disk
 - [Architecture](#architecture-why-simpool-is-the-parent-not-execd-away) —
@@ -76,8 +88,10 @@ or from source:
 go build -o simpool .
 ```
 
-Go 1.25+, stdlib only, single binary, macOS only (uses BSD `flock`,
-`xcrun simctl`, `pgrep`, `lsof`, `ps`). `simpool_ios_test_runner` (see
+Go 1.26+, single binary, macOS only (uses BSD `flock`,
+`xcrun simctl`, `pgrep`, `lsof`, `ps`), and one Go dependency — see
+[Dependencies and licenses](#dependencies-and-licenses).
+`simpool_ios_test_runner` (see
 Bazel, below) looks for the Homebrew install path first
 (`/opt/homebrew/bin/simpool` or `/usr/local/bin/simpool`), so that's the
 path of least resistance for CI/agent machines too.
@@ -89,12 +103,14 @@ pool with no maintenance at all:
 brew services start simpool
 ```
 
-Every 30 minutes it runs `reap --purge-orphan-runtimes --cold 60 --warm 2`:
-shut down free simulators idle over an hour, keep two warm per group, and
-collect the processes of simulators that no longer exist. `reap --max` is
-on by default, so the same pass also brings any group that has drifted
-above its slot cap back down to it — deleting the excess simulators, which
-is the only scheduled thing that ever reclaims simulator disk. Logs to
+Every 30 minutes it runs `reap --purge-orphan-runtimes --cold 60 --warm 2
+--scrub 120`:
+shut down free simulators idle over an hour, keep two warm per group,
+collect the processes of simulators that no longer exist, and reclaim a
+slot's generated caches and logs (1.3-1.9GB each, measured here) once it
+has been cold for two hours, without deleting the simulator. `reap --max`
+is on by default, so the same pass also brings any group that has drifted
+above its slot cap back down to it, deleting the excess simulators. Logs to
 `/tmp/simpool-reap.log`; stop with `brew services stop simpool`.
 
 This is not optional housekeeping. `with` deliberately does not shut
@@ -143,7 +159,7 @@ simpool status
     acquisition paths decide by, not a separate opinion — see "Why a
     slot can be refused" below.
 
-simpool reap [--max N] [--cold N] [--stuck-after D] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
+simpool reap [--max N] [--cold N] [--stuck-after D] [--scrub N] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -160,6 +176,22 @@ simpool reap [--max N] [--cold N] [--stuck-after D] [--purge N] [--prune-runs-af
     doesn't do this on its own exit. Never touches a device whose name
     doesn't start with `SIMPOOL_`, no matter what meta.json says: the
     default device set also holds the user's own simulators.
+
+    --scrub N is the step between --cold and --purge: it deletes a cold
+    slot's generated caches, logs and temporary files WITHOUT deleting the
+    simulator. Measured on this pool's own slots, each ~4GB simulator was
+    holding 1.3-1.9GB of exactly that, over a gigabyte of it unified logs,
+    and until now the only way to get it back was --purge — which destroys
+    the slot, costs a re-provision, and hands back a *different* simulator
+    whose renderer may not be the one a repo's snapshot baselines were
+    recorded against. Scrubbing keeps the device, its UDID and its
+    installed apps. It only ever runs on a slot that is free, unleased,
+    unquarantined, confirmed to own its device, and already shut down —
+    every guard --purge needs, since it reuses the same path. Categories
+    are fixed by --scrub-categories (default caches,logs,temporary: the
+    ones iOS regenerates locally). Installed apps, documents, app data and
+    user media are not cleanup categories and are never touched. Respects
+    --dry-run, which reports what each slot would give back.
 
     --disown-poisoned is the manual, explicit-only escape from a
     *permanent* quarantine: a slot whose recorded consumer keeps testing
@@ -278,12 +310,96 @@ subprocess on every call. None of this changes exit codes or stdout
 contracts; it's meant to make a slow or wrong acquisition diagnosable
 straight from a `bazel test` log, without re-running anything.
 
+### Slim slots: why the cap is 6 and not 3
+
+A stock simulator boots around 265 processes. Almost none of them are
+anything a test runner talks to: Siri and the on-device ML stack,
+Spotlight, iCloud sync and keychain, Wallet, Health, News, Game Center,
+PosterBoard redrawing a wallpaper nobody is looking at. simpool disables
+them through [simslim](https://github.com/MobAI-App/simslim), which writes
+the disables into the simulator's own launchd overrides database.
+
+Measured on this project's hardware (iPhone 17 Pro, iOS 26.3, a device
+created outside the pool for the test):
+
+| | processes | phys_footprint |
+|---|---|---|
+| stock | 265 | 4.90 GB |
+| slim | 73 | 1.09 GB |
+
+Read that as "what this machine got", not as a spec. It is one device
+(iPhone 17 Pro), one runtime (iOS 26.3), one host (18GB Apple silicon),
+one measurement each, idle — no app installed, no test running — and
+`phys_footprint` double-counts shared memory, so it overstates what the
+machine actually gets back. simslim's own benchmark reports 2.5x across
+its fleet; this came out at 4.5x. Expect your own number to land somewhere
+between them, and measure before betting a cap on it:
+
+```
+simslim measure <udid>     # booted device, stock and then slim
+```
+
+That memory is the whole reason `--max` exists, so slimming is what moves it: a
+slim pool defaults to 6 slots per group instead of 3. The default is
+deliberately not quadrupled — the saving is measured on an idle simulator,
+and what a slot costs mid-test (the app, its host process, an install in
+flight) is not a number measured here yet. `SIMPOOL_MAX_SLOTS` still wins
+over both defaults.
+
+The overrides persist across reboot on iOS 18.5+, so a slot pays for this
+exactly once in its life: measured at 1m18s for a slot's first
+provisioning, against 1.5s for every acquisition after it, which finds the
+overrides already in place and reboots nothing. Runtimes older than that
+cannot persist them, and are reported as an error rather than silently
+slimmed for one boot — a pool whose capacity maths assumes slim slots must
+not quietly be handing out stock ones.
+
+#### What slimming does not fix
+
+It does not touch rendering, and it does not fix the slot-to-slot
+renderer differences this project has spent real days on. Verified rather
+than assumed: the same device was screenshotted before and after
+slimming, and the system palette is identical down to the exact bytes —
+the system greys (242,242,247) and the accent blue (0,136,255) are the
+same pixels either way.
+
+That is deliberately a *negative* result worth writing down. Two slots of
+the same device and runtime can still render system colours differently,
+which makes a snapshot suite pass on one slot and fail on another, and
+the pool's leases are sticky per checkout, so whoever lands on the wrong
+slot sees red on every run and goes looking in their own code. Slimming
+changes none of that. It remains a provisioning problem — which slot a
+consumer gets, and which slot a repo's baselines were recorded against —
+and it is still open.
+
+#### Turning it off, and tuning it
+
+- `SIMPOOL_SLIM=0` turns slimming off entirely, and takes the default cap
+  back to 3 with it.
+- `SIMPOOL_SLIM_EXCEPT` keeps whole categories enabled for a repo that
+  needs them (`push`, `store`, `photos`; `simslim profiles` lists them).
+- `SIMPOOL_SLIM_KEEP` keeps individual launchd labels enabled.
+- `SIMPOOL_SLIM_TIMEOUT` bounds the one-off reconfigure (default 10m).
+
+A slim that fails is reported on stderr and nothing more: the slot is
+handed out stock rather than the acquisition failing, because a fat
+simulator still runs tests and a failed one does not.
+
+#### Not measured yet
+
+What a slim slot costs *during a test* — the app installed and running,
+its host process, `xcodebuild` alongside it — is unknown. Every number
+above is an idle simulator. That measurement is what would say whether
+the cap can go above 6, so until someone takes it, 6 is a deliberately
+conservative default rather than a tuned one.
+
 ### Capacity
 
-Each device+OS group is capped at `--max` resident slots (default 3,
-override with `SIMPOOL_MAX_SLOTS`) — booting one costs ~1.75GB (design doc
-§3), so an uncapped pool turns ordinary contention into the kind of jetsam
-this tool exists to prevent. Once a group is at capacity, `with`/`acquire`
+Each device+OS group is capped at `--max` resident slots (default 6 for a
+slim pool, 3 for a stock one — see [Slim slots](#slim-slots-why-the-cap-is-6-and-not-3) —
+override with `SIMPOOL_MAX_SLOTS`) — booting a stock one costs ~1.75GB
+(design doc §3), so an uncapped pool turns ordinary contention into the
+kind of jetsam this tool exists to prevent. Once a group is at capacity, `with`/`acquire`
 poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
 before giving up. `lease` counts against the same `--max` (a leased slot is
 just as resident as a locked one) but never polls — see below.
@@ -316,6 +432,48 @@ SIGKILLs consumers, which is what creates the orphans `reap`/recovery exist
 to clean up in the first place. The gate is held only for the duration of
 one boot, never for a slot's lifetime, so it can never widen how long
 anything else has to wait on a slot's own lock.
+
+### Recycling: shut down, scrub, purge
+
+A slot that has been used costs three different things, and until
+recently `reap` could only address the first and the last of them.
+
+| | what it reclaims | what it costs you |
+|---|---|---|
+| `--cold N` | the memory of a booted-but-idle simulator | a cold boot (~110s) next time that slot is acquired |
+| `--scrub N` | the disk a slot's *generated* data holds: caches, unified logs, temporary files | nothing a slot cannot regenerate |
+| `--purge N` | all of that slot's disk, by deleting the simulator | a re-provision, and a **different** simulator |
+
+The middle row is the one that did not exist. A slot that stayed useful
+kept every log and cache it had ever produced, and the only way to get
+that disk back was to destroy the slot. Measured on this pool's own
+slots, each ~4GB simulator was holding 1.3–1.9GB of exactly that data,
+over a gigabyte of it unified logs — so the choice was a full purge or
+nothing, on a machine that regularly ran out of disk.
+
+Why the distinction matters beyond convenience: a purged slot comes back
+as a newly created simulator, and this project has already established
+that two slots of the same device and runtime can render system colours
+differently (see [What slimming does not
+fix](#what-slimming-does-not-fix)). Purging to reclaim disk therefore
+risks handing a repo a slot whose renderer is not the one its snapshot
+baselines were recorded against. Scrubbing keeps the device, its UDID,
+its installed apps and its renderer, and takes back only what iOS will
+regenerate on demand.
+
+It is safe to schedule for the same reason. `--scrub` reuses `--purge`'s
+own code path, so it inherits every guard `--purge` has before it may
+touch a slot: the flock is free, no live lease sits on it, it is not
+quarantined, its device exists, that device's real name in the default
+set is exactly what this slot must own, and it is already shut down.
+What it deletes is fixed by `--scrub-categories`, which defaults to
+`caches,logs,temporary` — the categories iOS regenerates locally.
+Installed apps, documents, app data and user media are not cleanup
+categories at all and are never passed to anything. `--dry-run` reports
+what each slot would give back without deleting a byte.
+
+The Homebrew service runs `--scrub 120`; `--purge` is still deliberately
+not scheduled (see [Build](#build)).
 
 ### Why a slot can be refused
 
@@ -1066,6 +1224,37 @@ the tree's leader is never missed even if the second pass fails. Within a
 device, pids are signalled in ascending order: `launchd_sim` necessarily
 holds a lower pid than anything it started, and it is the only member still
 able to spawn more.
+
+## Dependencies and licenses
+
+simpool was stdlib-only until slim slots landed. It now has exactly one
+Go dependency:
+
+| | |
+|---|---|
+| **[simslim](https://github.com/MobAI-App/simslim)** | MIT, © 2026 Interlap |
+| Used for | reading and writing a simulator's launchd disable overrides ([slim slots](#slim-slots-why-the-cap-is-6-and-not-3)), and measuring and deleting a simulator's regenerable on-disk data ([`reap --scrub`](#recycling)) |
+| Why not reimplement it | the daemon allowlist is ~170 launchd labels grouped into categories with their own downsides, kept current against new iOS runtimes by people who do that full time. Vendoring a stale copy of that list would be worse than depending on a maintained one |
+
+Two consequences worth stating plainly, because neither is reversible by
+someone who just installs the binary:
+
+- **The minimum Go version is now 1.26**, which is simslim's own minimum,
+  up from 1.25. The release workflow pins the same version.
+- **A released simpool binary statically links simslim**, so it carries
+  simslim's copyright notice and MIT license text with it. That is what
+  [`NOTICE`](NOTICE) is for, and the MIT license requires it to travel
+  with any copy — a GitHub release download, a Homebrew install, or your
+  own build. Keep it alongside anything you redistribute.
+
+There is still no runtime dependency: simpool remains a single binary
+that shells out to `xcrun simctl` and nothing else. The `simslim` CLI
+does not need to be installed for any of this to work, though it is
+useful by hand (`simslim measure`, `simslim profiles`, `simslim status`)
+and the docs above point at it for that.
+
+simpool itself ships no LICENSE file. That predates this change and is
+not something a dependency decides; it is worth fixing separately.
 
 ## Testing
 

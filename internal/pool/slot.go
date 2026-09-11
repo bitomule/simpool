@@ -16,6 +16,19 @@ import (
 // scenario simpool exists to prevent. Override with SIMPOOL_MAX_SLOTS.
 const DefaultMaxSlotsPerGroup = 3
 
+// DefaultMaxSlotsPerGroupSlim is the same cap for a pool that slims its
+// simulators (see slim.go), where the measured per-slot cost drops by
+// ~4.5x: 265 processes and 4.90GB of phys_footprint stock, 73 and 1.09GB
+// slim, on this project's own hardware. Doubling rather than quadrupling
+// the cap is deliberate — the saving is measured on an idle simulator, and
+// what a slot actually costs under a test run (the app itself, its host
+// process, a simulator mid-install) is not a number this project has
+// measured yet. Raise it with SIMPOOL_MAX_SLOTS once a machine has proven
+// it has the headroom; the point of the default is to be the value nobody
+// has to think about, and a default that reaches jetsam is worse than one
+// that leaves a little memory unused.
+const DefaultMaxSlotsPerGroupSlim = 6
+
 // EnvMaxSlots overrides DefaultMaxSlotsPerGroup.
 const EnvMaxSlots = "SIMPOOL_MAX_SLOTS"
 
@@ -25,13 +38,24 @@ var ErrAtCapacity = errors.New("simpool: pool at capacity")
 
 const acquirePollInterval = 2 * time.Second
 
-// MaxSlotsPerGroup resolves the effective per-group slot cap: SIMPOOL_MAX_SLOTS
-// if set to a positive integer, else DefaultMaxSlotsPerGroup.
+// MaxSlotsPerGroup resolves the effective per-group slot cap:
+// SIMPOOL_MAX_SLOTS if set to a positive integer, else the default for
+// whichever kind of simulator this pool provisions — slim slots cost a
+// fraction of stock ones, so the same machine safely holds more of them.
+//
+// Every process that applies this cap must resolve it the same way (see
+// `reap --max`, which is the enforcement half of the claim-time check), so
+// this reads SIMPOOL_SLIM rather than taking a parameter: a launchd job
+// inherits almost no environment, and a reaper that thought the pool was
+// stock would delete the very slots a slim pool is entitled to keep.
 func MaxSlotsPerGroup() int {
 	if v := os.Getenv(EnvMaxSlots); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
+	}
+	if SlimEnabled() {
+		return DefaultMaxSlotsPerGroupSlim
 	}
 	return DefaultMaxSlotsPerGroup
 }

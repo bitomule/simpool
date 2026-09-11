@@ -54,7 +54,7 @@ func TestReapSlot_RemovesDeadNeverProvisionedSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("slot directory %s should have been removed, stat err = %v\nstdout:\n%s\nstderr:\n%s", dir, err, stdout.String(), stderr.String())
@@ -74,7 +74,7 @@ func TestReapSlot_KeepsFreshNeverProvisionedSlotDir(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("fresh slot directory should survive reap, stat err = %v\nstdout:\n%s", err, stdout.String())
@@ -90,7 +90,7 @@ func TestReapSlot_PurgeDisabledKeepsDeadSlotDir(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0 /*purgeMinutes disabled*/, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("slot directory should survive with --purge disabled, stat err = %v", err)
@@ -106,7 +106,7 @@ func TestReapSlot_DryRunNeverDeletes(t *testing.T) {
 	makeAbandonedSlotDir(t, dir, 2*deadSlotGrace)
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, true /*dryRun*/, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("--dry-run must not remove the slot directory, stat err = %v", err)
@@ -188,7 +188,7 @@ func TestReapSlot_RecoversVerifiedOrphanEvenWithoutUDIDInArgv(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, false, &stdout, &stderr)
+	reapSlot(root, dir, 0 /*n*/, 0 /*coldMinutes*/, 0 /*purgeMinutes*/, time.Hour, 3*time.Minute, false /*dryRun*/, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("RECOVER")) {
 		t.Fatalf("reap should RECOVER a slot whose consumer is alive only via a verified ConsumerPGID (no UDID anywhere in argv), got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -236,7 +236,7 @@ func TestReapSlot_SkipsOrphanWithUnverifiableIdentity(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP a slot it cannot verify the identity of, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -282,7 +282,7 @@ func TestReapSlot_DisownPoisonedFreesAnUnverifiableSlotWithoutKilling(t *testing
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
 		t.Fatalf("reap --disown-poisoned should report reclaiming the slot, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -326,7 +326,7 @@ func TestReapSlot_DisownPoisonedDryRunNeverMutates(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	persisted := pool.ReadMeta(dir)
 	if persisted.ConsumerPGID != pgid || persisted.UDID != fakeUDID {
@@ -387,7 +387,7 @@ func TestReapSlot_DisownPoisonedNeverTouchesLiveLeaseConsumer(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, true /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, true /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
 		t.Fatalf("--disown-poisoned must never act on a live lease consumer, got:\n%s", stdout.String())
@@ -456,7 +456,7 @@ func TestReapSlot_RecoveryNeverFallsThroughToSamePassPurge(t *testing.T) {
 	// --purge 1 (minute): eligible immediately given the backdated LastUsed
 	// above, if reapSlot were to (incorrectly) fall through to that
 	// accounting in this same pass.
-	reapSlot(root, dir, 0, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0 /*coldMinutes*/, 1 /*purgeMinutes*/, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	out := stdout.String()
 	if !strings.Contains(out, "RECOVER") {
@@ -489,7 +489,7 @@ func TestReapSlot_SkipsSlotWithActiveLease(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP a slot with an active lease, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -520,7 +520,7 @@ func TestReapSlot_RemovesExpiredLeaseFile(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	// purgeMinutes=0 (disabled) so the never-provisioned-slot path leaves
 	// the directory itself alone — this test is only about the lease file.
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	lease, _ := pool.ReadLease(dir)
 	if lease.Key != "" {
@@ -545,7 +545,7 @@ func TestReapSlot_DryRunNeverRemovesExpiredLease(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	lease, _ := pool.ReadLease(dir)
 	if lease.Key != "old-repo" {
@@ -576,7 +576,7 @@ func TestReapSlot_UnreadableLeaseIsTreatedAsBusy(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 1, time.Hour, 3*time.Minute, false, false, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP a slot whose lease.json cannot be read, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -716,7 +716,7 @@ func TestReapSlot_SkipsCompanionWithUnverifiableDeviceIdentity(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, false /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, false /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("reap should SKIP an identity-unverifiable companion, not RECOVER it, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -757,7 +757,7 @@ func TestReapSlot_DryRunReportsCompanionWithoutKilling(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, true /*dryRun*/, true /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("SKIP")) {
 		t.Fatalf("dry-run must report SKIP, never act, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
@@ -804,7 +804,7 @@ func TestReapSlot_DisownPoisonedKillsUnverifiableCompanion(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, &stdout, &stderr)
+	reapSlot(root, dir, 0, 0, 0, time.Hour, 3*time.Minute, false /*dryRun*/, true /*disownPoisoned*/, 0 /*scrubMinutes*/, nil /*scrubCategories*/, &stdout, &stderr)
 
 	if !bytes.Contains(stdout.Bytes(), []byte("DISOWN")) {
 		t.Fatalf("reap --disown-poisoned should report reclaiming the companion, got:\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())

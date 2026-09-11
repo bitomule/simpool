@@ -59,11 +59,27 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	disownPoisoned := fs.Bool("disown-poisoned", false, "for a poisoned slot automatic recovery could not verify: for an unverifiable `with` process-group fingerprint (a recycled pid, or a process group owned by another user), forget this slot's identity and delete its device WITHOUT signaling the process, which if actually still alive is left running untouched; for orphaned residue (an idb_companion daemon, or an orphaned `simctl spawn <udid> log stream`) whose target device is confirmed NOT RUNNING but whose identity as this slot's own could not be confirmed (deleted, or named for something else), KILL the already narrowly-verified residue pid(s) and forget the stale device reference — unlike the first case, forgetting alone would leave them running and re-poisoning this slot forever, since neither self-terminates. Never a live lease/acquire consumer, a check that merely failed to run, or residue attached to a device that is still running (that one is reclaimed automatically instead, with the device-identity guard intact — this flag skips that guard, so it must never act without a not-running device behind it). Use after `simpool doctor`/`reap` keep reporting the same slot stuck across multiple runs")
 	maxSlots := fs.Int("max", pool.MaxSlotsPerGroup(), "maximum slots a device+OS group may have at all: excess slots that are free, unleased, unquarantined and idle are DELETED — simulator and slot directory both — newest kept, coldest first. This is the enforcement half of the same --max that AcquireSlots/AcquireLease apply at claim time; without it --max is a one-way ratchet, since nothing else ever removes a slot and every acquisition happily reuses whatever exists (env "+pool.EnvMaxSlots+"). 0 disables the pass entirely. Unlike --purge this is on by default: a group over its own declared cap is by definition holding simulators that should never have existed. Make sure this process resolves the SAME --max as the acquirers around it — a launchd job inherits almost no environment")
 	warmCap := fs.Int("warm", 0, "maximum free+booted simulators to keep warm per device+OS group, independent of --max (which caps how many may be resident/locked at once, not how many stay booted afterward); the most-recently-used ones are kept, the rest are shut down regardless of --cold. 0 (default) disables this and preserves today's behavior, where only --cold's idle-time check ever shuts a free slot down")
+	scrubMinutes := fs.Int("scrub", 0, "minutes a slot must have been shut down (already cold) before its generated caches, logs and temporary files are deleted WITHOUT deleting the simulator; 0 disables scrubbing. This is the step between --cold and --purge: measured on this pool's own slots, a ~4GB simulator holds 1.3-1.9GB of exactly this data, over a gigabyte of it unified logs. Unlike --purge it keeps the device — its UDID, its installed apps, and the renderer its snapshot baselines were recorded against — so reclaiming disk never costs a re-provision or a re-recorded baseline. Only touches a slot that is free, unleased, unquarantined, confirmed to own its device, and shut down")
+	scrubCategoryList := fs.String("scrub-categories", pool.DefaultScrubCategories, "comma-separated categories --scrub deletes. The default three are the ones iOS regenerates locally on demand; `linguistic-data` is also cleanable but comes back over the network. Installed apps, documents, app data and user media are not cleanup categories and are never touched")
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
 	purgeOrphanRuntimes := fs.Bool("purge-orphan-runtimes", false, "kill the still-running processes of simulators that no longer exist. Deleting a booted device does not stop the userland it booted: its launchd_sim tree is reparented to launchd and runs forever (measured here: 452 processes across 19 deleted devices, oldest 18 days, the machine paging itself to a standstill). Every `simpool reap` already REPORTS these; this flag is what kills them. Only ever touches processes whose device is absent from a device listing that succeeded and returned other devices — never one belonging to a live device, and nothing at all if that listing could not be trusted. Respects --dry-run")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	// Validated up front, before a single slot is walked: a typo in
+	// --scrub-categories must fail the command outright rather than
+	// halfway through a pass that has already deleted data under a
+	// different selection than the operator asked for.
+	var scrubCategories []string
+	if *scrubMinutes > 0 {
+		valid, err := pool.ScrubCategories(*scrubCategoryList)
+		if err != nil {
+			fmt.Fprintln(stderr, "simpool reap: --scrub-categories:", err)
+			return 2
+		}
+		scrubCategories = valid
 	}
 
 	root, err := pool.Root()
@@ -80,7 +96,7 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	for _, groupDir := range groups {
 		for _, n := range pool.ListSlotNumbers(groupDir) {
 			dir := pool.SlotDir(groupDir, n)
-			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, stdout, stderr)
+			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, *scrubMinutes, scrubCategories, stdout, stderr)
 		}
 	}
 
@@ -373,7 +389,33 @@ func enforceWarmCap(root, groupDir string, warmCap int, dryRun bool, stdout, std
 	}
 }
 
-func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, stdout, stderr io.Writer) {
+// scrubSlot reclaims a cold slot's generated caches, logs and temporary
+// files without deleting the simulator. Failure is reported and never
+// fatal: a slot that could not be scrubbed is exactly as usable as it was
+// before, and taking a scheduled reap pass down over reclaimable disk
+// would cost more than the disk is worth.
+func scrubSlot(label, udid string, idle time.Duration, scrubMinutes int, categories []string, dryRun bool, stdout, stderr io.Writer) {
+	if scrubMinutes <= 0 || idle < time.Duration(scrubMinutes)*time.Minute {
+		return
+	}
+	if dryRun {
+		reclaimable, err := pool.PlanScrub(udid, categories, pool.DefaultScrubTimeout)
+		if err != nil {
+			fmt.Fprintf(stderr, "reap %s: planning scrub of %s: %v\n", label, udid, err)
+			return
+		}
+		fmt.Fprintf(stdout, "SCRUB %s  would reclaim %s from %s (%s), simulator kept\n", label, pool.HumanBytes(reclaimable), udid, strings.Join(categories, ","))
+		return
+	}
+	reclaimed, err := pool.ScrubDevice(udid, categories, pool.DefaultScrubTimeout)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap %s: scrubbing %s: %v\n", label, udid, err)
+		return
+	}
+	fmt.Fprintf(stdout, "SCRUB %s  reclaimed %s from %s (%s), simulator kept\n", label, pool.HumanBytes(reclaimed), udid, strings.Join(categories, ","))
+}
+
+func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, scrubMinutes int, scrubCategories []string, stdout, stderr io.Writer) {
 	groupDir := filepath.Dir(dir)
 	label := filepath.Base(groupDir) + "/" + filepath.Base(dir)
 	lock, err := pool.TryLock(pool.LockPath(dir))
@@ -600,6 +642,15 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	}
 
 	fmt.Fprintf(stdout, "COLD  %s  already shut down\n", label)
+
+	// Everything above has already proven this slot is safe to act on:
+	// the flock is free, no live lease sits on it, it is not poisoned, the
+	// device exists, it is named exactly what this slot's device must be
+	// named, and it is shut down. That is a stricter set of guarantees
+	// than --purge itself needs, which is why the scrub can run here and
+	// nowhere else.
+	scrubSlot(label, meta.UDID, idle, scrubMinutes, scrubCategories, dryRun, stdout, stderr)
+
 	if purgeMinutes <= 0 || idle < time.Duration(purgeMinutes)*time.Minute {
 		return
 	}

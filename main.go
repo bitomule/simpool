@@ -55,7 +55,14 @@ Usage:
       --purge-orphans deletes them (only on that explicit request).
 
   simpool doctor
-      Check pool coherence. Exits non-zero if anything looks wrong.`)
+      Check pool coherence. Exits non-zero if anything looks wrong.
+
+  simpool version [--short]
+      Print this binary's version, commit, Go version and platform.
+      Worth asking when a pool is shared: versions disagree about
+      defaults (--max is 6 for a slim pool since v0.17.0, 3 before it),
+      and an older copy reaping a newer copy's slots looks like a bug
+      in neither of them.`)
 }
 
 func main() {
@@ -82,6 +89,8 @@ func main() {
 		code = cli.RunReap(rest, os.Stdout, os.Stderr)
 	case "doctor":
 		code = cli.RunDoctor(rest, os.Stdout, os.Stderr)
+	case "version", "--version", "-version":
+		code = cli.RunVersion(rest, os.Stdout, os.Stderr)
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)

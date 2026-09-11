@@ -1,25 +1,6 @@
-simpool is MIT licensed, Copyright (c) 2026 David Collado; see LICENSE.
-
-It also bundles third-party code in its compiled binary. Those licenses
-and copyright notices are reproduced below, as they require.
-
-The binary is statically linked, so a released simpool binary is a
-"substantial portion" of each of these works and carries these notices
-with it. Anyone redistributing simpool — the binary from a GitHub
-release, a Homebrew install, or a build of their own — must keep this
-file with it.
-
-================================================================================
-simslim — https://github.com/MobAI-App/simslim
-
-Used for the launchd work behind slim slots and `reap --scrub`: reading
-and writing a simulator's launchd disable overrides, and measuring and
-deleting a simulator's regenerable on-disk data. See the README's "Slim
-slots" section.
-
 MIT License
 
-Copyright (c) 2026 Interlap
+Copyright (c) 2026 David Collado
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -38,4 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-================================================================================

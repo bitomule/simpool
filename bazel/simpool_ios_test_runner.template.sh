@@ -808,6 +808,30 @@ if [[ "$should_use_xcodebuild" == true ]]; then
     -e "s@BAZEL_PRODUCT_PATH@$xcrun_test_bundle_path@g" \
     "%(xctestrun_template)s" > "$xctestrun_file"
 
+  # The template comes from whichever rules_apple the consumer depends on, and every
+  # `BAZEL_*_SECTION` marker in it stands for an OPTIONAL plist fragment that the
+  # upstream runner leaves empty when the corresponding feature is off. When
+  # rules_apple adds one and this runner has not learned it yet, the marker survives
+  # the substitutions above as literal text inside the plist, xcodebuild refuses the
+  # whole file with "The data couldn't be read because it isn't in the correct
+  # format", and the run reports a failure without executing a single test.
+  #
+  # rules_apple 5.0.0 did exactly that with `BAZEL_SCREEN_CAPTURE_FORMAT_SECTION`
+  # (absent in 5.0.0-rc3, present in 5.0.0), which is why this surfaced as a version
+  # bump breaking tests rather than as anything anyone changed here.
+  #
+  # So: blank any marker left over, which is precisely what the upstream runner emits
+  # for a feature that is off, and say so on stderr. Silence would trade a loud
+  # failure for a quiet one; a hard error would strand every consumer on the old
+  # rules_apple until this file caught up, for a section they were not using anyway.
+  leftover_sections=$(grep -o 'BAZEL_[A-Z_]*_SECTION' "$xctestrun_file" | sort -u || true)
+  if [[ -n "$leftover_sections" ]]; then
+    echo "note: this rules_apple template has xctestrun sections simpool does not fill; leaving them empty:" >&2
+    echo "$leftover_sections" | sed 's/^/note:   /' >&2
+    /usr/bin/sed -e 's@BAZEL_[A-Z_]*_SECTION@@g' "$xctestrun_file" > "$xctestrun_file.swept"
+    mv "$xctestrun_file.swept" "$xctestrun_file"
+  fi
+
   if [[ -n "${DEBUG_XCTESTRUNNER:-}" ]]; then
     echo
     echo "xctestrun contents:"

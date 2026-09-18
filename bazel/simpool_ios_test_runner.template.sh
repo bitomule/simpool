@@ -32,9 +32,10 @@
 #      acquisition instead of handing a wedged-but-nominally-"Booted"
 #      device straight to the next consumer (see the comment at its call
 #      site, right after the test execution block).
-# Everything else, including the fallback when simpool isn't installed
-# (this script then behaves like a stock ios_xctestrun_runner), is
-# unmodified upstream behavior.
+#   4. When simpool cannot be found, this FAILS the test action instead of
+#      quietly building its own simulator. Running unpooled is still
+#      possible, but it has to be asked for: SIMPOOL_OPTIONAL=1.
+# Everything else is unmodified upstream behavior.
 
 set -euo pipefail
 
@@ -103,19 +104,125 @@ simpool_run_bounded() {
 # run by a human, cron, or CI, is the only path that shuts down an
 # otherwise-idle slot's simulator — never a side effect of this script's
 # own acquisition.
-if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
-  simpool_bin=""
-  for candidate in "${SIMPOOL_BIN:-}" /opt/homebrew/bin/simpool /usr/local/bin/simpool; do
-    if [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]]; then
-      simpool_bin="$candidate"
-      break
+# simpool: >>> resolve-begin
+# Everything between these two markers is extracted verbatim and exercised
+# by TestRunnerTemplate* in runner_template_test.go, so it must stay free of
+# Bazel substitution placeholders — anything a message needs comes in
+# through an environment variable the caller sets.
+
+# Where to look, as data, so the loop and the error message cannot drift
+# apart. They used to: the loop checked three places and the message named a
+# hardcoded list beside it, with nothing keeping the two honest. Overridable
+# mainly so the tests can point it somewhere empty on a machine that does
+# have simpool installed; $SIMPOOL_BIN remains the way a person names a
+# binary in an unusual place.
+SIMPOOL_SEARCH_PREFIXES="${SIMPOOL_SEARCH_PREFIXES:-/opt/homebrew/bin /usr/local/bin}"
+
+simpool_search_places() {
+  local prefix places='$SIMPOOL_BIN'
+  for prefix in $SIMPOOL_SEARCH_PREFIXES; do
+    places="$places, $prefix/simpool"
+  done
+  printf '%s' "$places, and \$PATH"
+}
+
+# simpool_resolve_bin prints the path to a usable simpool binary, or fails.
+#
+# It retries, and the retry is not defensive padding: a `brew upgrade` of
+# simpool unlinks /opt/homebrew/bin/simpool and relinks it a moment later,
+# and a test action that looks in exactly that window sees no binary at all.
+# That window is believed to be how the one stray BAZEL_TEST_* simulator on
+# this machine was born — unproven, since no surviving test log carries the
+# warning, but it is the only path in this script that produces that name.
+# A miss is therefore not proof of absence, and ~3s of retry is far cheaper
+# than either a failed test action or a simulator nobody reclaims. The happy
+# path sleeps zero times.
+simpool_resolve_bin() {
+  local candidate attempt prefix
+  # Brace expansion rather than `seq`: a Bazel test action's PATH is
+  # sanitized, and a resolver that needs an external binary to decide
+  # whether a binary exists fails for the wrong reason. Caught by
+  # TestRunnerTemplate* running with PATH emptied.
+  for attempt in {1..10}; do
+    if [[ -n "${SIMPOOL_BIN:-}" && -f "${SIMPOOL_BIN}" && -x "${SIMPOOL_BIN}" ]]; then
+      printf '%s' "${SIMPOOL_BIN}"
+      return 0
+    fi
+    for prefix in $SIMPOOL_SEARCH_PREFIXES; do
+      candidate="$prefix/simpool"
+      if [[ -f "$candidate" && -x "$candidate" ]]; then
+        printf '%s' "$candidate"
+        return 0
+      fi
+    done
+    candidate="$(command -v simpool 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    if [[ "$attempt" -lt 10 ]]; then
+      # Absolute path and `|| true` for the same reason as the brace
+      # expansion above: `sleep` is an external binary, a sanitized PATH
+      # would not find it, and under `set -e` that failure would kill the
+      # whole test action rather than merely skip a pause.
+      /bin/sleep 0.3 2>/dev/null || true
     fi
   done
-  if [[ -z "$simpool_bin" ]]; then
-    simpool_bin="$(command -v simpool 2>/dev/null || true)"
+  return 1
+}
+
+# simpool_require_bin prints the binary path (0), asks to run unpooled (2),
+# or refuses (1).
+#
+# Refusing is the change this function exists for. Until now a missing
+# simpool meant silently falling back to a single shared
+# BAZEL_TEST_<device>_<os> simulator — one that no lease expires on, that no
+# `simpool reap` pass ever collects, and that every concurrent test action
+# missing simpool piles onto at once. Two simulators born that way were found
+# still booted days after the sessions that made them had been closed, with
+# the machine at a load average of 212. A warning on a test action's stderr
+# is not enough to prevent that: nobody reads the stderr of a test that
+# passed.
+#
+# There IS a legitimate case for running without a pool — a machine where
+# simpool is not installed, CI, a fresh checkout — so it stays possible. It
+# just has to be someone's deliberate decision rather than the default that
+# happens when a lookup fails: set SIMPOOL_OPTIONAL=1 (in Bazel,
+# `--test_env=SIMPOOL_OPTIONAL=1`). The point of the switch is that the
+# person who sets it knows what they are accepting, which is exactly what
+# nobody knew before.
+simpool_require_bin() {
+  local bin
+  if bin="$(simpool_resolve_bin)"; then
+    printf '%s' "$bin"
+    return 0
+  fi
+  if [[ "${SIMPOOL_OPTIONAL:-}" == "1" ]]; then
+    echo "warning: simpool binary not found (looked in $(simpool_search_places)), and SIMPOOL_OPTIONAL=1 — running against a single shared ${SIMPOOL_FALLBACK_NAME:-BAZEL_TEST} simulator with no concurrency safety. Nothing reclaims that simulator: delete it when you are done, and expect concurrent test actions to collide on it." >&2
+    return 2
+  fi
+  echo "error: simpool binary not found. Looked in $(simpool_search_places) (retried for ~3s, in case a 'brew upgrade' was relinking it)." >&2
+  echo "       This test action needs a pooled simulator and will not make one of its own: a simulator created here has no lease, no reaper, and nothing that ever shuts it down." >&2
+  echo "       Install simpool — 'brew install bitomule/tap/simpool' (see https://github.com/bitomule/simpool#build) — or point \$SIMPOOL_BIN at it." >&2
+  echo "       To run without a pool on purpose, accepting that concurrent test actions share one unmanaged simulator: SIMPOOL_OPTIONAL=1 (Bazel: --test_env=SIMPOOL_OPTIONAL=1)." >&2
+  return 1
+}
+# simpool: <<< resolve-end
+
+if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
+  export SIMPOOL_FALLBACK_NAME="BAZEL_TEST_%(device_type)s_%(os_version)s"
+  # `set +e` around the call, not `if simpool_bin=$(...)`: this needs all
+  # three outcomes, and an `if` collapses "refused" and "run unpooled" into
+  # one failing branch.
+  set +e
+  simpool_bin="$(simpool_require_bin)"
+  simpool_rc=$?
+  set -e
+  if [[ $simpool_rc -eq 1 ]]; then
+    exit 1
   fi
 
-  if [[ -n "$simpool_bin" ]]; then
+  if [[ $simpool_rc -eq 0 ]]; then
     # simpool (the Go binary) resolves its pool root via os.UserHomeDir(),
     # which on Unix only ever reads $HOME — it does not fall back to the
     # password database the way `~` in a shell does. A test action's $HOME
@@ -158,16 +265,11 @@ if [[ -z "${_SIMPOOL_WRAPPED:-}" ]]; then
     fi
     exec "$simpool_bin" with "${simpool_with_args[@]}" -- "$0" "$@"
   fi
-  # simpool: no simpool binary found anywhere on this machine (not at
-  # SIMPOOL_BIN, not at either Homebrew prefix, not on $PATH) — fall
-  # through to the stock ios_xctestrun_runner-equivalent behavior below, so
-  # this rule stays a correct drop-in for anyone who hasn't installed it
-  # yet. That fallback is *not* equally safe, though: it reuses one fixed
-  # BAZEL_TEST_<type>_<os> simulator by name, so every test action
-  # concurrently missing simpool shares that one simulator — precisely the
-  # collision this whole rule exists to prevent. Warn loudly rather than
-  # let that be discovered from a flaky/racy test run.
-  echo "warning: simpool binary not found (checked \$SIMPOOL_BIN, /opt/homebrew/bin, /usr/local/bin, \$PATH) — falling back to a single shared BAZEL_TEST_%(device_type)s_%(os_version)s simulator with no concurrency safety; install simpool (see https://github.com/bitomule/simpool#build) to fix" >&2
+  # simpool: rc 2 — no binary, and SIMPOOL_OPTIONAL=1 said to carry on
+  # anyway. simpool_require_bin has already warned. Fall through to the
+  # stock ios_xctestrun_runner-equivalent behavior below, which reuses one
+  # fixed BAZEL_TEST_<type>_<os> simulator by name. rc 1 never reaches here;
+  # it exits above.
 fi
 
 if [[ -n "${TEST_PREMATURE_EXIT_FILE:-}" ]]; then

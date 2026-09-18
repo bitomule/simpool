@@ -112,7 +112,7 @@ func TestEnsureProvisionedSurvivesSlimFailure(t *testing.T) {
 		bootAndWait:    func(string, time.Duration) error { booted = true; return nil },
 		shutdown:       neverShutdown(t),
 		delete:         neverDelete(t),
-		slim:           func(string, time.Duration) (bool, error) { return false, errors.New("launchctl said no") },
+		slim:           func(string, []string, time.Duration) (bool, error) { return false, errors.New("launchctl said no") },
 	}
 	if err := ensureProvisioned(s, "test", "with", "", deps, time.Minute); err != nil {
 		t.Fatalf("a failed slim must not fail provisioning: %v", err)
@@ -134,7 +134,7 @@ func TestEnsureProvisionedSkipsSlimWhenDisabled(t *testing.T) {
 		bootAndWait:    func(string, time.Duration) error { return nil },
 		shutdown:       neverShutdown(t),
 		delete:         neverDelete(t),
-		slim:           func(string, time.Duration) (bool, error) { slimCalled = true; return true, nil },
+		slim:           func(string, []string, time.Duration) (bool, error) { slimCalled = true; return true, nil },
 	}
 	if err := ensureProvisioned(s, "test", "with", "", deps, time.Minute); err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestEnsureProvisionedReconcilesSlimOnAWarmSlot(t *testing.T) {
 		bootAndWait: func(string, time.Duration) error { booted = true; return nil },
 		shutdown:    neverShutdown(t),
 		delete:      neverDelete(t),
-		slim:        func(string, time.Duration) (bool, error) { slimCalls++; return false, nil },
+		slim:        func(string, []string, time.Duration) (bool, error) { slimCalls++; return false, nil },
 	}
 	if err := ensureProvisioned(s, "test", "with", "", deps, time.Minute); err != nil {
 		t.Fatal(err)

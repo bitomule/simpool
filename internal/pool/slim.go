@@ -191,6 +191,32 @@ func SurplusCategories(have, want []string) int {
 	return n
 }
 
+// EffectiveCategories decides what a slot's profile should actually become
+// on this acquisition, given what it already has and what was asked for.
+//
+// The rule is: never strip on an ordinary acquisition, strip only on the
+// one that was going to reconfigure the slot anyway. When the slot already
+// satisfies the request, its own set wins — so a plain `simpool with`
+// landing on the group's photos slot leaves it a photos slot instead of
+// quietly taking Photos away from the repo that set it up. When it does
+// not satisfy the request, the slot is being reconfigured regardless, and
+// that is the moment to reclaim whatever surplus it was carrying, so the
+// request's own set wins exactly.
+//
+// Acquisition only reaches a non-satisfying slot when the group is at its
+// cap (see tryAcquireSlots), which is what makes this the lazy reclaim it
+// is meant to be: a capability is given back when it is actually costing
+// somebody a slot, and at no other time. The alternative — resetting cold
+// slots to the baseline on a schedule — is a pendulum: the one repo that
+// needs Photos every morning would pay the reconfigure every morning
+// because something stripped it overnight.
+func EffectiveCategories(have, want []string) []string {
+	if Satisfies(have, want) {
+		return dedupeSorted(have)
+	}
+	return dedupeSorted(want)
+}
+
 // CapabilityNames lists every capability name, sorted, for error messages
 // and --help.
 func CapabilityNames() []string {
@@ -279,10 +305,20 @@ func splitEnvList(v string) []string {
 // that quietly goes stock again at its next boot, and a capacity decision
 // made on the assumption that slots are slim would then be wrong in the
 // one direction that ends in jetsam.
-func SlimDevice(udid string, timeout time.Duration) (bool, error) {
+func SlimDevice(udid string, cats []string, timeout time.Duration) (bool, error) {
 	p, err := SlimProfile()
 	if err != nil {
 		return false, err
+	}
+	// cats is the profile this particular slot should end up in — the
+	// request's categories, or the slot's own when it already satisfies
+	// the request (see EffectiveCategories). It replaces whatever
+	// SlimProfile resolved from --need for the process as a whole, so that
+	// an ordinary acquisition landing on a capable slot leaves it capable
+	// instead of stripping it back to the baseline.
+	p.ExceptCategories = map[string]bool{}
+	for _, id := range cats {
+		p.ExceptCategories[id] = true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

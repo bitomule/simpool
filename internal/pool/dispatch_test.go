@@ -132,6 +132,37 @@ func TestAcquireNeverHandsTheSameSlotOutTwice(t *testing.T) {
 	}
 }
 
+// The defect found by watching the real pool minutes after v0.20.0
+// shipped: an ordinary acquisition rewrote the slot's profile to the
+// request's (empty) set, so the photos slot a repo had just paid 41s to
+// set up read "slim" again and its daemons really had been stripped. That
+// is the pendulum in its worst form — not a nightly reset, but a reset by
+// whoever happened to run a test next.
+func TestAnOrdinaryAcquisitionDoesNotStripASlotsCapabilities(t *testing.T) {
+	got := EffectiveCategories([]string{"photos"}, nil)
+	if len(got) != 1 || got[0] != "photos" {
+		t.Fatalf("a plain request landing on a photos slot must leave it a photos slot, got %v", got)
+	}
+}
+
+// The other half: the reclaim still happens, on the acquisition that was
+// going to reconfigure the slot anyway — which acquisition only reaches
+// when the group is at its cap and the capability is genuinely costing
+// somebody a slot.
+func TestReconfiguringASlotReclaimsItsSurplus(t *testing.T) {
+	got := EffectiveCategories([]string{"photos"}, []string{"search"})
+	if len(got) != 1 || got[0] != "search" {
+		t.Fatalf("a slot being reconfigured must end up with exactly what was asked for, got %v", got)
+	}
+}
+
+func TestASatisfyingSlotIsLeftExactlyAsItIs(t *testing.T) {
+	got := EffectiveCategories([]string{"photos", "search"}, []string{"photos"})
+	if len(got) != 2 {
+		t.Fatalf("a slot that already satisfies the request must be left alone, got %v", got)
+	}
+}
+
 func TestSatisfiesIsSupersetNotEquality(t *testing.T) {
 	if !Satisfies([]string{"photos", "search"}, []string{"photos"}) {
 		t.Error("a richer slot must serve a narrower request, or the pool grows one family per combination")

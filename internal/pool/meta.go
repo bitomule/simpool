@@ -35,6 +35,19 @@ type Meta struct {
 	// child-less holder (`acquire`, which never spawns anything by design)
 	// apart from a `with` whose consumer already exited out from under it.
 	Mode string `json:"mode,omitempty"`
+	// Capabilities is the set of simslim categories this slot was last
+	// provisioned with enabled — what `--need` asked for, resolved (see
+	// pool.ResolveCapabilities). It is what makes --need a dispatch
+	// criterion rather than a reconfigure: a shut-down slot has no launchd
+	// to ask, so without this the pool cannot tell a photos slot from a
+	// slim one without booting it.
+	//
+	// Advisory like every other Meta field, and deliberately so. It is the
+	// hint acquisition sorts by; the guarantee is still the reconcile
+	// EnsureProvisioned performs on every acquisition, which makes this
+	// field true again if it had drifted. A stale value therefore costs at
+	// worst one reconfigure, never a slot that lies about what it can do.
+	Capabilities []string `json:"capabilities,omitempty"`
 	// LeaseKey is the sticky key of the `simpool lease` caller that last
 	// held this slot (empty for `with`/`acquire`, which never lease). It
 	// outlives lease.json on purpose: a `simpool release` removes the

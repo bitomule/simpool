@@ -41,7 +41,7 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "GROUP\tSLOT\tAVAILABLE\tWHY\tLEASE\tDEVICE STATE\tUDID")
+	fmt.Fprintln(tw, "GROUP\tSLOT\tAVAILABLE\tCAPABILITIES\tWHY\tLEASE\tDEVICE STATE\tUDID")
 	for _, groupDir := range groups {
 		group := filepath.Base(groupDir)
 		for _, n := range pool.ListSlotNumbers(groupDir) {
@@ -93,7 +93,16 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 				}
 			}
 
-			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\n", group, n, availableCol, why, leaseCol, deviceState, meta.UDID)
+			// What this slot was last provisioned with enabled beyond the
+			// slim baseline, which is what --need dispatches on. "slim" for
+			// the baseline rather than a blank, so a pool where nothing has
+			// asked for anything reads as a deliberate state instead of a
+			// column nobody filled in.
+			capsCol := "slim"
+			if len(meta.Capabilities) > 0 {
+				capsCol = strings.Join(meta.Capabilities, ",")
+			}
+			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\t%s\n", group, n, availableCol, capsCol, why, leaseCol, deviceState, meta.UDID)
 		}
 	}
 	tw.Flush()

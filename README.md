@@ -423,14 +423,67 @@ sends people off to `xcrun simctl create`.
 
 `--need` exists on `with`, `acquire`, `lease` and `preboot`, and has an
 env form, `SIMPOOL_NEED`, for a consumer that cannot pass a flag (a bazel
-rule, a Makefile wrapper). Warming with the same `--need` a later
-acquisition will use is what keeps that acquisition from paying the
-reconfigure reboot.
+rule, a Makefile wrapper).
 
-The first acquisition that changes a slot's profile reboots its simulator
-(tens of seconds) and says so on stderr; every later acquisition asking
-for the same thing is one `launchctl` read. The profile is reconciled on
-**every** acquisition, warm or cold — which it was not until v0.19.0. See
+#### `--need` is a dispatch criterion, not a reconfigure order
+
+A slot with Photos and a slim slot are different things, and since v0.20.0
+the pool knows it. Each slot records what it was last provisioned with in
+its `meta.json`, `simpool status` shows it in a CAPABILITIES column, and
+acquisition picks in this order:
+
+1. **A free slot that already satisfies the request**, preferring the
+   leanest one that does. Nothing is reconfigured and the slot is handed
+   over warm.
+2. **A new slot**, while the group is under its `--max`. A request nothing
+   resident can serve should *add* a slot that can, not strip one that
+   already serves somebody else.
+3. **Reconfigure a slot that does not match** — only with the group full.
+   This is the 25-40s path, and it is now the last resort rather than what
+   every request paid.
+
+Measured end to end on this pool: the first `--need photos` took 41.3s and
+opened a photos slot; the second took 12.1s on that same slot with no
+reconfigure. The first `--need spotlight` took 40.1s and opened a second
+slot; the next took 7.7s. A plain request in between took neither of them —
+it landed on a slim slot, leaving both capable slots for whoever needs
+them.
+
+"Satisfies" is superset, not equality: a slot with `photos` and `search`
+serves a request for `photos`. That converges on a few capable slots
+instead of one family per combination of requirements.
+
+**The cap does not move.** A profile is a property of a slot inside the
+device+OS group, never a group of its own, so a group still tops out at
+`--max` simulators however many distinct profiles are in play. That matters
+because a capability is not free. Measured idle on an iPhone 17 Pro @ 26.3,
+90s after a cold boot, summing resident memory across the simulator's own
+runtime processes:
+
+| profile | processes | resident |
+|---|---|---|
+| slim (baseline) | 55–56 | 229–345 MB |
+| `--need spotlight` | 57 | 286 MB |
+| `--need photos` | 57 | 519 MB |
+| `--need photos,spotlight` | 62 | 1260 MB |
+
+So the worst case measured is roughly +900 MB per slot — real, and still
+far under the ~4.9 GB a fully stock simulator costs, which is why 6 per
+group survives this unchanged. (Those are summed RSS, which double-counts
+shared pages; they are comparable to each other, not to the
+phys_footprint numbers in the table further up. Measure both configurations
+at the same age after boot — the same device read 1570 MB right after a
+reboot and 3788 MB once settled.)
+
+Nothing resets a slot's profile on a schedule, deliberately. A scheduled
+reset would be a pendulum: the one repo that needs Photos every morning
+would pay the reconfigure every morning because the night before something
+stripped it. Instead the reclaim is lazy — step 3 above only reconfigures
+when the group is full and the capability is actually costing somebody a
+slot.
+
+The profile is also reconciled on **every** acquisition, warm or cold,
+which it was not until v0.19.0. See
 [Turning it off, and tuning it](#turning-it-off-and-tuning-it).
 
 #### Turning it off, and tuning it

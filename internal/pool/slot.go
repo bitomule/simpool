@@ -184,6 +184,11 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// refusals records why each slot this call could not take was refused,
 	// so ErrAtCapacity can name the actual obstacle per slot — see
 	// atCapacityError.
+	// taken records the slot numbers this call already holds, so the
+	// later passes never re-claim one. flock is per open file description,
+	// so a second claim from this same process would succeed.
+	taken := map[int]bool{}
+
 	var refusals []SlotRefusal
 	refuse := func(n int, av Availability) (bool, error) {
 		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
@@ -261,6 +266,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			Meta:     meta,
 		}
 		acquired = append(acquired, s)
+		taken[n] = true
 		return true, nil
 	}
 
@@ -274,9 +280,37 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
 	})
 
+	// --need is a dispatch criterion, not a reconfigure order. Within that
+	// most-recently-used ordering, prefer a slot that already has what was
+	// asked for, and among those the LEANEST one that still satisfies it:
+	// an ordinary run must not land on the group's only photos slot and
+	// force the next photo job to pay a reconfigure for it. A capability
+	// costs real memory — measured idle, a slim slot sums 229-345 MB of
+	// resident memory and the same slot with photos and spotlight both
+	// enabled sums 1260 MB — so which slot serves which request is worth
+	// getting right.
+	want := RequestedCategories()
+	sort.SliceStable(existing, func(i, j int) bool {
+		hi := ReadMeta(SlotDir(groupDir, existing[i])).Capabilities
+		hj := ReadMeta(SlotDir(groupDir, existing[j])).Capabilities
+		si, sj := Satisfies(hi, want), Satisfies(hj, want)
+		if si != sj {
+			return si
+		}
+		if si {
+			return SurplusCategories(hi, want) < SurplusCategories(hj, want)
+		}
+		return false
+	})
+
+	// Pass one takes only slots that already satisfy the request, so the
+	// common case is the 1.5s path and nothing is reconfigured.
 	for _, n := range existing {
 		if len(acquired) >= count {
 			break
+		}
+		if !Satisfies(ReadMeta(SlotDir(groupDir, n)).Capabilities, want) {
+			continue
 		}
 		ok, err := take(n)
 		if err != nil {
@@ -286,23 +320,16 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		_ = ok
 	}
 
+	// Then new slot numbers, while the group is under its cap: a request
+	// nothing resident can serve should ADD a slot that can, not strip one
+	// that already serves somebody else. The cap is unchanged by any of
+	// this — a profile is a property of a slot inside the device+OS group,
+	// never a group of its own — so the group still tops out at `max`
+	// simulators however many distinct profiles are in play.
 	next := 0
-	for len(acquired) < count {
+	for len(acquired) < count && len(resident) < max {
 		for resident[next] {
 			next++
-		}
-		if len(resident) >= max {
-			// Every slot this call already claimed is about to be given
-			// back by release() below, purely because acquisition is
-			// all-or-nothing and the group came up short of count — that
-			// is not a refusal, but atCapacityError's enumeration must
-			// still account for it, or it silently lists fewer slots than
-			// the max it names in the same sentence (see SlotRefusal).
-			for _, s := range acquired {
-				refusals = append(refusals, SlotRefusal{Number: s.Number, TakenThenReleased: true})
-			}
-			release()
-			return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 		}
 		ok, err := take(next)
 		if err != nil {
@@ -311,9 +338,42 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		}
 		resident[next] = true
 		next++
-		if !ok {
+		_ = ok
+	}
+
+	// Only with the group full does a request reconfigure a slot that does
+	// not match — the 25-40s path, and the last resort rather than the
+	// default it used to be. EnsureProvisioned does the actual reconcile.
+	// Slots this call already holds are skipped by number: flock is per
+	// open file description, so a second claim from this same process would
+	// succeed and hand one slot out twice.
+	for _, n := range existing {
+		if len(acquired) >= count {
+			break
+		}
+		if taken[n] {
 			continue
 		}
+		ok, err := take(n)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		_ = ok
+	}
+
+	if len(acquired) < count {
+		// Every slot this call already claimed is about to be given back by
+		// release() below, purely because acquisition is all-or-nothing and
+		// the group came up short of count — that is not a refusal, but
+		// atCapacityError's enumeration must still account for it, or it
+		// silently lists fewer slots than the max it names in the same
+		// sentence (see SlotRefusal).
+		for _, s := range acquired {
+			refusals = append(refusals, SlotRefusal{Number: s.Number, TakenThenReleased: true})
+		}
+		release()
+		return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 	}
 
 	return acquired, nil

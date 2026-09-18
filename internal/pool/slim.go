@@ -117,6 +117,80 @@ func ResolveCapabilities(names []string) ([]string, error) {
 	return cats, nil
 }
 
+// RequestedCategories is what this process's --need resolves to, sorted and
+// deduplicated — the value recorded in a slot's Meta.Capabilities and the
+// one acquisition matches candidate slots against. An unresolvable name
+// yields nil, which is safe: the flags already rejected it before any slot
+// was touched.
+func RequestedCategories() []string {
+	needs := append(append([]string{}, requestedCapabilities...), splitEnvList(os.Getenv(EnvNeed))...)
+	cats, err := ResolveCapabilities(needs)
+	if err != nil {
+		return nil
+	}
+	for _, id := range splitEnvList(os.Getenv(EnvSlimExcept)) {
+		cats = append(cats, id)
+	}
+	return dedupeSorted(cats)
+}
+
+func dedupeSorted(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range in {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Satisfies reports whether a slot whose enabled categories are `have` can
+// serve a request for `want`. Superset, not equality: a slot with photos
+// and spotlight serves a request for photos, so the pool converges on a few
+// capable slots instead of one family per combination of requirements.
+func Satisfies(have, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	set := make(map[string]bool, len(have))
+	for _, h := range have {
+		set[h] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// SurplusCategories counts what a slot carries beyond what was asked for.
+// Acquisition prefers the leanest slot that still satisfies the request, so
+// a plain run does not land on the pool's one photos slot and force the
+// next photo job to pay a reconfigure. It is worth being deliberate about:
+// measured idle on an iPhone 17 Pro @ 26.3, 90s after a cold boot, a slim
+// slot summed 229-345 MB of resident memory across ~56 runtime processes,
+// the same slot with spotlight 286 MB, with photos 519 MB, and with both
+// 1260 MB over 62 processes. A capability is not free; it is simply far
+// cheaper than the ~4.9 GB a fully stock simulator costs, which is why the
+// cap of 6 per group survives this feature unchanged.
+func SurplusCategories(have, want []string) int {
+	wanted := make(map[string]bool, len(want))
+	for _, w := range want {
+		wanted[w] = true
+	}
+	n := 0
+	for _, h := range have {
+		if !wanted[h] {
+			n++
+		}
+	}
+	return n
+}
+
 // CapabilityNames lists every capability name, sorted, for error messages
 // and --help.
 func CapabilityNames() []string {

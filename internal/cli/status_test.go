@@ -130,8 +130,14 @@ func TestRunStatus_ReportsAPlainlyFreeSlotAsFree(t *testing.T) {
 	if fields[2] != "free" {
 		t.Errorf("AVAILABLE for an unheld, unpoisoned slot: want free, got %q (row: %v)", fields[2], fields)
 	}
-	if fields[3] != "-" {
-		t.Errorf("WHY for a free slot should be empty, got %q", fields[3])
+	// CAPABILITIES sits between AVAILABLE and WHY. A slot nobody has asked
+	// anything of reads "slim" rather than blank: that is the baseline
+	// every slot boots in, and a blank cell reads as missing data.
+	if fields[3] != "slim" {
+		t.Errorf("CAPABILITIES for a slot with no recorded capabilities: want slim, got %q (row: %v)", fields[3], fields)
+	}
+	if fields[4] != "-" {
+		t.Errorf("WHY for a free slot should be empty, got %q", fields[4])
 	}
 }
 

@@ -463,6 +463,15 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	s.Meta.OwnerPID = os.Getpid()
 	s.Meta.OwnerCmd = ownerCmd
 	s.Meta.Mode = mode
+	// Recorded after the reconcile above, never before it: this is what the
+	// next acquisition dispatches on, so it has to describe the profile the
+	// device actually ended up in. When slimming is off entirely the field
+	// is left alone — SIMPOOL_SLIM=0 says nothing about which categories a
+	// slot has, and writing an empty set would make every slot look like it
+	// satisfies nothing.
+	if SlimEnabled() {
+		s.Meta.Capabilities = RequestedCategories()
+	}
 	// Recorded on every mode, including the empty key `with`/`acquire`
 	// pass: a slot moving from `lease` to `with` must not keep naming the
 	// lease key that used to hold it, or ownLeaseResidue would go on

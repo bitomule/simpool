@@ -206,10 +206,9 @@ func TestRestoreDoesNotRestartSpringBoardForUIOnlyDrift(t *testing.T) {
 }
 
 // "Absent" and "0" are different states of AppleICUForce24HourTime: absent
-// follows the region, 0 forces a 12-hour clock whatever the region says. A
-// slot that has been through a language change carries an explicit value
-// where a fresh one carries none — which is how the second dirty slot in
-// this pool was spotted.
+// follows the region, 0 forces a 12-hour clock whatever the region says.
+// Three states, not two, so the clean one is restored by deleting the key —
+// writing a 0 for "clean" would leave the slot permanently wrong.
 func TestRestoreDeletesAnExplicit24HourSettingRatherThanWritingZero(t *testing.T) {
 	dirty := cleanSlot()
 	dirty.Force24Hour = "0"

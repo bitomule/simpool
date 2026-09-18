@@ -421,6 +421,73 @@ func ReleaseLease(root, key string) ([]string, error) {
 	return released, nil
 }
 
+// ReclaimReleasedResidue kills the idb_companion / orphaned
+// `simctl spawn <udid> log stream` processes key's own lease left on dir,
+// so a slot handed back by a completely normal, successful session goes
+// straight back to `free` instead of sitting in `quarantined` until
+// something else happens to look at it.
+//
+// This is the missing trigger, not a missing mechanism: every other path
+// that could reclaim this residue is an OBSERVER of the slot — an
+// acquisition that happens to land on it, a `reap` pass, `doctor` — and
+// none of them runs at the moment the residue is created. Between the
+// release and whichever of them comes first, the slot is advertised as
+// quarantined, and the only things that reliably end that window today are
+// `simpool reap` (opt-in, half-hourly at best) and a person reading the pid
+// out of `simpool status` and killing it by hand.
+//
+// It is also the only path that can act at all in the shape actually
+// reported: the device is still Booted and Meta.LastUsed is seconds old, so
+// neither ResidueTargetNotRunning nor ResidueSlotLongIdle can hold and
+// CheckPoison can only reach PoisonedByLiveConsumers — which is never a
+// kill candidate, correctly, for anyone who cannot prove the session is
+// over. The releasing key can: see ResidueOwnerReleased.
+//
+// Returns the pids it killed and whether it reclaimed anything. Every
+// refusal — slot busy or gone, a lease still alive on it, a non-residue
+// process among the live consumers, a device that is not verifiably this
+// slot's own — returns (nil, false) and leaves the slot exactly as it was,
+// for the caller to report as it does today. Reclaiming is best-effort
+// tidying on top of a release that has already succeeded; it must never
+// turn one into a failure.
+func ReclaimReleasedResidue(root, dir, key string) ([]int, bool) {
+	if key == "" {
+		return nil, false
+	}
+	groupDir := filepath.Dir(dir)
+	n, ok := SlotNumberOf(dir)
+	if !ok {
+		return nil, false
+	}
+	lock, err := LockExistingSlot(groupDir, dir)
+	if err != nil || lock == nil {
+		// Busy (someone already claimed it — then it is theirs and their
+		// acquisition ran its own recovery), gone, or unreadable.
+		return nil, false
+	}
+	defer lock.Release()
+
+	// A lease read back under the flock: `simpool release` removed this
+	// key's lease a moment ago, but a concurrent call sharing the same key
+	// (stickiness is per key, not per process) may have written a fresh one
+	// since. That is a session still in progress, and its companion is
+	// infrastructure, not residue.
+	lease, err := ReadLease(dir)
+	if err != nil || lease.Alive() {
+		return nil, false
+	}
+
+	meta := ReadMeta(dir)
+	poison := checkPoison(meta, key)
+	if poison.Reason != PoisonedByOrphanedResidue {
+		return nil, false
+	}
+	if !attemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison, key) {
+		return nil, false
+	}
+	return poison.ResiduePIDs, true
+}
+
 // CleanupExpiredLease removes dir's lease.json if — re-checked under the
 // group allocation lock — it is still expired at the moment of removal.
 // The re-check (rather than trusting an earlier, lock-free ReadLease) is

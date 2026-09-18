@@ -158,6 +158,19 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 	released, err := pool.ReleaseLease(root, k)
 	for _, dir := range released {
 		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
+		// Dropping the lease does not end the session's side effects: a
+		// complete, successful `mav run` leaves `idb`'s own companion
+		// daemon attached to the slot's device (its "terminate if the
+		// target goes offline" default is false), and that alone
+		// quarantines the slot against every other caller. Nothing else
+		// runs at this moment — the next acquisition and `reap` are both
+		// observers that arrive later, if at all — so the reclaim happens
+		// here, for exactly the key that left it. Best-effort: a refusal
+		// leaves the slot as it was and falls through to the note below.
+		// It reports what it killed on stderr itself, in the same words the
+		// acquisition paths use for the same act — printing it again here
+		// would only say it twice.
+		pool.ReclaimReleasedResidue(root, dir, k)
 		// Dropping the lease is not the same as making the slot available,
 		// and saying only the first while the caller reads it as the second
 		// is what made this command look like it succeeded without changing

@@ -806,13 +806,49 @@ Zero configuration: no `.bazelrc` `--run_under` prefix, no `--test_env`.
 Each test action resolves the `simpool` binary and the pool's real `$HOME`
 for itself (a Bazel test action's environment is sanitized — no inherited
 `PATH`, no `$HOME` — so nothing here can be assumed to arrive from the
-caller), and falls back to stock `ios_xctestrun_runner`-equivalent
-behavior (reuse-or-create a fixed-name simulator) when `simpool` isn't
-installed at all, so this rule always *builds and runs* whether or not the
-host machine has `simpool`. That fallback is not equally *safe*, though:
-every concurrent test action missing `simpool` shares that one fixed-name
-simulator — exactly the collision this rule exists to prevent — and the
-runner warns on stderr when it takes that path.
+caller).
+
+#### When `simpool` cannot be found, the test action fails
+
+Until v0.22.0 it fell back instead: it built a fixed-name
+`BAZEL_TEST_<device>_<os>` simulator, warned on stderr, and carried on. That
+warning is not enough. Nobody reads the stderr of a test that passed, and
+what it leaves behind is a simulator with no lease, that no `simpool reap`
+pass collects, and that every concurrent test action missing `simpool` piles
+onto at once. Two simulators born that way were found still booted days
+after the sessions that made them had been closed, with the machine at a
+load average of 212.
+
+So a missing binary is now an error, and the error says where it looked:
+
+```
+error: simpool binary not found. Looked in $SIMPOOL_BIN,
+       /opt/homebrew/bin/simpool, /usr/local/bin/simpool, and $PATH
+       (retried for ~3s, in case a 'brew upgrade' was relinking it).
+       This test action needs a pooled simulator and will not make one of
+       its own: a simulator created here has no lease, no reaper, and
+       nothing that ever shuts it down.
+       Install simpool — 'brew install bitomule/tap/simpool' — or point
+       $SIMPOOL_BIN at it.
+       To run without a pool on purpose, ...: SIMPOOL_OPTIONAL=1
+```
+
+**Running unpooled is still possible, as a decision rather than a
+consequence.** A machine without `simpool`, a CI runner, a fresh checkout:
+set `SIMPOOL_OPTIONAL=1` (in Bazel, `--test_env=SIMPOOL_OPTIONAL=1`) and the
+old behaviour comes back, warning included. It must be exactly `1` —
+`SIMPOOL_OPTIONAL=0` reads as "no" to everyone who writes it, and silently
+meaning "yes" would hand the pool away to someone who asked for the
+opposite. The point of the switch is that whoever sets it knows what they
+are accepting, which is precisely what nobody knew before.
+
+**The lookup retries for ~3 seconds before giving up.** `brew upgrade`
+unlinks `/opt/homebrew/bin/simpool` and relinks it a moment later, and a
+test action that looks inside that window sees no binary at all — the most
+likely explanation for the one stray `BAZEL_TEST_*` simulator found on this
+machine (unproven: no surviving test log carries the warning, and that path
+is the only thing in the runner that produces the name). A miss is not proof
+of absence. The happy path sleeps zero times.
 
 After a failed test run against a pool slot, the runner probes whether the
 simulator itself is still responsive (a cheap, read-only
@@ -871,11 +907,13 @@ ios_unit_test(
 )
 ```
 
-Then just `bazel test //:MyTests` — no wrapper, no flags. If a `simpool`
-pool for that device/OS group doesn't exist yet, the rule's fallback path
-creates and reuses a plain `BAZEL_TEST_<device>_<os>` simulator, same as
-`ios_xctestrun_runner` always has; install `simpool` (see Build, below) and
-subsequent runs pick up the pool automatically.
+Then just `bazel test //:MyTests` — no wrapper, no flags. A pool for that
+device/OS group does not have to exist yet: the first test action creates
+the slot it needs. The `simpool` **binary** does have to exist (see
+[Build](#build)), because as of v0.22.0 a test action that cannot find it
+fails rather than building a simulator of its own — see [When `simpool`
+cannot be found, the test action
+fails](#when-simpool-cannot-be-found-the-test-action-fails).
 
 ## Pool layout
 

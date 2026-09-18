@@ -157,6 +157,18 @@ func TestAcquireLease_StickyByKey(t *testing.T) {
 	if !secondExpiry.After(firstExpiry) {
 		t.Fatalf("renewal did not push ExpiresAt forward: first=%v second=%v", firstExpiry, secondExpiry)
 	}
+
+	// The two halves of Slot.Renewed. Hand-out resets a slot's language,
+	// region and appearance (see presentation.go), and this flag is the
+	// only thing that stops it doing so to a screenshot matrix that set
+	// the language itself and is now taking its next capture through
+	// another `simpool lease` call.
+	if first.Renewed {
+		t.Error("a first claim is not a renewal")
+	}
+	if !second.Renewed {
+		t.Error("a sticky renewal must be marked as one, or hand-out resets the language under its own caller")
+	}
 }
 
 // TestAcquireLease_TwoKeysGetTwoSlots proves two independent keys never

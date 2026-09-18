@@ -116,6 +116,12 @@ type deviceEntry struct {
 	IsAvailable  bool   `json:"isAvailable"`
 	DeviceTypeID string `json:"deviceTypeIdentifier"`
 	RuntimeID    string `json:"-"`
+	// DataPath is the device's own data container on the host. It is what
+	// lets a caller read a simulator's global preferences without booting
+	// it or spawning anything inside it — `simpool status` reports a
+	// slot's language and region from here, and a shut-down slot has no
+	// other way to answer that question at all.
+	DataPath string `json:"dataPath"`
 }
 
 type devicesDoc struct {

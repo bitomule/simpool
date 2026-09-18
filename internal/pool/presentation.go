@@ -52,10 +52,18 @@ type Presentation struct {
 	// separator, currency and measurement units independently of Language.
 	Region string `json:"region,omitempty"`
 	// Force24Hour is AppleICUForce24HourTime: "1", "0", or "" when the key
-	// is absent, which is not the same as "0" — absent means "follow the
-	// region", 0 means "12-hour, whatever the region says". A slot that has
-	// been through a language change carries an explicit value where a
-	// fresh one carries none, which is exactly how it was found.
+	// is absent, which is NOT the same as "0" — absent means "follow the
+	// region", 0 means "12-hour, whatever the region says". Three states,
+	// not two, which is why restoring the clean one deletes the key rather
+	// than writing a value into it.
+	//
+	// Nothing sets this as a side effect of changing a slot's language:
+	// the one slot in this pool carrying an explicit 0 got it from a
+	// person measuring by hand, and the 24-hour rendering they were
+	// chasing turned out to come from `simctl status_bar override --time
+	// 9:41`, which draws "09:41" whatever the key and the region say. It
+	// is here because a consumer CAN leave it — not because a pattern was
+	// observed leaving it, and hunting for one is a dead end.
 	Force24Hour string `json:"force24Hour,omitempty"`
 	// Appearance is simctl's ui appearance: "light" or "dark".
 	Appearance string `json:"appearance,omitempty"`

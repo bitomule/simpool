@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bitomule/simpool/internal/simctl"
@@ -62,6 +63,11 @@ type provisionDeps struct {
 	// no-op would be noise. liveProvisionDeps always sets it, and
 	// TestLiveProvisionDepsSlims guards exactly that.
 	slim func(udid string, cats []string, timeout time.Duration) (bool, error)
+	// restore puts a slot back into the pool's baseline presentation
+	// before it changes hands (see presentation.go). Faked for the same
+	// reason slim is; a nil restore means "disabled", so the fakes that
+	// predate it are unaffected.
+	restore func(udid string, want Presentation, timeout time.Duration) ([]string, error)
 }
 
 var liveProvisionDeps = provisionDeps{
@@ -73,6 +79,7 @@ var liveProvisionDeps = provisionDeps{
 	shutdown:       simctl.Shutdown,
 	delete:         simctl.Delete,
 	slim:           SlimDevice,
+	restore:        RestorePresentation,
 }
 
 // EnvStrictSubstance, when set to "0", disables substance verification and
@@ -192,6 +199,57 @@ func reconcileSlim(deps provisionDeps, udid string, cats []string) {
 	case changed:
 		fmt.Fprintf(os.Stderr, "simpool: reconfigured %s to the requested slim profile (this reboots the simulator, and only happens when the profile actually changes)\n", udid)
 	}
+}
+
+// reconcilePresentation puts a slot back into the pool's baseline
+// language, region, appearance, text size, contrast and status bar before
+// it is handed to a consumer that is not the one who last had it.
+//
+// # Why here and not on release
+//
+// Because the consumer that leaves a slot dirty is usually not around to
+// clean it. `with`'s release is a deferred cleanup that a SIGKILL skips
+// outright; `acquire` and `lease` have no release step at all in the crash
+// case — a lease simply expires, with nobody running. Design for the node
+// that dies halfway through, not the one that finishes politely, and
+// "restore on the way out" restores nothing in exactly the case that
+// produced this bug.
+//
+// # Why here and not in reap
+//
+// reap is a scheduled disk-reclaim pass over cold slots. It is not an
+// admission gate and cannot be one: a slot dirtied at 10:00 and handed out
+// at 10:05 meets no reap until 11:00, and reap never touches a slot that
+// stayed booted, which in this pool is most of them. Only hand-out is
+// guaranteed to run between "the previous consumer stopped" and "the next
+// consumer sees it", whatever happened in between.
+//
+// # Why here specifically
+//
+// This is already the line where this exact shape of bug was fixed once
+// this month. The slim reconcile used to live inside the cold-boot branch,
+// so a warm slot came back in 1.6s with the capability it had been asked
+// for still disabled. A slot handed out without what was asked for and a
+// slot handed out with something nobody asked for are the same defect seen
+// from its two sides, and they belong in the same place.
+//
+// Never fails the acquisition, for the same reason reconcileSlim doesn't: a
+// slot whose appearance could not be read is still a usable simulator, and
+// taking a test run down over it would be worse than the drift. It does say
+// so on stderr, naming every setting it reset — the whole reason this went
+// unnoticed for months is that a dirty slot looked exactly like a clean one
+// until somebody read a published screenshot.
+func reconcilePresentation(deps provisionDeps, udid string) []string {
+	want := BaselinePresentation()
+	changed, err := deps.restore(udid, want, DefaultPresentationTimeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "simpool: could not restore %s to the pool's baseline presentation (%v) — the simulator is usable, but it may still carry the previous consumer's language, appearance or text size, which would silently change what your screenshots look like\n", udid, err)
+		return nil
+	}
+	if len(changed) > 0 {
+		fmt.Fprintf(os.Stderr, "simpool: %s came back from its previous consumer with %s — reset to the pool baseline (%s/%s)\n", udid, strings.Join(changed, ", "), want.Language, want.Region)
+	}
+	return changed
 }
 
 // EnsureProvisioned makes sure s has a booted simulator matching
@@ -455,6 +513,16 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		if bootErr != nil {
 			return fmt.Errorf("booting %s: %w", udid, bootErr)
 		}
+	}
+
+	// After the boot, never before it: every read and write here goes
+	// through `simctl spawn` or `simctl ui`, which need a running
+	// simulator. And only when the slot actually changed hands — a sticky
+	// lease renewal is the same consumer coming back for its next command,
+	// and resetting the language underneath it would break the very
+	// screenshot matrix this exists to protect (see Slot.Renewed).
+	if !s.Renewed && RestoreEnabled() && deps.restore != nil {
+		reconcilePresentation(deps, udid)
 	}
 
 	s.Meta.Device = s.Device

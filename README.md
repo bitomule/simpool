@@ -49,6 +49,9 @@ service that runs it on a schedule.
   slimmed, what it saves, and how to turn it off
 - [Recycling](#recycling-shut-down-scrub-purge) — `--cold`, `--scrub` and
   `--purge`, and why scrubbing is not purging
+- [A clean slot](#a-clean-slot-language-region-appearance-text-size) — what
+  the pool resets between consumers, and why at hand-out rather than on
+  release
 - [Dependencies and licenses](#dependencies-and-licenses) — simslim (MIT),
   and the Go 1.26 minimum
 - [Bazel](#bazel-simpool_ios_test_runner) — the `simpool_ios_test_runner` rule
@@ -606,6 +609,85 @@ what each slot would give back without deleting a byte.
 
 The Homebrew service runs `--scrub 120`; `--purge` is still deliberately
 not scheduled (see [Build](#build)).
+
+### A clean slot: language, region, appearance, text size
+
+A slot used to come back to the pool carrying whatever device-wide
+settings its last consumer left on it, and nothing anywhere said so. A
+screenshot run put a slot into German; the slot went back into the pool in
+German; the next snapshot suite to get that slot would have recorded German
+baselines, and the only way to find out was to read a published screenshot.
+`mav sim language` now exists precisely so a matrix can walk fourteen App
+Store languages, so slots get their language changed on purpose, many times
+a day.
+
+**What counts as dirty.** Only the settings that change what a screenshot of
+*any* app looks like — the ones that make the same suite give different
+answers depending on which slot it was handed:
+
+| | how a consumer sets it | survives a reboot |
+|---|---|---|
+| language (`AppleLanguages`) | `mav sim language`, `defaults write -g` | yes |
+| region (`AppleLocale`) | same | yes |
+| 12/24-hour clock (`AppleICUForce24HourTime`) | same | yes |
+| appearance, light or dark | `simctl ui appearance` | yes |
+| text size (Dynamic Type) | `simctl ui content_size` | yes |
+| increase contrast | `simctl ui increase_contrast` | yes |
+| status bar overrides (9:41, full battery) | `simctl status_bar override`, `mav --preset appstore` | **no** — but pool slots stay booted for days, so between two consumers of a warm slot it is as sticky as the rest |
+
+**What does not**, deliberately: installed apps, their containers, the
+keychain, added media. Those change what a screenshot of *that* app looks
+like, never one of an unrelated app; a suite installs its own build anyway;
+and wiping them would throw away the reuse that makes a warm slot worth
+having and charge a reinstall on every acquisition — the same argument
+`--scrub` makes for leaving stored data alone.
+
+**Where it is restored: at hand-out, not on release.** Restoring on the way
+out only works for a consumer that gets to the way out. A SIGKILL skips
+`with`'s deferred cleanup outright, and `acquire`/`lease` have no release
+step at all in the crash case — a lease just expires, with nobody running.
+The node that dies halfway through is the case that actually happens, and
+it is exactly the one "restore on release" cannot cover. `reap` is no
+better: it is a scheduled disk pass over cold slots, so a slot dirtied at
+10:00 and handed out at 10:05 never meets it, and it never touches a slot
+that stayed booted. Hand-out is the only point guaranteed to run between
+one consumer stopping and the next one seeing the slot.
+
+**A sticky lease renewal is not a hand-out.** `mav` calls `simpool lease`
+before every single command, so a matrix does `mav sim language set de-DE`
+and then takes its capture through another lease call. Resetting there
+would put the slot back into Spanish between the two and shoot fourteen
+identical captures. The reset only fires when the slot actually changes
+hands.
+
+Measured on an iPhone 17 Pro @ 26.3 slot: a clean slot costs +1.5s on a
+fresh claim (6.4s vs 4.8s, the reads run in parallel), a sticky renewal
+costs nothing at all (4.9s, no reads), and a dirty one costs ~8s more
+because a language change needs SpringBoard restarted before the status bar
+stops drawing the old language.
+
+**The baseline** is the host Mac's own language and region — exactly what a
+hand-made `simctl create` gives you, so switching this on changes no
+existing snapshot baseline anywhere — plus iOS's factory defaults for the
+rest (`light`, `large`, contrast off, no status bar overrides). Uniform
+across the whole pool on purpose: "the same suite gives the same result
+whichever slot you got" is the entire point.
+
+```
+SIMPOOL_LANGUAGE=en-US   # override the baseline language
+SIMPOOL_REGION=en_US     # override the baseline region
+SIMPOOL_RESTORE=0        # turn the whole reconcile off
+```
+
+`simpool status` grew a `LOCALE` column, read live off each simulator's own
+container (so it answers for a shut-down slot too, which is the one nobody
+would otherwise look at) and marked `!` when it differs from the baseline:
+
+```
+GROUP               SLOT    AVAILABLE  CAPABILITIES  LOCALE         DEVICE STATE
+iPhone-17-Pro@26.3  slot-2  free       slim          de-DE/de_DE !  Booted
+iPhone-17-Pro@26.3  slot-4  free       slim          es-ES/es_ES    Booted
+```
 
 ### Why a slot can be refused
 

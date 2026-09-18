@@ -70,6 +70,21 @@ type Slot struct {
 	Device   string
 	OSVer    string
 
+	// Renewed marks a slot handed back to a caller that was already
+	// holding it — `simpool lease`'s sticky renewal, which is what every
+	// `mav tap`/`mav screenshot` in a hot loop hits. It is a property of
+	// the claim, not of the slot, which is why it travels on the value the
+	// claim returns rather than in meta.json.
+	//
+	// It exists for exactly one decision: whether hand-out may reset this
+	// slot's presentation (see presentation.go). Resetting it on a renewal
+	// would be a bug with teeth — a screenshot matrix does `mav sim
+	// language set de-DE` and then takes a capture through another
+	// `simpool lease` call, so a reconcile on the renewal would put the
+	// slot back into Spanish between the two and the matrix would silently
+	// shoot fourteen identical languages.
+	Renewed bool
+
 	lock *Lock
 	Meta Meta
 }

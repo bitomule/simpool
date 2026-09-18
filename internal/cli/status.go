@@ -41,7 +41,8 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 	}
 
 	tw := tabwriter.NewWriter(stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "GROUP\tSLOT\tAVAILABLE\tCAPABILITIES\tWHY\tLEASE\tDEVICE STATE\tUDID")
+	baseline := pool.BaselinePresentation()
+	fmt.Fprintln(tw, "GROUP\tSLOT\tAVAILABLE\tCAPABILITIES\tLOCALE\tWHY\tLEASE\tDEVICE STATE\tUDID")
 	for _, groupDir := range groups {
 		group := filepath.Base(groupDir)
 		for _, n := range pool.ListSlotNumbers(groupDir) {
@@ -73,10 +74,31 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 				why = "-"
 			}
 
+			// This slot's language and region, read live off the
+			// simulator's own container (see pool.LocaleOnDisk) rather
+			// than remembered in meta.json. The defect this column exists
+			// for is a consumer changing these under a slot the pool has
+			// already handed out, so a remembered value would read
+			// correctly right up to the moment it mattered.
+			//
+			// Marked with a "!" when it differs from the baseline the pool
+			// restores slots to, because the raw value is only meaningful
+			// to someone who already knows what the pool is supposed to
+			// be. A slot got to the App Store in the wrong language once,
+			// and it was invisible here until somebody read a published
+			// screenshot.
 			deviceState := "unprovisioned"
+			localeCol := "-"
 			if meta.UDID != "" {
-				if state, found, err := simctl.State(meta.UDID); err == nil && found {
-					deviceState = state
+				entry, found, err := simctl.Find(meta.UDID)
+				if err == nil && found {
+					deviceState = entry.State
+					if lang, region := pool.LocaleOnDisk(entry.DataPath); lang != "" || region != "" {
+						localeCol = lang + "/" + region
+						if lang != baseline.Language || region != baseline.Region {
+							localeCol += " !"
+						}
+					}
 				} else {
 					deviceState = "missing"
 				}
@@ -102,7 +124,7 @@ func RunStatus(args []string, stdout, stderr io.Writer) int {
 			if len(meta.Capabilities) > 0 {
 				capsCol = strings.Join(meta.Capabilities, ",")
 			}
-			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\t%s\n", group, n, availableCol, capsCol, why, leaseCol, deviceState, meta.UDID)
+			fmt.Fprintf(tw, "%s\tslot-%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", group, n, availableCol, capsCol, localeCol, why, leaseCol, deviceState, meta.UDID)
 		}
 	}
 	tw.Flush()

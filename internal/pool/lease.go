@@ -227,7 +227,14 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
 				return nil, err
 			}
-			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
+			view := leaseSlotView(root, groupDir, dir, n, device, osVersion)
+			// The one path in the whole codebase that hands a slot back to
+			// the caller already on it. Everything else — take(),
+			// claimSlotForLease, preboot — is a fresh claim by definition,
+			// so the slot changed hands and hand-out is entitled to reset
+			// its presentation. See Slot.Renewed.
+			view.Renewed = true
+			return view, nil
 		}
 	}
 

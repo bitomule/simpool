@@ -61,7 +61,7 @@ type provisionDeps struct {
 	// this field has nothing to do with, and making each of them carry a
 	// no-op would be noise. liveProvisionDeps always sets it, and
 	// TestLiveProvisionDepsSlims guards exactly that.
-	slim func(udid string, timeout time.Duration) (bool, error)
+	slim func(udid string, cats []string, timeout time.Duration) (bool, error)
 }
 
 var liveProvisionDeps = provisionDeps{
@@ -184,8 +184,8 @@ func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason, ownLeas
 // consequence spelled out, because a caller that asked for a capability
 // and did not get it will otherwise read the failure as "the simulator
 // cannot do this", which is the reading that ends in `simctl create`.
-func reconcileSlim(deps provisionDeps, udid string) {
-	changed, err := deps.slim(udid, SlimTimeout())
+func reconcileSlim(deps provisionDeps, udid string, cats []string) {
+	changed, err := deps.slim(udid, cats, SlimTimeout())
 	switch {
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "simpool: could not apply the slim profile to %s (%v) — the simulator is usable but its daemons are in whatever state they were already in, so anything you asked for with --need may still be disabled\n", udid, err)
@@ -373,8 +373,9 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// simslim performs when the profile actually differs adds no new peak
 	// for the gate to protect against. In the common case — the profile
 	// already matches — it is one launchctl read and no reboot at all.
+	effectiveCats := EffectiveCategories(s.Meta.Capabilities, RequestedCategories())
 	if knownState == "Booted" && SlimEnabled() && deps.slim != nil {
-		reconcileSlim(deps, udid)
+		reconcileSlim(deps, udid, effectiveCats)
 	}
 
 	// Only pay for the boot-and-wait round trip when the device isn't
@@ -438,7 +439,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		// overrides, find them already in place, and return in about as
 		// long as a `simctl list` takes.
 		if SlimEnabled() && deps.slim != nil {
-			reconcileSlim(deps, udid)
+			reconcileSlim(deps, udid, effectiveCats)
 			// The slim step consumed its own budget, not the caller's, so
 			// the boot-and-wait below starts from a full bootTimeout
 			// again rather than from whatever minutes of a 180s budget
@@ -470,7 +471,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// slot has, and writing an empty set would make every slot look like it
 	// satisfies nothing.
 	if SlimEnabled() {
-		s.Meta.Capabilities = RequestedCategories()
+		s.Meta.Capabilities = effectiveCats
 	}
 	// Recorded on every mode, including the empty key `with`/`acquire`
 	// pass: a slot moving from `lease` to `with` must not keep naming the

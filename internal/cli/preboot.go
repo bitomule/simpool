@@ -83,6 +83,7 @@ func RunPreboot(args []string, stdout, stderr io.Writer) int {
 	osVersion := fs.String("os", "", "simulator OS version, e.g. \"26.3\" (required)")
 	count := fs.Int("count", 1, "number of slots to warm up")
 	max := fs.Int("max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
+	need := fs.String("need", "", "comma-separated capabilities the warmed slots must have, e.g. \"photos\" or \"spotlight\" (env "+pool.EnvNeed+"); warming with the same --need a later acquisition uses is what keeps that acquisition from paying a reconfigure reboot")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -100,6 +101,10 @@ func RunPreboot(args []string, stdout, stderr io.Writer) int {
 	}
 	if *max < *count {
 		fmt.Fprintf(stderr, "simpool preboot: --max (%d) must be >= --count (%d)\n", *max, *count)
+		return 2
+	}
+	if err := applyNeed(*need); err != nil {
+		fmt.Fprintln(stderr, "simpool preboot:", err)
 		return 2
 	}
 

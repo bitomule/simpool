@@ -21,6 +21,7 @@ type acquireFlags struct {
 	count  int
 	max    int
 	wait   time.Duration
+	need   string
 }
 
 func parseAcquireFlags(fs *flag.FlagSet, f *acquireFlags) {
@@ -29,6 +30,21 @@ func parseAcquireFlags(fs *flag.FlagSet, f *acquireFlags) {
 	fs.IntVar(&f.count, "count", 1, "number of slots to acquire")
 	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
 	fs.DurationVar(&f.wait, "wait", 10*time.Minute, "how long to wait for a slot to free up once --max is reached (0 = fail immediately instead of waiting)")
+	fs.StringVar(&f.need, "need", "", "comma-separated `capabilities` this slot must have: \"photos\" for simctl addmedia (else PHPhotosErrorDomain 3301), \"spotlight\" for CoreSpotlight indexing (else CSIndexErrorDomain -1003). Slots boot slim, with those daemons disabled, and asking is how you get them back (env "+pool.EnvNeed+"). Known: "+strings.Join(pool.CapabilityNames(), ", ")+"; any simslim category ID also works")
+}
+
+// applyNeed validates --need and records it for the slim profile every
+// provisioning in this process will resolve. An unknown capability is a
+// hard error at flag time rather than a warning during provisioning:
+// handing back a slot that silently lacks what was asked for is the
+// failure mode --need exists to close.
+func applyNeed(need string) error {
+	names := strings.Split(need, ",")
+	if _, err := pool.ResolveCapabilities(names); err != nil {
+		return fmt.Errorf("--need: %w", err)
+	}
+	pool.SetRequestedCapabilities(names)
+	return nil
 }
 
 func (f *acquireFlags) validate() error {
@@ -44,7 +60,7 @@ func (f *acquireFlags) validate() error {
 	if f.max < f.count {
 		return fmt.Errorf("--max (%d) must be >= --count (%d)", f.max, f.count)
 	}
-	return nil
+	return applyNeed(f.need)
 }
 
 // splitDoubleDash splits args into the flags portion and the command

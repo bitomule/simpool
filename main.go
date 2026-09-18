@@ -16,13 +16,25 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `simpool — iOS simulator pool broker
 
 Usage:
-  simpool with [--device D] [--os V] [--count N] [--max M] [--wait D] -- <cmd>
+  simpool with [--device D] [--os V] [--count N] [--max M] [--wait D] [--need C] -- <cmd>
       Acquire N slots, export the environment, run <cmd>, release on exit.
 
-  simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
+  simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D] [--need C]
       Print the environment for N slots and hold the lock until signaled.
 
-  simpool lease --device D --os V [--key K] [--ttl D] [--max M]
+  --need asks for a capability a slot does not have by default, because
+  slots boot slim (see README "Slim slots"). Use the name of the thing you
+  are doing, not the daemon:
+      --need photos      xcrun simctl addmedia, the photo picker
+                         (without it: PHPhotosErrorDomain 3301)
+      --need spotlight   CSSearchableIndex.indexAppEntities, CoreSpotlight
+                         (without it: CSIndexErrorDomain -1003)
+  Comma-separate several; any simslim category ID also works; an unknown
+  name is an error, never a slot quietly missing what you asked for. Works
+  on with/acquire/lease/preboot, env SIMPOOL_NEED. The first acquisition
+  that changes a slot's profile reboots its simulator; later ones do not.
+
+  simpool lease --device D --os V [--key K] [--ttl D] [--max M] [--need C]
       Print just a UDID and exit. For short, independent commands in a
       hot loop (mav tap/swipe/screenshot, wired as MAV's target_command)
       that have nothing to hold "with"'s lock across. Sticky per --key
@@ -32,7 +44,7 @@ Usage:
   simpool release [--key K]
       Drop --key's lease immediately instead of waiting out its TTL.
 
-  simpool preboot --device D --os V [--count N] [--max M]
+  simpool preboot --device D --os V [--count N] [--max M] [--need C]
       Warm up N slots (boot their simulators) without a consumer, then
       release them immediately, so the next with/acquire/lease/bazel-test
       call finds a warm slot instead of paying a cold boot itself. Never

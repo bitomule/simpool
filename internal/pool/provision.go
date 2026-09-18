@@ -172,6 +172,28 @@ func resolveSubstanceMismatch(s *Slot, deps provisionDeps, udid, reason, ownLeas
 	return nil
 }
 
+// reconcileSlim brings udid to the slim profile this process resolved,
+// whether that means disabling daemons for the first time or re-enabling
+// the ones a --need asked for. simslim is idempotent by construction, so
+// on a slot already in the requested state this is a launchctl read and
+// nothing else.
+//
+// It never fails the acquisition. A slot whose profile could not be
+// applied is still a usable slot, and taking a test run down over it
+// would be worse than the problem — but it says so on stderr with the
+// consequence spelled out, because a caller that asked for a capability
+// and did not get it will otherwise read the failure as "the simulator
+// cannot do this", which is the reading that ends in `simctl create`.
+func reconcileSlim(deps provisionDeps, udid string) {
+	changed, err := deps.slim(udid, SlimTimeout())
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "simpool: could not apply the slim profile to %s (%v) — the simulator is usable but its daemons are in whatever state they were already in, so anything you asked for with --need may still be disabled\n", udid, err)
+	case changed:
+		fmt.Fprintf(os.Stderr, "simpool: reconfigured %s to the requested slim profile (this reboots the simulator, and only happens when the profile actually changes)\n", udid)
+	}
+}
+
 // EnsureProvisioned makes sure s has a booted simulator matching
 // s.Device/s.OSVer, in the shared default device set, named
 // s.DeviceName() (see pool.DeviceName). Creates one if this is a fresh
@@ -335,6 +357,26 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		s.Meta.RuntimeID = adopted.RuntimeID
 	}
 
+	// A slot that is already booted still has to have its slim profile
+	// reconciled, and for a year it did not: the whole slim step lived
+	// inside the `knownState != "Booted"` branch below, so a caller asking
+	// for a capability got a warm slot back in under two seconds with the
+	// daemons it asked for still disabled, and no error anywhere. Measured
+	// on this pool: `SIMPOOL_SLIM_EXCEPT=photos simpool with` returned
+	// slot-2 in 1.6s with com.apple.assetsd still disabled and
+	// `simctl addmedia` still failing PHPhotosErrorDomain 3301 — which is
+	// how two nodes concluded a slot could not do the job and went off to
+	// run `simctl create` instead.
+	//
+	// Deliberately outside the boot-concurrency gate, unlike the cold path
+	// below: this device's userland is already resident, so the reboot
+	// simslim performs when the profile actually differs adds no new peak
+	// for the gate to protect against. In the common case — the profile
+	// already matches — it is one launchctl read and no reboot at all.
+	if knownState == "Booted" && SlimEnabled() && deps.slim != nil {
+		reconcileSlim(deps, udid)
+	}
+
 	// Only pay for the boot-and-wait round trip when the device isn't
 	// already known-booted. This is the idempotency fix for the hot path:
 	// `simpool lease` on a warm slot used to call simctl.Boot unconditionally
@@ -396,18 +438,7 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 		// overrides, find them already in place, and return in about as
 		// long as a `simctl list` takes.
 		if SlimEnabled() && deps.slim != nil {
-			slimmed, slimErr := deps.slim(udid, SlimTimeout())
-			switch {
-			case slimErr != nil:
-				// A slot that could not be slimmed is still a usable
-				// slot — just a fat one — and failing the acquisition
-				// would take a test run down over an optimisation. Say
-				// so loudly instead: a pool silently running stock is a
-				// pool whose capacity assumptions are wrong.
-				fmt.Fprintf(os.Stderr, "simpool: could not slim %s (%v) — continuing with a stock simulator; it will use several GB more memory than a slim one\n", udid, slimErr)
-			case slimmed:
-				fmt.Fprintf(os.Stderr, "simpool: slimmed %s (disabled the background daemons a test simulator does not need; this happens once per slot)\n", udid)
-			}
+			reconcileSlim(deps, udid)
 			// The slim step consumed its own budget, not the caller's, so
 			// the boot-and-wait below starts from a full bootTimeout
 			// again rather than from whatever minutes of a 180s budget

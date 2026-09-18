@@ -186,3 +186,87 @@ func TestHumanBytes(t *testing.T) {
 		}
 	}
 }
+
+// The regression this whole change exists for. The slim step used to live
+// inside provision.go's `knownState != "Booted"` branch, so a slot that was
+// already warm was handed back without its profile ever being reconciled:
+// a caller asking for a capability got the slot in under two seconds with
+// the daemons it asked for still disabled and no error anywhere. Two nodes
+// read that as "a slot cannot do this" and ran `simctl create` instead.
+func TestEnsureProvisionedReconcilesSlimOnAWarmSlot(t *testing.T) {
+	t.Setenv(EnvSlim, "")
+	s := fakeSlot(t, "iPhone 17 Pro", "26.3", "UDID-WARM")
+	slimCalls := 0
+	booted := false
+	deps := provisionDeps{
+		find: func(udid string) (simctl.DeviceEntry, bool, error) {
+			return simctl.DeviceEntry{
+				UDID: udid, Name: s.DeviceName(), State: "Booted", IsAvailable: true,
+				RuntimeID: "runtime-1", DeviceTypeID: "devicetype-1",
+			}, true, nil
+		},
+		listDevices:    func() ([]simctl.DeviceEntry, error) { return nil, nil },
+		resolveRuntime: stubResolveRuntime("runtime-1", "devicetype-1"),
+		create: func(string, string, string) (string, error) {
+			t.Fatal("a warm slot must not be recreated")
+			return "", nil
+		},
+		bootAndWait: func(string, time.Duration) error { booted = true; return nil },
+		shutdown:    neverShutdown(t),
+		delete:      neverDelete(t),
+		slim:        func(string, time.Duration) (bool, error) { slimCalls++; return false, nil },
+	}
+	if err := ensureProvisioned(s, "test", "with", "", deps, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if slimCalls != 1 {
+		t.Errorf("a warm slot must have its slim profile reconciled exactly once, got %d calls", slimCalls)
+	}
+	if booted {
+		t.Error("reconciling a warm slot must not add a boot-and-wait round trip")
+	}
+}
+
+func TestNeedResolvesCapabilitiesToSimslimCategories(t *testing.T) {
+	// Measured on a real slot, which is the only reason these two names
+	// exist: `simctl addmedia` fails PHPhotosErrorDomain 3301 without the
+	// photos category, and CSSearchableIndex.indexAppEntities fails
+	// CSIndexErrorDomain -1003 without the search one.
+	for name, want := range map[string]string{"photos": "photos", "spotlight": "search"} {
+		got, err := ResolveCapabilities([]string{name})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(got) != 1 || got[0] != want {
+			t.Errorf("%s must resolve to the %q category, got %v", name, want, got)
+		}
+	}
+}
+
+func TestNeedAcceptsARawSimslimCategory(t *testing.T) {
+	if _, err := ResolveCapabilities([]string{"store"}); err != nil {
+		t.Fatalf("a simslim category ID must be usable verbatim, so a need with no name here yet does not have to wait for a release: %v", err)
+	}
+}
+
+func TestNeedRejectsAnUnknownName(t *testing.T) {
+	_, err := ResolveCapabilities([]string{"photo"})
+	if err == nil {
+		t.Fatal("an unknown capability must be an error; silently handing back a slot without what was asked for is what sends a node to simctl create")
+	}
+	if !strings.Contains(err.Error(), "photos") {
+		t.Errorf("the error must list the real names, got %q", err)
+	}
+}
+
+func TestNeedFeedsTheSlimProfile(t *testing.T) {
+	SetRequestedCapabilities([]string{"photos"})
+	t.Cleanup(func() { SetRequestedCapabilities(nil) })
+	p, err := SlimProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.ExceptCategories["photos"] {
+		t.Error("--need photos must leave the photos category enabled")
+	}
+}

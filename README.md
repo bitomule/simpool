@@ -389,18 +389,80 @@ changes none of that. It remains a provisioning problem — which slot a
 consumer gets, and which slot a repo's baselines were recorded against —
 and it is still open.
 
+#### Asking for what you need: `--need`
+
+A slim slot is missing daemons, and the two that people actually hit are
+Photos and Spotlight. Ask for them by the name of the operation, not the
+daemon:
+
+```
+simpool with --device 'iPhone 17 Pro' --os 26.3 --need photos -- ./script.sh
+simpool with --device 'iPhone 17 Pro' --os 26.3 --need spotlight -- ./script.sh
+simpool with ... --need photos,spotlight -- ./script.sh
+```
+
+| `--need` | What stops failing | The error without it |
+|---|---|---|
+| `photos` | `xcrun simctl addmedia`, the photo picker, anything reading the photo library | `PHPhotosErrorDomain 3301` |
+| `spotlight` | `CSSearchableIndex.indexAppEntities`, CoreSpotlight indexing and App Entity donation | `CSIndexErrorDomain -1003` |
+
+Both were established by running the operation on a real slot until it
+returned successfully, not by reading a daemon list — and the second one
+corrects a belief this pool carried for a week. The daemon
+`indexAppEntities` needs is `com.apple.corespotlightservice`, in simslim's
+`search` category; it is **not** `com.apple.linkd`. Measured both ways:
+keeping `linkd` alone still fails `-1003`, and the `search` category alone
+succeeds with `linkd` still disabled.
+
+`--need` also takes any simslim category ID verbatim (`store`, `icloud`,
+`pim`, …), so a need with no name here yet does not have to wait for a
+release. An unknown name is a hard error at flag time, listing the real
+ones: a slot handed back silently missing what was asked for is worse than
+no answer, because it reads as "a pooled simulator cannot do this" and
+sends people off to `xcrun simctl create`.
+
+`--need` exists on `with`, `acquire`, `lease` and `preboot`, and has an
+env form, `SIMPOOL_NEED`, for a consumer that cannot pass a flag (a bazel
+rule, a Makefile wrapper). Warming with the same `--need` a later
+acquisition will use is what keeps that acquisition from paying the
+reconfigure reboot.
+
+The first acquisition that changes a slot's profile reboots its simulator
+(tens of seconds) and says so on stderr; every later acquisition asking
+for the same thing is one `launchctl` read. The profile is reconciled on
+**every** acquisition, warm or cold — which it was not until v0.19.0. See
+[Turning it off, and tuning it](#turning-it-off-and-tuning-it).
+
 #### Turning it off, and tuning it
 
 - `SIMPOOL_SLIM=0` turns slimming off entirely, and takes the default cap
   back to 3 with it.
+- `SIMPOOL_NEED` is the env form of `--need`, above.
 - `SIMPOOL_SLIM_EXCEPT` keeps whole categories enabled for a repo that
   needs them (`push`, `store`, `photos`; `simslim profiles` lists them).
+  `--need` is the same mechanism with names for the operations and an
+  error when you get one wrong.
 - `SIMPOOL_SLIM_KEEP` keeps individual launchd labels enabled.
 - `SIMPOOL_SLIM_TIMEOUT` bounds the one-off reconfigure (default 10m).
 
 A slim that fails is reported on stderr and nothing more: the slot is
-handed out stock rather than the acquisition failing, because a fat
-simulator still runs tests and a failed one does not.
+handed out rather than the acquisition failing, because a simulator whose
+profile is wrong still runs most tests and a failed acquisition runs none.
+The message says what that costs — the daemons are in whatever state they
+were already in, so a `--need` may not have taken effect — because the
+previous wording claimed the slot was "stock" when it was usually still
+slim, which is the opposite of the truth in the one case that matters.
+
+**Until v0.19.0 the profile was only applied on a cold boot.** The slim
+step lived inside the branch that runs when a device is not already
+booted, so asking a warm slot for a capability returned it in under two
+seconds with the daemons still disabled and no error anywhere —
+`SIMPOOL_SLIM_EXCEPT=photos` measured at 1.6s with `com.apple.assetsd`
+still off and `addmedia` still failing 3301. Two agents read that as a
+limitation of pooled simulators and created their own with `simctl
+create`, which nothing then reclaimed. If a slot on an older binary is
+stuck in the wrong profile, shutting its simulator down and acquiring it
+again is the manual equivalent of the fix.
 
 #### Not measured yet
 

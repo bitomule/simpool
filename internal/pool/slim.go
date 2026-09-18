@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -47,7 +48,85 @@ const (
 
 	// EnvSlimTimeout overrides DefaultSlimTimeout.
 	EnvSlimTimeout = "SIMPOOL_SLIM_TIMEOUT"
+
+	// EnvNeed is the env form of --need: a comma-separated list of
+	// capability names (see Capabilities). It exists so a consumer that
+	// cannot pass a flag — a bazel test rule, a Makefile wrapping
+	// simpool — can still ask for one.
+	EnvNeed = "SIMPOOL_NEED"
 )
+
+// Capabilities maps the name a consumer asks for to the simslim
+// categories that must stay enabled for it to work. The names are the
+// operation, not the daemon: a node that needs a photo library asks for
+// "photos", not for com.apple.assetsd, because which daemons back an
+// operation is exactly the thing nobody gets right from memory.
+//
+// Both entries were established by running the operation on a real slot,
+// not by reading a daemon list:
+//
+//	photos     xcrun simctl addmedia               fails PHPhotosErrorDomain 3301 without it
+//	spotlight  CSSearchableIndex.indexAppEntities  fails CSIndexErrorDomain -1003 without it
+//
+// The spotlight entry corrects a belief this pool carried for a week: the
+// daemon that operation needs is com.apple.corespotlightservice, in
+// simslim's "search" category — NOT com.apple.linkd. Measured both ways
+// on an iPhone 17 Pro @ 26.3 slot: keeping linkd alone still fails -1003,
+// and the search category alone succeeds with linkd still disabled.
+//
+// Any simslim category ID is also accepted verbatim, so a need this pool
+// has no name for yet does not have to wait for a release here.
+var Capabilities = map[string][]string{
+	"photos":    {"photos"},
+	"spotlight": {"search"},
+}
+
+// requestedCapabilities is what --need asked for, set once by the CLI
+// after flag parsing and read by SlimProfile. A package-level value
+// rather than a parameter threaded through EnsureProvisioned and its four
+// call sites: the slim profile has always been resolved from this
+// process's own configuration, and a flag is the same kind of
+// configuration as the env vars beside it.
+var requestedCapabilities []string
+
+// SetRequestedCapabilities records the --need list for this process. Call
+// it once, after flag parsing and before provisioning anything.
+func SetRequestedCapabilities(names []string) { requestedCapabilities = names }
+
+// ResolveCapabilities turns capability names into simslim category IDs.
+// An unknown name is an error listing what is available: a node that asks
+// for "photo", gets no error and no photo library is the exact failure
+// this mechanism exists to prevent — it is what sends a node off to run
+// `simctl create` instead.
+func ResolveCapabilities(names []string) ([]string, error) {
+	var cats []string
+	for _, n := range names {
+		if n = strings.TrimSpace(n); n == "" {
+			continue
+		}
+		if mapped, ok := Capabilities[n]; ok {
+			cats = append(cats, mapped...)
+			continue
+		}
+		if _, ok := simslim.CategoryByID(n); ok {
+			cats = append(cats, n)
+			continue
+		}
+		return nil, fmt.Errorf("%q is not a capability or a simslim category; capabilities are %s, and `simslim profiles` lists the categories", n, strings.Join(CapabilityNames(), ", "))
+	}
+	return cats, nil
+}
+
+// CapabilityNames lists every capability name, sorted, for error messages
+// and --help.
+func CapabilityNames() []string {
+	out := make([]string, 0, len(Capabilities))
+	for k := range Capabilities {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // DefaultSlimTimeout bounds the one-off reconfigure: boot, ~170 launchctl
 // transitions, reboot, and a read-back to prove the overrides survived it.
@@ -85,6 +164,14 @@ func SlimProfile() (simslim.Profile, error) {
 		if _, ok := simslim.CategoryByID(id); !ok {
 			return p, fmt.Errorf("%s: %q is not a simslim category (run `simslim profiles` for the list)", EnvSlimExcept, id)
 		}
+		p.ExceptCategories[id] = true
+	}
+	needs := append(append([]string{}, requestedCapabilities...), splitEnvList(os.Getenv(EnvNeed))...)
+	cats, err := ResolveCapabilities(needs)
+	if err != nil {
+		return p, err
+	}
+	for _, id := range cats {
 		p.ExceptCategories[id] = true
 	}
 	for _, label := range splitEnvList(os.Getenv(EnvSlimKeep)) {

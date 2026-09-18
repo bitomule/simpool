@@ -15,6 +15,7 @@ type leaseFlags struct {
 	key    string
 	ttl    time.Duration
 	max    int
+	need   string
 }
 
 func parseLeaseFlags(fs *flag.FlagSet, f *leaseFlags) {
@@ -23,6 +24,7 @@ func parseLeaseFlags(fs *flag.FlagSet, f *leaseFlags) {
 	fs.StringVar(&f.key, "key", "", "sticky lease key; defaults to the current git repo's root, or the working directory if there is none")
 	fs.DurationVar(&f.ttl, "ttl", pool.LeaseTTL(), "how long the lease lasts before it's considered abandoned; renewed on every call made with the same key (env "+pool.EnvLeaseTTL+")")
 	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
+	fs.StringVar(&f.need, "need", "", "comma-separated capabilities this slot must have, e.g. \"photos\" or \"spotlight\" (env "+pool.EnvNeed+"); see `simpool with --help`")
 }
 
 func (f *leaseFlags) validate() error {
@@ -38,7 +40,7 @@ func (f *leaseFlags) validate() error {
 	if f.max < 1 {
 		return fmt.Errorf("--max must be >= 1")
 	}
-	return nil
+	return applyNeed(f.need)
 }
 
 // RunLease implements `simpool lease`: a fast, sticky, key-scoped

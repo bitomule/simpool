@@ -42,7 +42,12 @@ Usage:
       key return the same slot, renewing a TTL — NOT a flock, see README.
 
   simpool release [--key K]
-      Drop --key's lease immediately instead of waiting out its TTL.
+      Drop --key's lease immediately instead of waiting out its TTL, and
+      kill the idb_companion / "simctl spawn <udid> log stream" processes
+      that session left attached to the slot — idb never reaps its own
+      companion, and one left behind quarantines the slot against every
+      other caller until something happens to try to acquire it. Only
+      ever --key's own residue, on a slot --key's own lease held.
 
   simpool preboot --device D --os V [--count N] [--max M] [--need C]
       Warm up N slots (boot their simulators) without a consumer, then

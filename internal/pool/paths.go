@@ -154,6 +154,22 @@ func SlotDir(groupDir string, n int) string {
 	return filepath.Join(groupDir, "slot-"+strconv.Itoa(n))
 }
 
+// SlotNumberOf returns the slot number a slot directory's own name encodes
+// ("…/slot-3" -> 3). Reports false for anything that is not a slot
+// directory name rather than guessing a number, so a caller handed some
+// other path cannot silently act on slot 0.
+func SlotNumberOf(dir string) (int, bool) {
+	m := slotDirRe.FindStringSubmatch(filepath.Base(dir))
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // ListSlotNumbers returns the slot numbers that already have a directory
 // under groupDir, sorted ascending. Missing/unreadable groupDir yields nil.
 //

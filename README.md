@@ -149,7 +149,9 @@ simpool lease --device D --os V [--key K] [--ttl D] [--max M]
     flock — see "MAV in the hot loop" below.
 
 simpool release [--key K]
-    Drop --key's lease immediately instead of waiting out its TTL.
+    Drop --key's lease immediately instead of waiting out its TTL, and
+    reclaim the residue that session left on the slot — see "Releasing
+    also reclaims what the session left behind" below.
 
 simpool preboot --device D --os V [--count N] [--max M]
     Warm up N slots (boot their simulators) with no consumer attached,
@@ -729,6 +731,38 @@ removed that, by the lease key recorded in `meta.json`. The exemption is
 narrow on purpose: only for a slot last held in `lease` mode, only for a
 non-empty key that matches, and never for a still-alive `with`-spawned
 process group or a liveness check that failed to complete.
+
+**Releasing also reclaims what the session left behind.** The exemption
+above keeps a key out of its own way; it does nothing for everyone else,
+and the slot stays quarantined against them while the residue lives. The
+reported case is a completely normal, successful run: `mav run`, then
+`simpool release --key`, then `xcrun simctl shutdown` — and `idb`'s
+companion daemon survives all three (its own `--help`: "Terminate if the
+target goes offline" defaults to false), so the slot sits in `quarantined`
+with the pid named in `status`'s WHY column. Reproduced twice on one iPad
+slot hours apart before this was written.
+
+Nothing was broken about the reclamation itself — an acquisition landing on
+that slot, or a `simpool reap` pass, kills exactly that residue and always
+did. What was missing was a trigger at the moment the residue is created:
+every path that could act is an *observer* that arrives later, if at all,
+and until one does, the slot is out of the pool. In practice that window
+ended when a person read the pid out of `status` and killed it.
+
+`simpool release --key K` now does it, for exactly K's own residue on a
+slot K's own lease held. It is also the only caller that *can*: at that
+instant the device is still booted and the slot was used seconds ago, so
+neither "the device is confirmed not running" nor "the slot has been idle
+for 30 minutes" can hold, and the general check can only reach "a live
+process still references this device" — never a kill candidate for anyone
+who cannot prove the session is over. K can: it is the session, saying so.
+The kill surface is unchanged (an `idb_companion`, or an orphaned
+`simctl spawn <udid> log stream`, both identified by exact argv shape, on a
+device confirmed by name to be this slot's own), and the reclaim refuses
+outright if a lease is alive on the slot again, if the slot was last held
+by `with`/`acquire`, or if anything else at all is attached to the device.
+A release whose reclaim refuses still succeeds — it reports what still
+stands in the way, exactly as before.
 
 `--max 1` is therefore usable for a repeated single-slot workload, which is
 the point of setting it: it bounds disk (~1.75GB per resident slot), and a

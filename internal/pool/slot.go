@@ -3,6 +3,7 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -37,6 +38,34 @@ const EnvMaxSlots = "SIMPOOL_MAX_SLOTS"
 var ErrAtCapacity = errors.New("simpool: pool at capacity")
 
 const acquirePollInterval = 2 * time.Second
+
+// firstWaitNotice is how long AcquireSlots stays quiet before saying it is
+// queued, and waitNoticeInterval how often it repeats afterwards.
+//
+// The first one is deliberately short — one poll — because the silence that
+// costs is the silence at the start. A node that is told at four seconds
+// that six slots are taken and why waits calmly; a node looking at a still
+// screen for two minutes gets treated as hung. That is not hypothetical:
+// queueing was measured at 21-79ms whenever a slot was usable, so any wait
+// long enough to be noticed at all means the group really has nothing free,
+// and one acquisition reported 2m01s of it with nothing printed in between.
+// Several nodes were peeked, messaged and reported as stuck on exactly that
+// evidence, all of them merely in the queue.
+//
+// Then every 15s rather than every poll: eight lines a minute is a log
+// nobody reads, and the point is a heartbeat with a reason attached, not a
+// progress bar.
+const (
+	firstWaitNotice    = acquirePollInterval
+	waitNoticeInterval = 15 * time.Second
+)
+
+// waitNotice is where AcquireSlots' queue notices are written, as a
+// package-level var so tests can capture them without a real pool and
+// without racing os.Stderr. Stderr, not stdout: `acquire`'s stdout is the
+// shell `export` lines a caller evaluates, and a progress line in there
+// would be evaluated too.
+var waitNotice io.Writer = os.Stderr
 
 // MaxSlotsPerGroup resolves the effective per-group slot cap:
 // SIMPOOL_MAX_SLOTS if set to a positive integer, else the default for
@@ -143,10 +172,33 @@ func AcquireSlots(root, device, osVersion string, count, max int, waitTimeout ti
 
 	start := time.Now()
 	deadline := start.Add(waitTimeout)
+	nextNotice := start.Add(firstWaitNotice)
 	for {
 		slots, err := tryAcquireSlots(root, device, osVersion, count, max)
 		if !errors.Is(err, ErrAtCapacity) {
 			return slots, err
+		}
+		if waitTimeout > 0 && !time.Now().After(deadline) && !time.Now().Before(nextNotice) {
+			// The refusal this loop is sitting on already enumerates, slot
+			// by slot, WHY each one could not be handed over — that is what
+			// atCapacityError builds. Until now it was only ever printed
+			// when the wait gave up, so the whole time it would have been
+			// useful nobody saw it. Printing it here is not new information,
+			// it is the same information at the moment it answers the
+			// question the caller actually has.
+			//
+			// The per-slot reason is the load-bearing half, not the elapsed
+			// time: "three quarantined, three leased" tells a reader
+			// something is wrong, and "six busy" tells them to wait. A bare
+			// "still waiting" would have prevented none of the confusion
+			// this exists for.
+			reason := "no slot available"
+			var ce *capacityError
+			if errors.As(err, &ce) {
+				reason = ce.Summary()
+			}
+			fmt.Fprintf(waitNotice, "simpool: waiting %s for a slot in %s — %s\n", time.Since(start).Round(time.Second), GroupName(device, osVersion), reason)
+			nextNotice = time.Now().Add(waitNoticeInterval)
 		}
 		if waitTimeout <= 0 || time.Now().After(deadline) {
 			// tryAcquireSlots' own error already names the group, the cap
@@ -204,9 +256,25 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// so a second claim from this same process would succeed.
 	taken := map[int]bool{}
 
+	// One entry per slot, not one per attempt. Acquisition walks `existing`
+	// more than once — pass one takes only slots that already satisfy the
+	// request, pass three reconsiders the rest — and a slot refused in pass
+	// one is not in `taken`, so it was refused again in pass three and
+	// listed twice. Harmless while this text only appeared once, on giving
+	// up; now that the same enumeration is printed every 15s while queueing,
+	// a group of six busy slots would report twelve. The later verdict
+	// replaces the earlier one: it is the more recent observation of the
+	// same slot.
 	var refusals []SlotRefusal
+	refusedAt := map[int]int{}
 	refuse := func(n int, av Availability) (bool, error) {
-		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
+		r := SlotRefusal{Number: n, Availability: av}
+		if i, seen := refusedAt[n]; seen {
+			refusals[i] = r
+			return false, nil
+		}
+		refusedAt[n] = len(refusals)
+		refusals = append(refusals, r)
 		return false, nil
 	}
 

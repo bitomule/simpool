@@ -251,8 +251,9 @@ simpool reap [--max N] [--cold N] [--stuck-after D] [--scrub N] [--purge N] [--p
     slow instead of silent and immediate.
 
     --warm N caps how many free simulators stay booted per device+OS
-    group, independent of --max (which caps concurrency, not residue —
-    see "Capacity" above): the N most-recently-used are kept, the rest
+    group, independent of --max (which caps how many slots exist, not how
+    many stay booted — see "Capacity" above): the N most-recently-used are
+    kept, the rest
     are shut down regardless of --cold. 0 (default) disables it.
 
     --orphans scans the default device set for pool-named simulators no
@@ -544,11 +545,31 @@ poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
 before giving up. `lease` counts against the same `--max` (a leased slot is
 just as resident as a locked one) but never polls — see below.
 
-`--max` only ever bounds concurrency — how many slots may be resident/locked
-at once. It says nothing about how many stay *booted* once freed; that's a
+`--max` bounds **residency** — how many slots a group may have at all. It is
+not a concurrency limit, and the difference only shows up in an oversized
+group, which is exactly when somebody reaches for it. The acquisition paths
+check `--max` in one place and one place only: before creating slot number
+`--max`+1. They never count how many of the group's existing slots are
+already leased, so in a group that already has more slot directories than
+`--max`, every one of them is handed out on demand and the cap bounds
+nothing. Measured: a group with three resident slots, one of them held,
+`--max 1` — the second acquisition took another slot in **2 ms** with no
+wait. The same probe against a one-slot group waited its full `--wait` and
+then returned `ErrAtCapacity`, so it is the group size that is doing the
+limiting, not the flag
+(`internal/pool/maxusage_test.go` runs both).
+
+So **`--max` caps how many machines may exist, not how many nodes may use
+the machine at once** — and while `reap --max` keeps a group at its size the
+two coincide, which is why the flag reads like a concurrency cap and behaves
+like one right up until it matters. If what you need is "no more than N of
+these running at a time", `--max` alone does not give it to you; the group
+has to actually be at size for it to hold.
+
+It says nothing either about how many stay *booted* once freed; that's a
 separate knob, `reap --warm N` (see "Recycling" below), because conflating
 the two makes sustained runs slower: a residue cap set as low as the
-concurrency cap means every run past the first pays a fresh cold boot for a
+residency cap means every run past the first pays a fresh cold boot for a
 slot that was needlessly shut down the moment it went idle.
 
 The cap is enforced in both directions, and for a long time it was not.

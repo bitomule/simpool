@@ -28,8 +28,8 @@ func parseAcquireFlags(fs *flag.FlagSet, f *acquireFlags) {
 	fs.StringVar(&f.device, "device", "", "simulator device type, e.g. \"iPhone 17 Pro\" (required)")
 	fs.StringVar(&f.os, "os", "", "simulator OS version, e.g. \"26.3\" (required)")
 	fs.IntVar(&f.count, "count", 1, "number of slots to acquire")
-	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
-	fs.DurationVar(&f.wait, "wait", 10*time.Minute, "how long to wait for a slot to free up once --max is reached (0 = fail immediately instead of waiting)")
+	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum slots this device+OS group may HAVE, across all callers. Checked only before creating a new slot, never against how many are currently in use, so it caps concurrency only while `reap --max` has kept the group at this size: a group that already has more slots hands every one of them out on demand (env "+pool.EnvMaxSlots+")")
+	fs.DurationVar(&f.wait, "wait", 10*time.Minute, "how long to poll once every slot the group has is busy and --max forbids adding another (0 = fail immediately instead of waiting)")
 	fs.StringVar(&f.need, "need", "", "comma-separated `capabilities` this slot must have: \"photos\" for simctl addmedia (else PHPhotosErrorDomain 3301), \"spotlight\" for CoreSpotlight indexing (else CSIndexErrorDomain -1003). Slots boot slim, with those daemons disabled, and asking is how you get them back (env "+pool.EnvNeed+"). Known: "+strings.Join(pool.CapabilityNames(), ", ")+"; any simslim category ID also works")
 }
 

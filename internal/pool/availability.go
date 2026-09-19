@@ -281,7 +281,53 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 		}
 	}
 	b.WriteString("\nraise --max/" + EnvMaxSlots + " to allow another resident slot, or clear what holds the ones above (`simpool doctor`, `simpool reap`)")
-	return fmt.Errorf("%w: %s", ErrAtCapacity, b.String())
+	return &capacityError{msg: b.String(), refusals: refusals}
+}
+
+// capacityError is atCapacityError's result: the same message as before,
+// plus the refusals it was built from, so a caller that needs a SHORT form
+// can have one without re-deriving anything or parsing the long one.
+//
+// It exists for the queue notice. Printing the full message every 15s while
+// waiting means four to thirteen lines per notice, most of them the same
+// remediation advice, and a heartbeat that verbose stops being read — which
+// would defeat the reason it was added. Wraps ErrAtCapacity so every
+// existing `errors.Is` check is unaffected.
+type capacityError struct {
+	msg      string
+	refusals []SlotRefusal
+}
+
+func (e *capacityError) Error() string { return fmt.Sprintf("%s: %s", ErrAtCapacity, e.msg) }
+func (e *capacityError) Unwrap() error { return ErrAtCapacity }
+
+// Summary is the one-line form: what is standing in the way, per slot, and
+// nothing else. No remediation advice (a heartbeat is not the place to
+// suggest raising --max fifteen seconds at a time) and no group/cap preamble
+// (the caller's own line already says what it is waiting for).
+//
+// The per-slot reason is the part that earns its place. "Waiting" alone
+// would not have prevented the confusion this is for: knowing that three
+// slots are quarantined rather than busy is what separates "wait, this is
+// normal" from "something is broken here", and today several nodes queueing
+// normally were investigated as hung.
+func (e *capacityError) Summary() string {
+	if len(e.refusals) == 0 {
+		return "no slot available"
+	}
+	parts := make([]string, 0, len(e.refusals))
+	for _, r := range e.refusals {
+		if r.TakenThenReleased {
+			parts = append(parts, fmt.Sprintf("slot-%d taken by this call", r.Number))
+			continue
+		}
+		if detail := r.Availability.Detail(); detail != "" {
+			parts = append(parts, fmt.Sprintf("slot-%d %s (%s)", r.Number, r.Availability.State, detail))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("slot-%d %s", r.Number, r.Availability.State))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // ownLeaseResidue decides whether residue found on a lease-mode slot may be

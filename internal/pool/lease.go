@@ -478,11 +478,62 @@ func ReclaimReleasedResidue(root, dir, key string) ([]int, bool) {
 	}
 
 	meta := ReadMeta(dir)
-	poison := checkPoison(meta, key)
+	owner := ownerDeclaration{releasedKey: key}
+	poison := checkPoison(meta, owner)
 	if poison.Reason != PoisonedByOrphanedResidue {
 		return nil, false
 	}
-	if !attemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison, key) {
+	if !attemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison, owner) {
+		return nil, false
+	}
+	return poison.ResiduePIDs, true
+}
+
+// ReclaimOwnResidue is ReclaimReleasedResidue for the other half of the
+// pool: a `with` or `acquire` process tidying up after itself as it exits,
+// while it still holds the slot's flock.
+//
+// It exists because `simpool release` structurally cannot cover these. An
+// acquire holds a kernel flock and carries no lease and no key, so a later
+// `release --key K` matches nothing of its on any slot — it reports "no
+// active lease for key K", which is true, and reclaims nothing, which is
+// the part that hurt: the session's own idb_companion then quarantined the
+// slot against every other caller for the full ResidueIdleGrace. That was
+// reported twice in one day as two separate defects (a `release` that
+// looked broken, and a slot stuck in quarantine); it is one gap, and this
+// is the missing half of it.
+//
+// The caller must still hold the slot's own flock — the precondition every
+// AttemptRecovery caller has (see poison.go) — which here is free: `with`
+// and `acquire` hold it until the moment they exit, so this runs before
+// Slot.Release, not after. That is also what makes it safe: while this
+// process holds the flock, no other consumer can have been handed the slot,
+// so nothing this kills can belong to anybody else's work. The kill surface
+// is unchanged from every other reclaim path — every live process
+// referencing the device must pass isReclaimableResidue, and the device
+// must pass deviceBelongsToSlot — so a session that left a real consumer
+// behind (a human's `simctl`, an `axe` run, an `idb` client mid-call) is
+// refused here exactly as it is everywhere else.
+//
+// Returns the pids it killed and whether it reclaimed anything. Every
+// refusal returns (nil, false) and leaves the slot exactly as it was. Like
+// the release path, this is best-effort tidying on top of work that has
+// already finished; it must never turn a successful run into a failure.
+func ReclaimOwnResidue(slot *Slot) ([]int, bool) {
+	if slot == nil || slot.Meta.UDID == "" {
+		return nil, false
+	}
+	// Deliberately meta as read back from disk rather than slot.Meta:
+	// EnsureProvisioned rewrote it during this very session, and the
+	// declaration below is checked against what the slot itself records,
+	// never against what the caller believes about itself.
+	meta := ReadMeta(slot.Dir)
+	owner := ownerDeclaration{finishingPID: os.Getpid()}
+	poison := checkPoison(meta, owner)
+	if poison.Reason != PoisonedByOrphanedResidue {
+		return nil, false
+	}
+	if !attemptRecovery(slot.Root, slot.Dir, slot.Number, GroupName(slot.Device, slot.OSVer), &meta, poison, owner) {
 		return nil, false
 	}
 	return poison.ResiduePIDs, true

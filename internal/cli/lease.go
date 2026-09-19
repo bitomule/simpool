@@ -4,9 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bitomule/simpool/internal/pool"
+	"github.com/bitomule/simpool/internal/procs"
 )
 
 type leaseFlags struct {
@@ -189,7 +192,73 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if len(released) == 0 {
-		fmt.Fprintf(stdout, "no active lease for key %q\n", k)
+		fmt.Fprintf(stdout, "no lease to release for key %q\n", k)
+		reportFlockHeldSlots(root, stdout)
 	}
 	return 0
+}
+
+// reportFlockHeldSlots explains, after a release that found no lease, the
+// slots that ARE held right now and by what — because the bare "no active
+// lease for key …" this replaces was read, twice in one day, as `release`
+// failing.
+//
+// It is not failing, and the confusion is structural rather than careless:
+// `with` and `acquire` hold a slot with a kernel flock, which carries no
+// key at all, while `release` is key-scoped because a lease is all it can
+// address. So a session that took its slot with `acquire` and then called
+// `release` got a message that is perfectly true and reads as an error —
+// one node reported a slot orphaned that was not, another spent its time
+// deciding `release` was broken. Nothing was wrong with either.
+//
+// Deliberately not an error and deliberately not a fix: a flock-held slot
+// is not `release`'s to take, and the kernel frees it the instant its
+// holder exits, with no cleanup step. The only thing missing was saying
+// so. It runs only on the nothing-released path, where the reader is
+// already asking "so why did nothing happen?", and never widens an actual
+// release into a pool-wide scan.
+func reportFlockHeldSlots(root string, stdout io.Writer) {
+	groups, err := pool.ListGroupDirs(root)
+	if err != nil {
+		return
+	}
+	var lines []string
+	for _, groupDir := range groups {
+		for _, n := range pool.ListSlotNumbers(groupDir) {
+			dir := pool.SlotDir(groupDir, n)
+			if free, err := pool.IsSlotFree(dir); err != nil || free {
+				continue
+			}
+			label := fmt.Sprintf("%s/slot-%d", filepath.Base(groupDir), n)
+			// The holder by pid from the kernel (lsof on the lock file),
+			// not from meta.json: meta is advisory and can name a pid that
+			// exited, which is exactly the kind of near-miss that sent
+			// someone hunting for a process that was not there. Fall back
+			// to meta only when lsof says nothing, and label it as the
+			// guess it is — the same distinction `simpool status` draws.
+			who := ""
+			if holders, _ := procs.LockHolders(pool.LockPath(dir)); len(holders) > 0 {
+				var parts []string
+				for _, h := range holders {
+					parts = append(parts, fmt.Sprintf("pid %d", h))
+				}
+				who = strings.Join(parts, ", ")
+			} else if meta := pool.ReadMeta(dir); meta.OwnerPID != 0 {
+				who = fmt.Sprintf("pid %d (from meta.json, unverified)", meta.OwnerPID)
+			}
+			if who == "" {
+				lines = append(lines, fmt.Sprintf("  %s is held, by a process this command could not identify", label))
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("  %s is held by a live process — %s", label, who))
+		}
+	}
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Fprintln(stdout, "note: nothing here is wrong. `release` drops leases, and these slots are held by a kernel lock instead:")
+	for _, l := range lines {
+		fmt.Fprintln(stdout, l)
+	}
+	fmt.Fprintln(stdout, "  A lock like that has no key and cannot be released from outside. It is `simpool with`/`acquire` holding its own slot, and the kernel drops it the moment that process exits — including on SIGKILL, with no cleanup step. Signal the process (an `acquire` exits on SIGINT/SIGTERM/SIGHUP); do not go looking for a lease.")
 }

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,8 +74,57 @@ func TestRunRelease_NoActiveLeaseIsNotAnError(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("release of an unheld key should exit 0, got %d, stderr:\n%s", code, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("no active lease")) {
-		t.Errorf("expected a \"no active lease\" message, got:\n%s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("no lease to release")) {
+		t.Errorf("expected a \"no lease to release\" message, got:\n%s", stdout.String())
+	}
+	// An empty pool has nothing held, so the explanation of what IS
+	// holding slots must stay out of the way entirely: the note exists to
+	// answer "so why did nothing happen?", and printing it when the answer
+	// is simply "there was nothing here" would be its own small lie.
+	if bytes.Contains(stdout.Bytes(), []byte("held by a live process")) {
+		t.Errorf("an empty pool must not report anything as held, got:\n%s", stdout.String())
+	}
+}
+
+// TestRunRelease_ExplainsAFlockHeldSlot is the reported failure of bug 1,
+// in the shape it was actually hit: a session took its slot with `simpool
+// acquire`, which holds a kernel flock and carries no lease key at all,
+// then called `simpool release`. The old output was the bare "no active
+// lease for key …" — true, and read twice in one day as `release` being
+// broken or the slot being orphaned. Neither was so, and the fix is that
+// the output now says which slot is held and by whom.
+func TestRunRelease_ExplainsAFlockHeldSlot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(pool.EnvPoolHome, home)
+
+	root, err := pool.Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupDir := pool.GroupDir(root, "iPhone 17 Pro", "26.3")
+	dir := pool.SlotDir(groupDir, 0)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real flock held for the duration of the call, exactly as a live
+	// `acquire` holds it — not a meta.json claiming a holder, which is the
+	// unverified case this command deliberately labels differently.
+	lock, err := pool.LockExistingSlot(groupDir, dir)
+	if err != nil || lock == nil {
+		t.Fatalf("locking the slot for the test: %v", err)
+	}
+	defer lock.Release()
+
+	var stdout, stderr bytes.Buffer
+	if code := RunRelease([]string{"--key", "some-other-key"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("a release with nothing of its own to drop must still exit 0, got %d, stderr:\n%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "slot-0 is held by a live process") {
+		t.Errorf("release must name the held slot, got:\n%s", out)
+	}
+	if !strings.Contains(out, "nothing here is wrong") {
+		t.Errorf("release must say this is not a failure, got:\n%s", out)
 	}
 }
 

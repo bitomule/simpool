@@ -21,6 +21,10 @@ Usage:
 
   simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D] [--need C]
       Print the environment for N slots and hold the lock until signaled.
+      Signal it (SIGINT/SIGTERM/SIGHUP) to hand the slots back; there is
+      no 'release' for these, because a kernel lock has no key. On the way
+      out it kills the idb_companion / log-stream processes its own
+      session left attached, so the slot goes straight back to free.
 
   --need asks for a capability a slot does not have by default, because
   slots boot slim (see README "Slim slots"). Use the name of the thing you
@@ -48,6 +52,13 @@ Usage:
       companion, and one left behind quarantines the slot against every
       other caller until something happens to try to acquire it. Only
       ever --key's own residue, on a slot --key's own lease held.
+      LEASES ONLY, and this is the line to read before concluding it is
+      broken: a slot taken with 'with'/'acquire' is held by a kernel lock,
+      which carries no key, so there is nothing here for --key to match
+      and nothing for this command to drop. That is not a failure and it
+      is not an orphaned slot — those sessions reclaim their own residue
+      as they exit, and the kernel frees their lock the moment they do.
+      When nothing matched, this says which slots are held and by whom.
 
   simpool preboot --device D --os V [--count N] [--max M] [--need C]
       Warm up N slots (boot their simulators) without a consumer, then

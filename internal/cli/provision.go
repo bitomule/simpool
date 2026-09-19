@@ -114,8 +114,38 @@ func reportForeignRootDevices(root string, stderr io.Writer) {
 	}
 }
 
+// releaseAll hands every slot this `with`/`acquire` holds back to the pool
+// — and, immediately before letting go of each one, reclaims the residue
+// this session itself left on it.
+//
+// The reclaim has to happen HERE, on this side of s.Release(), for the
+// reason that makes it safe at all: while this process still holds the
+// slot's flock, no other consumer can have been handed the slot, so
+// nothing it kills can belong to anyone else's work. One line later the
+// flock is gone and that guarantee with it.
+//
+// What it cleans up is a session's own `idb_companion`, which `idb` does
+// not reap (its "terminate if the target goes offline" default is false)
+// and which `with`'s process-group kill cannot reach because the daemon
+// reparents away from it. Left there, it quarantines the slot against
+// every other caller for the whole pool.ResidueIdleGrace — and on the
+// `acquire` path nothing could clear it sooner, because an acquire has no
+// lease for `simpool release` to find. Best-effort in every sense: it
+// refuses and leaves the slot untouched at the slightest doubt (see
+// pool.ReclaimOwnResidue), it reports what it killed on stderr itself, and
+// it must never keep a slot from being released.
 func releaseAll(slots []*pool.Slot) {
 	for _, s := range slots {
+		// Persist first, because the reclaim reads meta back off disk
+		// rather than trusting what the caller believes about itself, and
+		// on the `with` path the one field that matters has just been
+		// cleared in memory only: RunWith zeroes ConsumerPGID after
+		// sweeping the child's process group. Left unpersisted, the reclaim
+		// would read a dead pgid — harmless most of the time, but a pid
+		// macOS has since recycled reads as "the consumer is still alive"
+		// and refuses the reclaim for no reason at all.
+		_ = s.SaveMeta()
+		pool.ReclaimOwnResidue(s)
 		s.Release()
 	}
 }

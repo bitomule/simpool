@@ -250,11 +250,22 @@ simpool reap [--max N] [--cold N] [--stuck-after D] [--scrub N] [--purge N] [--p
     The 30-minute idle grace is what keeps that misconfiguration loud and
     slow instead of silent and immediate.
 
+    That caveat got sharper when `--max` started bounding use as well as
+    residency, and it is worth knowing even though nothing here fixes it.
+    A disagreement used to be wasteful: a reaper resolving a smaller
+    `--max` than the acquirers deletes healthy slots they promptly
+    recreate. It is now also restrictive in a way nobody asked for —
+    every process applies its own idea of the cap at claim time, so a
+    reaper with `SIMPOOL_MAX_SLOTS=2` against acquirers at 6 both deletes
+    their slots and does nothing to stop six of them running, while an
+    acquirer that resolves 2 against a pool run at 6 queues where nobody
+    intended a queue. One value, everywhere, including the launchd job.
+
     --warm N caps how many free simulators stay booted per device+OS
-    group, independent of --max (which caps how many slots exist, not how
-    many stay booted — see "Capacity" above): the N most-recently-used are
-    kept, the rest
-    are shut down regardless of --cold. 0 (default) disables it.
+    group, independent of --max (which caps how many slots exist and how
+    many are in use, not how many stay booted — see "Capacity" above):
+    the N most-recently-used are kept, the rest are shut down regardless
+    of --cold. 0 (default) disables it.
 
     --orphans scans the default device set for pool-named simulators no
     slot under this pool root currently references by name (a purged
@@ -545,28 +556,51 @@ poll for a free slot for up to `--wait` (default 10m; 0 fails immediately)
 before giving up. `lease` counts against the same `--max` (a leased slot is
 just as resident as a locked one) but never polls — see below.
 
-`--max` bounds **residency** — how many slots a group may have at all. It is
-not a concurrency limit, and the difference only shows up in an oversized
-group, which is exactly when somebody reaches for it. The acquisition paths
-check `--max` in one place and one place only: before creating slot number
-`--max`+1. They never count how many of the group's existing slots are
-already leased, so in a group that already has more slot directories than
-`--max`, every one of them is handed out on demand and the cap bounds
-nothing. Measured: a group with three resident slots, one of them held,
-`--max 1` — the second acquisition took another slot in **2 ms** with no
-wait. The same probe against a one-slot group waited its full `--wait` and
-then returned `ErrAtCapacity`, so it is the group size that is doing the
-limiting, not the flag
-(`internal/pool/maxusage_test.go` runs both).
+`--max` bounds **two** things, and it did not always: how many slots a group
+may *have*, and how many may be *in use at once*. Both are the same number
+and the same flag.
 
-So **`--max` caps how many machines may exist, not how many nodes may use
-the machine at once** — and while `reap --max` keeps a group at its size the
-two coincide, which is why the flag reads like a concurrency cap and behaves
-like one right up until it matters. If what you need is "no more than N of
-these running at a time", `--max` alone does not give it to you; the group
-has to actually be at size for it to hold.
+The second half is new, and it is new because the first half alone did not
+do what anybody reached for `--max` to do. Until then the acquisition paths
+checked `--max` in exactly one place — before creating slot number
+`--max`+1 — and never counted how many of the group's existing slots were
+already taken. So in a group that already held more slot directories than
+`--max`, every one of them was handed out on demand and the cap bounded
+nothing at all. Measured: three resident slots, one of them held, `--max 1`
+— the second acquisition got another slot in **2 ms** with no wait. A group
+of exactly one slot queued correctly in the same probe, which is the whole
+trap: while `reap --max` keeps a group at its size the two halves coincide,
+so the flag behaves like a concurrency cap right up until the moment it
+matters.
 
-It says nothing either about how many stay *booted* once freed; that's a
+Now a slot counts against `--max` while somebody is using it, whether that
+is a `with`/`acquire` flock or a live `lease` (a leased slot is just as much
+in use as a locked one). Once `--max` of them are in use, the next
+`with`/`acquire` **queues** — the same `--wait` poll, the same notice every
+15s naming who holds what — and `lease`, which never waits, refuses
+immediately. A key renewing its *own* live lease is never counted against
+itself: that is a renewal, not a second use, and `simpool lease` exists for
+a hot loop that does it once per action.
+
+Two things deliberately do **not** count, because a cap that never clears is
+a hang wearing a safety limit's clothes: a quarantined or unverifiable slot
+holds no share of `--max` (it refuses itself individually, with its own
+reason, which is what `simpool doctor` can act on), and neither does an
+expired lease.
+
+What this costs, stated plainly: **an acquisition that used to be instant
+can now wait.** On an oversized group that is the entire point — that
+acquisition was capacity nobody had authorised — but it is a real change in
+timing, so the wait is never silent (see the notice above) and the refusal
+says which of the two caps it hit, since the two want opposite responses:
+a residency refusal is a standing condition that wants `reap`, and a use
+refusal is a queue that clears by itself.
+
+`internal/pool/maxusage_test.go` holds the set, controls first: a group
+under its cap must neither wait nor print, and a call's own slots must not
+count against its own `--max`.
+
+`--max` says nothing about how many slots stay *booted* once freed; that's a
 separate knob, `reap --warm N` (see "Recycling" below), because conflating
 the two makes sustained runs slower: a residue cap set as low as the
 residency cap means every run past the first pays a fresh cold boot for a

@@ -256,14 +256,24 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 	// one blanket reason for the whole group — see atCapacityError.
 	var refusals []SlotRefusal
 
+	// uses is filled by the first claim that hits the --max slots-in-use cap.
+	// Once that happens every later slot would hit the same cap for the same
+	// reason, so the walk stops there rather than collecting per-slot
+	// refusals that describe other people's work as if it were an obstacle
+	// in this slot.
+	var uses []slotUse
+
 	for _, n := range existing {
 		dir := SlotDir(groupDir, n)
-		ok, av, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl)
+		ok, overCap, av, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl, max, &uses)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
+		}
+		if overCap {
+			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
 		}
 		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
 	}
@@ -278,12 +288,15 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 		}
 		dir := SlotDir(groupDir, next)
 		resident[next] = true
-		ok, av, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl)
+		ok, overCap, av, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl, max, &uses)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
 			return leaseSlotView(root, groupDir, dir, next, device, osVersion), nil
+		}
+		if overCap {
+			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
 		}
 		refusals = append(refusals, SlotRefusal{Number: next, Availability: av})
 		next++
@@ -311,20 +324,34 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 // holds it long-term — see the Lease doc comment) — mirroring take()'s own
 // lock-then-mutate pattern, and AttemptRecovery's other callers' documented
 // discipline (see poison.go), exactly.
-func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key string, ttl time.Duration) (bool, Availability, error) {
-	lock, err := claimSlotLock(groupDir, dir)
+// The use cap reaches this path through the same claimSlotLockCapped that
+// take() uses, so a lease counts against --max exactly as a `with`/`acquire`
+// consumer does — a leased slot is just as much in use as a locked one, and
+// leaving this path uncapped would have made the cap meaningless the moment
+// anyone used `lease`. Its own key is exempt (see censusInUse): a key coming
+// back to its own live lease is renewing, not taking a second slot.
+//
+// overCap is reported separately from a refusal because it is not one. The
+// slot asked for may be perfectly free; it is the GROUP that is full, which
+// is a fact about everybody else and does not belong in a per-slot reason.
+func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key string, ttl time.Duration, max int, uses *[]slotUse) (ok bool, overCap bool, av Availability, err error) {
+	lock, outcome, census, err := claimSlotLockCapped(groupDir, dir, n, max, nil, key)
 	if err != nil {
-		return false, Availability{}, err
+		return false, false, Availability{}, err
+	}
+	if outcome == claimOverUseCap {
+		*uses = census
+		return false, true, Availability{}, nil
 	}
 	if lock == nil {
-		return false, Availability{State: SlotBusy}, nil
+		return false, false, Availability{State: SlotBusy}, nil
 	}
 	defer lock.Release()
 
 	// One shared computation with what `simpool status` reports (see
 	// SlotState): everything except the flock, which this call now holds
 	// and therefore already knows the answer to.
-	av := slotAvailabilityLocked(dir, key)
+	av = slotAvailabilityLocked(dir, key)
 	switch av.State {
 	case SlotFree:
 		// Includes the case where av.Poison is non-empty but is this key's
@@ -347,16 +374,16 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 	case SlotQuarantined:
 		meta := av.Meta
 		if !AttemptRecovery(root, dir, n, GroupName(device, osVersion), &meta, av.Poison) {
-			return false, av, nil
+			return false, false, av, nil
 		}
 	default:
-		return false, av, nil
+		return false, false, av, nil
 	}
 
 	if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
-		return false, av, err
+		return false, false, av, err
 	}
-	return true, av, nil
+	return true, false, av, nil
 }
 
 func leaseSlotView(root, groupDir, dir string, n int, device, osVersion string) *Slot {

@@ -422,8 +422,53 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// this — a profile is a property of a slot inside the device+OS group,
 	// never a group of its own — so the group still tops out at `max`
 	// simulators however many distinct profiles are in play.
+	// This is the one branch of acquisition that ADDS a simulator to the
+	// machine, and therefore the only one where a free-memory floor can
+	// decline without failing a job that could have run: everything below
+	// it, plus AcquireSlots' own poll loop, waits for a resident slot
+	// instead. coldBootFloor has the whole reasoning, including what it
+	// deliberately does not decline.
+	//
+	// Measured once per tryAcquireSlots call, not once per slot: the
+	// simulators this loop's slots eventually cost are booted later, by
+	// EnsureProvisioned, so nothing inside the loop moves the number. The
+	// poll loop re-enters this function every 2s, which is where the
+	// re-reading happens.
+	coldFloorNote := ""
+	if len(acquired) < count && len(resident) < max && !capped {
+		// A fallback is a resident slot this call could still end up on
+		// without creating one — either because a later pass can take it,
+		// or because waiting for it is something that ends.
+		fallbacks := 0
+		for _, n := range existing {
+			if taken[n] {
+				continue
+			}
+			i, refused := refusedAt[n]
+			if !refused {
+				// Never refused, only skipped for not matching --need: the
+				// reconfigure pass below can still take it, with no wait
+				// and nothing created.
+				fallbacks++
+				continue
+			}
+			switch refusals[i].Availability.State {
+			case SlotBusy, SlotLeased:
+				// Somebody else's work in progress, and work in progress
+				// ends. This is the queue the floor is choosing over a boot.
+			default:
+				// Quarantined and unverifiable are deliberately absent: they
+				// do not clear by waiting, so counting them would let this
+				// decline a request that then has nothing to wait for.
+				continue
+			}
+			fallbacks++
+		}
+		coldFloorNote = coldBootFloor(fallbacks, count-len(acquired))
+	}
+
 	next := 0
-	for len(acquired) < count && len(resident) < max && !capped {
+	for coldFloorNote == "" && len(acquired) < count && len(resident) < max && !capped {
 		for resident[next] {
 			next++
 		}
@@ -476,6 +521,12 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			// to raising --max, when what they are actually in is a queue
 			// that clears on its own.
 			return nil, atUseCapError(GroupName(device, osVersion), "", max, atUseCap)
+		}
+		if coldFloorNote != "" {
+			// The group is NOT at its cap — it could have grown and chose
+			// not to. Reporting that as capacity would advise raising --max,
+			// the one remedy that cannot help here.
+			return nil, atMemoryFloorError(GroupName(device, osVersion), refusals, coldFloorNote)
 		}
 		return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 	}

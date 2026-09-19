@@ -270,18 +270,46 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 		b.WriteString(" and cannot fill the request")
 	}
 	b.WriteString(":")
-	for _, r := range refusals {
-		if r.TakenThenReleased {
-			fmt.Fprintf(&b, "\n  slot-%d: taken by this call, released when the group came up short", r.Number)
-			continue
-		}
-		fmt.Fprintf(&b, "\n  slot-%d: %s", r.Number, r.Availability.State)
-		if detail := r.Availability.Detail(); detail != "" {
-			fmt.Fprintf(&b, " — %s", detail)
-		}
-	}
+	writeRefusalLines(&b, refusals)
 	b.WriteString("\nraise --max/" + EnvMaxSlots + " to allow another resident slot, or clear what holds the ones above (`simpool doctor`, `simpool reap`)")
 	return &capacityError{msg: b.String(), refusals: refusals}
+}
+
+// writeRefusalLines is the per-slot enumeration both capacity failures
+// share: one line per slot, naming what actually stood in the way.
+func writeRefusalLines(b *strings.Builder, refusals []SlotRefusal) {
+	for _, r := range refusals {
+		if r.TakenThenReleased {
+			fmt.Fprintf(b, "\n  slot-%d: taken by this call, released when the group came up short", r.Number)
+			continue
+		}
+		fmt.Fprintf(b, "\n  slot-%d: %s", r.Number, r.Availability.State)
+		if detail := r.Availability.Detail(); detail != "" {
+			fmt.Fprintf(b, " — %s", detail)
+		}
+	}
+}
+
+// atMemoryFloorError is the failure acquisition returns when it could have
+// grown the group but declined to add a simulator because free memory is
+// below the floor (see coldBootFloor).
+//
+// A SEPARATE constructor rather than a note bolted onto atCapacityError,
+// because atCapacityError's every sentence would be false here: the group is
+// not at its --max, raising --max would change nothing, and `simpool doctor`
+// has nothing to clear. Saying so would send the reader to the one remedy
+// that cannot work. It still wraps ErrAtCapacity, so AcquireSlots' poll loop
+// treats it exactly as it treats a full group — which is the point: this is
+// a queue that clears on its own, not a refusal.
+func atMemoryFloorError(group string, refusals []SlotRefusal, note string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s: %s", group, note)
+	if len(refusals) > 0 {
+		b.WriteString("\nthe resident slots it is waiting on:")
+		writeRefusalLines(&b, refusals)
+	}
+	b.WriteString("\nthis clears on its own when a slot is released or memory frees up; move the floor with " + EnvAcquireMinFree + " (an integer percentage)")
+	return &capacityError{msg: b.String(), refusals: refusals, note: note}
 }
 
 // capacityError is atCapacityError's result: the same message as before,
@@ -296,6 +324,12 @@ func atCapacityError(group, forKey string, max int, refusals []SlotRefusal) erro
 type capacityError struct {
 	msg      string
 	refusals []SlotRefusal
+	// note is set only by atMemoryFloorError: the group-level reason the
+	// request was not filled, when that reason is not any individual slot.
+	// Summary leads with it, because "six busy" on its own would describe a
+	// machine that has run out of slots when it has actually run out of
+	// memory — and that line is the one a waiting caller reads every 15s.
+	note string
 }
 
 func (e *capacityError) Error() string { return fmt.Sprintf("%s: %s", ErrAtCapacity, e.msg) }
@@ -312,6 +346,9 @@ func (e *capacityError) Unwrap() error { return ErrAtCapacity }
 // normal" from "something is broken here", and today several nodes queueing
 // normally were investigated as hung.
 func (e *capacityError) Summary() string {
+	if e.note != "" {
+		return e.note
+	}
 	if len(e.refusals) == 0 {
 		return "no slot available"
 	}

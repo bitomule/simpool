@@ -278,12 +278,25 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		return false, nil
 	}
 
+	// atUseCap records that a claim was refused because the GROUP is at its
+	// --max slots in use, not because anything is wrong with the slot that
+	// was asked for. Every loop below stops on it: once the group is full
+	// there is nothing for a later pass to find, and walking on would build
+	// a refusal list describing slots as obstacles when they are simply
+	// other people's work in progress.
+	var atUseCap []slotUse
+	capped := false
+
 	take := func(n int) (bool, error) {
 		dir := SlotDir(groupDir, n)
 
-		lock, err := claimSlotLock(groupDir, dir)
+		lock, outcome, uses, err := claimSlotLockCapped(groupDir, dir, n, max, taken, "")
 		if err != nil {
 			return false, err
+		}
+		if outcome == claimOverUseCap {
+			capped, atUseCap = true, uses
+			return false, nil
 		}
 		if lock == nil {
 			return refuse(n, Availability{State: SlotBusy})
@@ -389,7 +402,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// Pass one takes only slots that already satisfy the request, so the
 	// common case is the 1.5s path and nothing is reconfigured.
 	for _, n := range existing {
-		if len(acquired) >= count {
+		if len(acquired) >= count || capped {
 			break
 		}
 		if !Satisfies(ReadMeta(SlotDir(groupDir, n)).Capabilities, want) {
@@ -410,7 +423,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// never a group of its own — so the group still tops out at `max`
 	// simulators however many distinct profiles are in play.
 	next := 0
-	for len(acquired) < count && len(resident) < max {
+	for len(acquired) < count && len(resident) < max && !capped {
 		for resident[next] {
 			next++
 		}
@@ -431,7 +444,7 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// open file description, so a second claim from this same process would
 	// succeed and hand one slot out twice.
 	for _, n := range existing {
-		if len(acquired) >= count {
+		if len(acquired) >= count || capped {
 			break
 		}
 		if taken[n] {
@@ -456,6 +469,14 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 			refusals = append(refusals, SlotRefusal{Number: s.Number, TakenThenReleased: true})
 		}
 		release()
+		if capped {
+			// The group is not short of slots, it is short of FREE ones:
+			// somebody else is using --max of them right now. Reporting
+			// that as the residency cap would send the reader to `reap` or
+			// to raising --max, when what they are actually in is a queue
+			// that clears on its own.
+			return nil, atUseCapError(GroupName(device, osVersion), "", max, atUseCap)
+		}
 		return nil, atCapacityError(GroupName(device, osVersion), "", max, refusals)
 	}
 
@@ -536,31 +557,14 @@ func withGroupAllocLock(groupDir string, fn func() error) error {
 // any slot number, since they all funnel through this same allocation
 // lock. See AcquireLease's history (lease.go) for where that used to bite.
 func claimSlotLock(groupDir, dir string) (*Lock, error) {
-	var lock *Lock
-	busy := false
-	err := withGroupAllocLock(groupDir, func() error {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-		l, err := TryLock(lockPath(dir))
-		if err != nil {
-			if err == ErrBusy {
-				busy = true
-				return nil
-			}
-			return err
-		}
-		lock = l
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if busy {
-		return nil, nil
-	}
-	return lock, nil
+	lock, _, _, err := claimSlotLockCapped(groupDir, dir, -1 /*n, unused*/, 0 /*max: no use cap*/, nil, "")
+	return lock, err
 }
+
+// mkdirAllSlot is the slot-directory creation step claimSlotLockCapped runs
+// inside the group allocation lock. Named rather than inlined only so that
+// step reads as one thing next to the census beside it.
+func mkdirAllSlot(dir string) error { return os.MkdirAll(dir, 0o755) }
 
 // LockExistingSlot is claimSlotLock for a caller that must NOT create the
 // slot it is locking: it takes the group allocation lock, confirms dir still

@@ -817,6 +817,31 @@ which is backwards. A *booted* slot has never counted as unavailable and
 still doesn't — booted with no consumer is exactly the warm slot the pool
 exists to hand back.
 
+### Waiting for a slot says so, every 15 seconds
+
+`with`/`acquire` poll for a slot when the group is at its cap, and the
+default `--wait` is 10 minutes. That wait used to be completely silent:
+nothing was printed until it either got a slot or gave up, so a caller
+queueing for two minutes showed a still screen for two minutes. Measured on
+this machine, queueing takes 21–79ms whenever a slot is actually usable, so
+any wait long enough to notice means the group genuinely has nothing free —
+and one acquisition reported `acquired … in 2m01s` with nothing printed in
+between. Several agents queueing normally were investigated as hung on
+exactly that evidence.
+
+It now says what it is waiting for, first after one poll and then every 15s:
+
+```
+simpool: waiting 2s for a slot in iPhone-Duo@27.1 — slot-0 busy (its flock is held)
+```
+
+The per-slot reason is the point, not the elapsed time: "three quarantined,
+three leased" means go and look, "six busy" means wait. It is the same
+enumeration the refusal has always carried (see "Why a slot can be
+refused"), condensed to one line and printed while it is still useful
+instead of only on giving up. An acquisition that never waits prints
+nothing.
+
 ### Warming up ahead of time
 
 `simpool preboot --device D --os V [--count N] [--max M]` provisions N

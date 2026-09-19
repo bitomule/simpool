@@ -628,6 +628,55 @@ to clean up in the first place. The gate is held only for the duration of
 one boot, never for a slot's lifetime, so it can never widen how long
 anything else has to wait on a slot's own lock.
 
+#### Adding a simulator when memory is tight
+
+Acquisition has one branch that makes the machine heavier: the pass that
+takes a **new** slot number, whose simulator is then cold-booted. That
+branch — and only that branch — is gated on free memory. Below 35% free it
+does not run, and the acquisition waits for one of the group's resident
+slots instead of adding a seventh simulator to a machine that is already
+struggling:
+
+```
+simpool: waiting 15s for a slot in iPhone-17-Pro@26.3 — not adding a
+simulator: 20% memory free, below the 35% floor — waiting for one of the 3
+resident slot(s) instead, which costs this job a queue where booting another
+would cost the machine ~1.75GB
+```
+
+Override with `SIMPOOL_ACQUIRE_MIN_FREE` as an integer percentage; `0`
+disables it. The threshold comes from the same nine measurements as the
+`--warm` floor above — 2 of 2 snapshot runs that finished started above 58%
+free, 7 of 7 that died started below — and is deliberately not stricter than
+it: warming is speculative, so skipping it costs nothing, while this is real
+demand and declining costs a queue.
+
+**Why only that branch.** A memory floor can only ever *decline*. A slot cap
+can *queue* — the work waits and then runs. A floor over acquisition as a
+whole would therefore turn a slow suite into a failed one, which is worse
+than the problem. The cold-boot branch is the one place where declining is
+free, because every other pass of acquisition, plus the `--wait` poll loop,
+is already a fallback.
+
+**What it never declines**, because a limit that cannot be released is a
+hang wearing a safety limit's clothes:
+
+- **A group with nothing to wait for.** An empty group, or one whose
+  remaining slots are quarantined or unverifiable rather than busy, has no
+  fallback — refusing there would fail the job after `--wait` instead of
+  queueing it. A cold group boots at 1% free.
+- **A request for more slots than could ever free up.** One busy slot is a
+  fallback for `--count 1`, not for `--count 2`.
+- **A measurement that failed.** `reap --warm` declines when it cannot read
+  memory, and is right to. Here the same reading would put every acquisition
+  on the machine into a queue because `vm_stat` failed once, so an
+  unverifiable measurement permits — and says nothing, rather than claiming
+  it checked.
+
+The refusal is deliberately *not* the capacity message: the group is not at
+its `--max`, it chose not to grow, so advising `--max` would point at the one
+remedy that cannot help.
+
 ### Recycling: shut down, scrub, purge
 
 A slot that has been used costs three different things, and until

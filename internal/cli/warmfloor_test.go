@@ -38,9 +38,9 @@ func fakeDeviceStates(t *testing.T, root, group string, byUDID map[string]int, s
 // sides of the threshold are testable without a machine in that state.
 func withFreeMemory(t *testing.T, fraction float64, ok bool) {
 	t.Helper()
-	orig := freeMemoryFraction
-	t.Cleanup(func() { freeMemoryFraction = orig })
-	freeMemoryFraction = func() (float64, bool) { return fraction, ok }
+	orig := pool.FreeMemoryFraction
+	t.Cleanup(func() { pool.FreeMemoryFraction = orig })
+	pool.FreeMemoryFraction = func() (float64, bool) { return fraction, ok }
 }
 
 // recordBoots captures which UDIDs the floor decides to boot.
@@ -213,9 +213,9 @@ func TestEnforceWarmFloor_StopsWhenMemoryRunsDownMidPass(t *testing.T) {
 	// Comfortable to begin with, tight after the first boot.
 	var mu sync.Mutex
 	calls := 0
-	orig := freeMemoryFraction
-	t.Cleanup(func() { freeMemoryFraction = orig })
-	freeMemoryFraction = func() (float64, bool) {
+	orig := pool.FreeMemoryFraction
+	t.Cleanup(func() { pool.FreeMemoryFraction = orig })
+	pool.FreeMemoryFraction = func() (float64, bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
@@ -317,19 +317,5 @@ func TestWarmFloorThreshold_OverrideAndItsRefusals(t *testing.T) {
 		if got := warmFloorThreshold(); got != warmFloorMinFreeMemory {
 			t.Errorf("%q must fall back to the default, not disable the guard; got %v", bad, got)
 		}
-	}
-}
-
-// TestFreeMemoryFraction_ReadsTheRealMachine is a smoke test on the live
-// probe, not a pinned value: it must come back plausible on whatever machine
-// runs it. A probe that silently returns 0 would make the floor decline
-// forever, which looks exactly like the floor not being implemented.
-func TestFreeMemoryFraction_ReadsTheRealMachine(t *testing.T) {
-	got, ok := liveFreeMemoryFraction()
-	if !ok {
-		t.Skip("could not read memory on this machine; nothing to assert")
-	}
-	if got <= 0 || got > 1 {
-		t.Fatalf("free memory fraction %v is not a fraction — the floor would misjudge every pass", got)
 	}
 }

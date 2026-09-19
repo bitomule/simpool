@@ -788,6 +788,19 @@ path, the kill surface included: the same two argv-identified classes, the
 same device-identity check, the same refusal the moment anything that is
 not one of them is attached to the device.
 
+**If you are testing any of this, keep the UDID out of your own argv.**
+Occupancy is decided with `pgrep -f <udid>`, so *any* process carrying a
+slot's UDID on its command line is a live consumer of that slot — a
+`grep`, an `awk -v udid=…`, a `ps | grep` in a shell function. A script
+written to measure whether a slot came back to `free` quarantined the very
+slot it was measuring, on every poll, and the result read exactly like a
+simpool defect. Pass the UDID through the environment instead
+(`U="$udid" awk '$0 ~ ENVIRON["U"]'`): environment variables are not in
+argv and `pgrep -f` cannot see them. The same applies to reading the
+result: a slot polled in the first seconds after a kill can still report a
+live consumer because macOS has not reaped the corpse yet, so wait for the
+state to settle before calling it a verdict.
+
 **What `release` will not do, and now says so.** A flock has no key, so
 `simpool release` cannot address a slot held by `with`/`acquire`, and it
 never could. What changed is the output: instead of the bare `no active

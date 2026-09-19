@@ -136,6 +136,15 @@ func reportForeignRootDevices(root string, stderr io.Writer) {
 // it must never keep a slot from being released.
 func releaseAll(slots []*pool.Slot) {
 	for _, s := range slots {
+		// Persist first, because the reclaim reads meta back off disk
+		// rather than trusting what the caller believes about itself, and
+		// on the `with` path the one field that matters has just been
+		// cleared in memory only: RunWith zeroes ConsumerPGID after
+		// sweeping the child's process group. Left unpersisted, the reclaim
+		// would read a dead pgid — harmless most of the time, but a pid
+		// macOS has since recycled reads as "the consumer is still alive"
+		// and refuses the reclaim for no reason at all.
+		_ = s.SaveMeta()
 		pool.ReclaimOwnResidue(s)
 		s.Release()
 	}

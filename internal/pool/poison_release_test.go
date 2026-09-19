@@ -217,18 +217,59 @@ func TestCheckPoison_NeverProducesOwnerReleasedEvidence(t *testing.T) {
 	}
 }
 
-// TestResidueOwnerReleased_NeverMatchesOnEmptyStrings pins the one way a
-// string comparison can silently become a wildcard: a slot with no
+// TestOwnerDeclaration_NeverMatchesOnZeroValues pins the one way each
+// form of attribution can silently become a wildcard: a slot with no
 // recorded lease key and a caller releasing no key would otherwise match
-// each other.
-func TestResidueOwnerReleased_NeverMatchesOnEmptyStrings(t *testing.T) {
-	if residueOwnerReleased(Meta{Mode: "lease"}, "") {
+// each other, and so would a slot with no recorded owner pid and a
+// declaration carrying none.
+func TestOwnerDeclaration_NeverMatchesOnZeroValues(t *testing.T) {
+	if (ownerDeclaration{}).declares(Meta{Mode: "lease"}) {
 		t.Fatal("an empty key must never match an empty Meta.LeaseKey")
 	}
-	if residueOwnerReleased(Meta{Mode: "lease", LeaseKey: "k"}, "") {
+	if (ownerDeclaration{}).declares(Meta{Mode: "lease", LeaseKey: "k"}) {
 		t.Fatal("an empty releasing key must never match")
 	}
-	if residueOwnerReleased(Meta{Mode: "lease"}, "k") {
+	if (ownerDeclaration{releasedKey: "k"}).declares(Meta{Mode: "lease"}) {
 		t.Fatal("a slot that remembers no lease key must never match")
+	}
+	if (ownerDeclaration{}).declares(Meta{Mode: "acquire"}) {
+		t.Fatal("a zero pid must never match an unrecorded Meta.OwnerPID")
+	}
+	if (ownerDeclaration{finishingPID: 4242}).declares(Meta{Mode: "acquire"}) {
+		t.Fatal("a slot that recorded no owner pid must never match")
+	}
+	if (ownerDeclaration{}).declares(Meta{Mode: "acquire", OwnerPID: 4242}) {
+		t.Fatal("a declaration carrying no pid must never match")
+	}
+}
+
+// TestOwnerDeclaration_EachFormIsScopedToItsOwnModes pins the crossover
+// neither form may make. A key speaks only for a lease (a `with`/`acquire`
+// slot's residue means something that held the flock died, which is the
+// ConsumerPGID branch's business); a pid speaks only for a flock holder (a
+// lease never holds the flock, so an exiting lease process proves nothing
+// about the slot). Letting either cross would let a caller declare a
+// session over that it never owned.
+func TestOwnerDeclaration_EachFormIsScopedToItsOwnModes(t *testing.T) {
+	key := ownerDeclaration{releasedKey: "k"}
+	for _, mode := range []string{"with", "acquire"} {
+		if key.declares(Meta{Mode: mode, LeaseKey: "k"}) {
+			t.Errorf("a lease key must not declare for a %q slot", mode)
+		}
+	}
+	pid := ownerDeclaration{finishingPID: 99}
+	if pid.declares(Meta{Mode: "lease", OwnerPID: 99}) {
+		t.Error("a finishing pid must not declare for a lease slot")
+	}
+	if !key.declares(Meta{Mode: "lease", LeaseKey: "k"}) {
+		t.Error("a matching key must declare for its own lease slot")
+	}
+	for _, mode := range []string{"with", "acquire"} {
+		if !pid.declares(Meta{Mode: mode, OwnerPID: 99}) {
+			t.Errorf("a matching pid must declare for its own %q slot", mode)
+		}
+	}
+	if pid.declares(Meta{Mode: "acquire", OwnerPID: 100}) {
+		t.Error("a different pid must never declare for someone else's slot")
 	}
 }

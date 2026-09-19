@@ -151,7 +151,10 @@ simpool lease --device D --os V [--key K] [--ttl D] [--max M]
 simpool release [--key K]
     Drop --key's lease immediately instead of waiting out its TTL, and
     reclaim the residue that session left on the slot — see "Releasing
-    also reclaims what the session left behind" below.
+    also reclaims what the session left behind" below. Leases only: a slot
+    held by `with`/`acquire` is held by a kernel lock, which has no key and
+    is not this command's to drop. It names those slots and their holders
+    rather than reporting nothing found and looking like a failure.
 
 simpool preboot --device D --os V [--count N] [--max M]
     Warm up N slots (boot their simulators) with no consumer attached,
@@ -763,6 +766,36 @@ outright if a lease is alive on the slot again, if the slot was last held
 by `with`/`acquire`, or if anything else at all is attached to the device.
 A release whose reclaim refuses still succeeds — it reports what still
 stands in the way, exactly as before.
+
+**`with` and `acquire` do the same for themselves, as they exit.** A lease
+key is not the only session that can say it is finished, and it was the
+only one that could. `acquire` holds a kernel flock and carries no lease
+and no key at all, so `simpool release` matched nothing of its on any slot:
+it said `no active lease for key …` — true — and reclaimed nothing, which
+left an acquire session's own companion quarantining its slot for the full
+thirty minutes. Both halves of that were reported on the same day as two
+separate defects. They are one gap, and the missing piece was that only a
+lease could declare itself over.
+
+So `with` and `acquire` now reclaim their own residue on the way out, in
+the instant before they drop the flock. That instant is what makes it safe:
+while the process still holds the lock, nobody else can have been handed
+the slot, so nothing it kills can belong to another caller's work. The
+attribution is the slot's own recorded `ownerPid` rather than a key, which
+is strictly stronger evidence — the kernel identifies the attesting
+process, and it is the holder. Everything else is identical to the release
+path, the kill surface included: the same two argv-identified classes, the
+same device-identity check, the same refusal the moment anything that is
+not one of them is attached to the device.
+
+**What `release` will not do, and now says so.** A flock has no key, so
+`simpool release` cannot address a slot held by `with`/`acquire`, and it
+never could. What changed is the output: instead of the bare `no active
+lease for key …` that was twice read as a failure (one node reported a slot
+orphaned that was not; another concluded `release` was broken), it now
+names the slots that are held and by which pid, and says plainly that this
+is not a failure and not something to release — the kernel drops that lock
+the instant its holder exits, including on SIGKILL, with no cleanup step.
 
 `--max 1` is therefore usable for a repeated single-slot workload, which is
 the point of setting it: it bounds disk (~1.75GB per resident slot), and a

@@ -103,10 +103,22 @@ const (
 	ResidueSlotLongIdle
 	// ResidueOwnerReleased means the device IS running and the slot was
 	// used moments ago — so neither form of evidence above can possibly
-	// hold — but the key whose own lease left this residue is, right now,
-	// explicitly saying its session is over: `simpool release --key K` on
-	// a slot whose Meta.LeaseKey is K, with the lease already gone and
-	// the slot's flock in this caller's hand.
+	// hold — but the session whose own use of this slot left the residue
+	// is, right now, explicitly saying it is over, with the slot's flock in
+	// this caller's hand. Two sessions can say that, and the difference
+	// between them is only how they are identified (see ownerDeclaration):
+	// `simpool release --key K` on a slot whose Meta.LeaseKey is K, and a
+	// `with`/`acquire` process exiting on a slot whose Meta.OwnerPID is its
+	// own pid.
+	//
+	// The second form is why this is not a lease-only affair. `acquire` has
+	// no lease and no key at all, so `simpool release` finds nothing of its
+	// on any slot and reclaims nothing there — which left an acquire
+	// session's own companion quarantining its slot for the full
+	// ResidueIdleGrace, and left `release` looking broken in the same
+	// breath, since it truthfully reported having no lease to drop. Both
+	// were reported as separate defects on the same day. They are one gap:
+	// only a lease could declare itself finished.
 	//
 	// This is the one evidence form the other two structurally cannot
 	// supply, and the gap it closes is the whole reason it exists. The
@@ -133,10 +145,11 @@ const (
 	// still has to pass deviceBelongsToSlot, so the worst case is an
 	// `idb_companion` respawned transparently on the next call.
 	//
-	// Deliberately unreachable from CheckPoison, which passes no key: no
+	// Deliberately unreachable from CheckPoison, which declares nothing: no
 	// path that merely OBSERVES a slot (`status`, `doctor`, `reap`, an
 	// acquisition by anyone else) can produce this evidence. Only
-	// ReclaimReleasedResidue can, for the exact key that is releasing.
+	// ReclaimReleasedResidue and ReclaimOwnResidue can, each for the exact
+	// session that is finishing.
 	ResidueOwnerReleased
 )
 
@@ -183,6 +196,27 @@ type Poison struct {
 	// ResidueEvidence is set only when Reason ==
 	// PoisonedByOrphanedResidue: why those PIDs were judged residue.
 	ResidueEvidence ResidueEvidence
+	// owner is the declaration that produced a ResidueOwnerReleased
+	// verdict, carried so reclaimOrphanedResidue' re-verification can ask
+	// checkPoison the same question it was asked rather than a narrower
+	// one — that determination would otherwise always fail its own
+	// re-check. Unexported: nothing outside this package may construct a
+	// declaration, which is the whole point of the type (see
+	// ownerDeclaration).
+	owner ownerDeclaration
+}
+
+// ResidueOwner describes, for a reader, which session declared itself
+// finished behind a ResidueOwnerReleased verdict. Empty for every other
+// reason and evidence.
+func (p Poison) ResidueOwner() string {
+	if p.Reason != PoisonedByOrphanedResidue || p.ResidueEvidence != ResidueOwnerReleased {
+		return ""
+	}
+	if p.owner.releasedKey != "" {
+		return fmt.Sprintf("lease key %q", p.owner.releasedKey)
+	}
+	return fmt.Sprintf("the process that held this slot, pid %d", p.owner.finishingPID)
 }
 
 // ResidueDisownable reports whether this poison is one `--disown-poisoned`
@@ -215,7 +249,7 @@ func (p Poison) String() string {
 		case ResidueTargetNotRunning:
 			return fmt.Sprintf("orphaned idb_companion / simctl log-stream process(es) attached to a non-running device (pids %v)", p.ResiduePIDs)
 		case ResidueOwnerReleased:
-			return fmt.Sprintf("idb_companion / simctl log-stream process(es) left behind by the lease that just released this slot (pids %v)", p.ResiduePIDs)
+			return fmt.Sprintf("idb_companion / simctl log-stream process(es) left behind by the session that just finished with this slot — %s (pids %v)", p.ResidueOwner(), p.ResiduePIDs)
 		}
 		return fmt.Sprintf("orphaned idb_companion / simctl log-stream process(es) left on a slot with no holder and no use in over %s (pids %v)", ResidueIdleGrace, p.ResiduePIDs)
 	default:
@@ -237,14 +271,15 @@ func (p Poison) String() string {
 // mode under resource pressure, not merely "no matches") is reported as
 // PoisonedByCheckFailure rather than silently treated as "no live
 // consumer": a check that could not complete must never be read as "free".
-func CheckPoison(meta Meta) Poison { return checkPoison(meta, "") }
+func CheckPoison(meta Meta) Poison { return checkPoison(meta, ownerDeclaration{}) }
 
 // checkPoison is CheckPoison with the one extra input no observer ever
-// has: releasedBy, the lease key that is releasing this slot right now (""
-// for every caller but ReclaimReleasedResidue). It only ever widens what
-// counts as evidence for residue that is already verified disposable — see
-// ResidueOwnerReleased — never what counts as residue.
-func checkPoison(meta Meta, releasedBy string) Poison {
+// has: a declaration, by the session that owned this slot, that it is over
+// (see ownerDeclaration). Zero for every caller but the two reclaim-on-
+// finish paths. It only ever widens what counts as EVIDENCE for residue
+// that is already verified disposable — see ResidueOwnerReleased — never
+// what counts as residue.
+func checkPoison(meta Meta, owner ownerDeclaration) Poison {
 	if meta.UDID == "" {
 		return Poison{}
 	}
@@ -258,8 +293,8 @@ func checkPoison(meta Meta, releasedBy string) Poison {
 	if len(live) == 0 {
 		return Poison{}
 	}
-	if companions, evidence, ok := allReclaimableResidue(meta, live, releasedBy); ok {
-		return Poison{Reason: PoisonedByOrphanedResidue, ResiduePIDs: companions, ResidueEvidence: evidence}
+	if companions, evidence, ok := allReclaimableResidue(meta, live, owner); ok {
+		return Poison{Reason: PoisonedByOrphanedResidue, ResiduePIDs: companions, ResidueEvidence: evidence, owner: owner}
 	}
 	return Poison{Reason: PoisonedByLiveConsumers}
 }
@@ -379,7 +414,7 @@ func isReclaimableResidue(pid int, udid string) bool {
 // first, ahead of the device lookup: it is the cheap one, and it is also
 // the one that most often rules the whole branch out, so there is no
 // reason to pay for a `simctl list devices` before it.
-func allReclaimableResidue(meta Meta, live []int, releasedBy string) ([]int, ResidueEvidence, bool) {
+func allReclaimableResidue(meta Meta, live []int, owner ownerDeclaration) ([]int, ResidueEvidence, bool) {
 	if len(live) == 0 {
 		return nil, NoResidueEvidence, false
 	}
@@ -394,25 +429,66 @@ func allReclaimableResidue(meta Meta, live []int, releasedBy string) ([]int, Res
 	if residueSlotLongIdle(meta) {
 		return live, ResidueSlotLongIdle, true
 	}
-	if residueOwnerReleased(meta, releasedBy) {
+	if owner.declares(meta) {
 		return live, ResidueOwnerReleased, true
 	}
 	return nil, NoResidueEvidence, false
 }
 
-// residueOwnerReleased reports whether releasedBy is the very key this
-// slot's own lease belonged to — the third, caller-supplied form of
-// evidence, and the only one available while the device is still Booted
-// and the slot was used seconds ago. See ResidueOwnerReleased.
+// ownerDeclaration is the one input no OBSERVER of a slot ever has: a
+// statement, by the session that owned the slot, that the session is over.
+// It is what makes ResidueOwnerReleased safe — the evidence is not
+// inferred from the device or the clock (the other two forms, which are
+// both structurally unavailable the instant a warm slot is handed back),
+// it is asserted by the only party that knows.
 //
-// An empty releasedBy never matches, and neither does an empty
-// Meta.LeaseKey: "nobody is releasing" and "this slot remembers no lease
-// key" must not collapse into a match the way two empty strings otherwise
-// would. Restricted to Mode "lease" for the same reason ownLeaseResidue is:
-// residue on a slot last held by `with`/`acquire` means something that held
-// the flock died, which is the ConsumerPGID branch's business, not this one's.
-func residueOwnerReleased(meta Meta, releasedBy string) bool {
-	return releasedBy != "" && meta.Mode == "lease" && meta.LeaseKey == releasedBy
+// A zero value declares nothing, which is what every observer passes:
+// `status`, `doctor`, `reap`, and an acquisition by anybody else all go
+// through CheckPoison, which cannot construct one. There are exactly two
+// ways to fill it, and each is checked against the slot's own bookkeeping
+// rather than taken on trust:
+//
+//   - releasedKey: `simpool release --key K` on a slot whose Meta.LeaseKey
+//     is K. The lease path, where the session has no process to point at —
+//     that is what a lease IS — so the key is the attribution.
+//   - finishingPID: a `with`/`acquire` process exiting, which is still
+//     holding that slot's flock as it says so, and whose own pid is the
+//     Meta.OwnerPID the slot recorded. Strictly stronger than the key
+//     form: the attesting process is the holder, identified by the kernel,
+//     and no one else can be using the slot while it holds the flock.
+//
+// The second exists because the first cannot cover `acquire` at all: an
+// acquire has no lease and no key, so `simpool release` finds nothing to
+// release on its slot and reclaims nothing — the slot then sat quarantined
+// with the session's own idb_companion in it for the whole
+// ResidueIdleGrace. Both halves of that were reported as separate defects
+// on the same day; they are one gap, which is that only a lease could ever
+// declare itself finished.
+type ownerDeclaration struct {
+	releasedKey  string
+	finishingPID int
+}
+
+// declares reports whether this declaration actually attests that meta's
+// own session is over. Nothing about it is taken on trust: each form must
+// match the slot's own recorded bookkeeping, and a zero declaration — what
+// every observer passes — matches nothing.
+//
+// Empty/zero never matches on either side. "Nobody is declaring" and "this
+// slot remembers no lease key" (or no owner pid) must not collapse into a
+// match the way two empty strings otherwise would.
+//
+// Each form is restricted to the modes it can possibly speak for. The key
+// form is "lease"-only for the same reason ownLeaseResidue is: residue on a
+// slot last held by `with`/`acquire` means something that held the flock
+// died, which is the ConsumerPGID branch's business. The pid form is the
+// mirror image — "with"/"acquire" only, because a lease never holds the
+// flock and so an exiting lease process proves nothing about the slot.
+func (d ownerDeclaration) declares(meta Meta) bool {
+	if d.releasedKey != "" && meta.Mode == "lease" && meta.LeaseKey == d.releasedKey {
+		return true
+	}
+	return d.finishingPID != 0 && (meta.Mode == "with" || meta.Mode == "acquire") && meta.OwnerPID == d.finishingPID
 }
 
 // VerifyConsumerIdentity checks meta's recorded consumer fingerprint
@@ -559,15 +635,16 @@ func ResidueDeviceVerified(root, groupName string, n int, meta Meta) bool {
 // the caller must fall back to its existing quarantine behavior (refuse to
 // hand it out, or leave it alone).
 func AttemptRecovery(root, dir string, n int, groupName string, meta *Meta, poison Poison) bool {
-	return attemptRecovery(root, dir, n, groupName, meta, poison, "")
+	return attemptRecovery(root, dir, n, groupName, meta, poison, ownerDeclaration{})
 }
 
-// attemptRecovery is AttemptRecovery threaded with the releasing key, so
-// reclaimOrphanedResidue' re-verification asks the same question
-// checkPoison was asked rather than a narrower one — a ResidueOwnerReleased
-// determination would otherwise always fail its own re-check. "" for every
-// caller but ReclaimReleasedResidue.
-func attemptRecovery(root, dir string, n int, groupName string, meta *Meta, poison Poison, releasedBy string) bool {
+// attemptRecovery is AttemptRecovery threaded with the owner's own
+// declaration that its session is over, so reclaimOrphanedResidue'
+// re-verification asks the same question checkPoison was asked rather than
+// a narrower one — a ResidueOwnerReleased determination would otherwise
+// always fail its own re-check. Zero for every caller but the two
+// reclaim-on-finish paths (see ownerDeclaration).
+func attemptRecovery(root, dir string, n int, groupName string, meta *Meta, poison Poison, owner ownerDeclaration) bool {
 	if poison.Reason == PoisonedByOrphanedResidue {
 		// Mode-independent, and handled entirely separately from the
 		// ConsumerPGID branch below: idb_companion residue has nothing to
@@ -575,7 +652,7 @@ func attemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 		// with what `idb` itself left behind, so this runs ahead of — not
 		// behind — the Mode == "with" gate that scopes every other branch
 		// of this function. See reclaimOrphanedResidue.
-		return reclaimOrphanedResidue(root, groupName, n, meta, poison, releasedBy)
+		return reclaimOrphanedResidue(root, groupName, n, meta, poison, owner)
 	}
 
 	if meta.Mode != "with" {
@@ -700,7 +777,7 @@ func attemptRecovery(root, dir string, n int, groupName string, meta *Meta, pois
 // either evidence case — for ResidueTargetNotRunning there is nothing
 // left to shut down, and for ResidueSlotLongIdle the device is a warm
 // pool slot's own simulator that the next consumer wants exactly as it is.
-func reclaimOrphanedResidue(root, groupName string, n int, meta *Meta, poison Poison, releasedBy string) bool {
+func reclaimOrphanedResidue(root, groupName string, n int, meta *Meta, poison Poison, owner ownerDeclaration) bool {
 	if len(poison.ResiduePIDs) == 0 {
 		return false
 	}
@@ -714,7 +791,7 @@ func reclaimOrphanedResidue(root, groupName string, n int, meta *Meta, poison Po
 		// applies one layer up.
 		return false
 	}
-	companions, evidence, ok := allReclaimableResidue(*meta, live, releasedBy)
+	companions, evidence, ok := allReclaimableResidue(*meta, live, owner)
 	if !ok || evidence != poison.ResidueEvidence || !samePIDSet(companions, poison.ResiduePIDs) {
 		// Re-verified and no longer holds: the device came back (or its
 		// state became unreadable), the slot was used again, a
@@ -740,7 +817,7 @@ func reclaimOrphanedResidue(root, groupName string, n int, meta *Meta, poison Po
 	case ResidueSlotLongIdle:
 		why = fmt.Sprintf("slot unheld and unused for over %s", ResidueIdleGrace)
 	case ResidueOwnerReleased:
-		why = fmt.Sprintf("the lease that left them, key %q, just released this slot", releasedBy)
+		why = fmt.Sprintf("the session that left them — %s — has just finished with this slot", poison.ResidueOwner())
 	}
 	fmt.Fprintf(os.Stderr, "simpool: reclaimed %d orphaned idb_companion / simctl log-stream process(es) attached to device %s (pids %v) — %s, and device confirmed this slot's own\n", len(poison.ResiduePIDs), meta.UDID, poison.ResiduePIDs, why)
 	return true

@@ -842,6 +842,48 @@ refused"), condensed to one line and printed while it is still useful
 instead of only on giving up. An acquisition that never waits prints
 nothing.
 
+### `reap --warm N` is a floor as well as a ceiling
+
+`--warm N` used to shut down free simulators beyond N and never start the
+ones that were missing, so "keep N warm" only ever meant "keep no more than
+N warm". It now also boots free, shut-down slots until the group reaches N,
+most-recently-used first.
+
+The number behind it, measured on this machine: provisioning a slot whose
+simulator is already booted takes **5.9–6.2s**, and one that is Shutdown
+takes **18.5s**. Getting the lock is 21–79ms either way, so cold boot is the
+whole difference — about 12 seconds paid on the critical path of every task
+that lands on a cold slot. `preboot` exists precisely to pay that ahead of
+time and **nothing invokes it**: zero occurrences across the Makefiles,
+`MUSTS.yml` files and shell hooks on this machine. That is why the floor
+lives in the scheduled `reap` rather than in a hook or a Makefile target.
+Anything that depends on somebody remembering to call it has been tried and
+is already failing.
+
+**It never warms while memory is tight.** Warming is speculative by
+definition — the slot may never be used — so it is the first thing that
+should give way. Below 35% free memory nothing is booted, and it says so,
+with the number:
+
+```
+WARM  iPhone-17-Pro@27.0  not warming 3 slot(s): 16% memory free, below the 35%
+      floor — a simulator booted now would cost a running suite more than it saves
+      the next one
+```
+
+Declining quietly would be the same defect as the silent wait above. The
+threshold comes from a real failure rather than caution in the abstract: a
+snapshot suite on this machine died seven times in one day for memory, and
+free memory at launch separated the outcomes cleanly — 2 of 2 runs that
+finished were above 58% free, 7 of 7 that died were below. The default sits
+below that observation because a slim slot is far cheaper than that suite
+(229–345MB resident measured idle, against ~1.75GB for a full one); override
+it with `SIMPOOL_WARM_MIN_FREE` as an integer percentage. Memory is re-read
+between boots, so a group several slots short cannot walk the machine down
+past the floor one boot at a time.
+
+`--warm 0` (the default) disables both halves.
+
 ### Warming up ahead of time
 
 `simpool preboot --device D --os V [--count N] [--max M]` provisions N

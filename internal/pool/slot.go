@@ -114,6 +114,20 @@ type Slot struct {
 	// shoot fourteen identical languages.
 	Renewed bool
 
+	// SharedWith names the OTHER live session already driving this slot
+	// under the same lease key, when there is one — the contaminated-
+	// readings failure, caught at the moment it happens. Nil in every
+	// normal case, including a hot loop renewing its own slot; see
+	// ConcurrentLeaseDriver for what it takes to be non-nil. A property of
+	// the claim, like Renewed, which is why it travels on the returned
+	// value rather than in meta.json.
+	//
+	// It is information, never a refusal: sharing a key is a legitimate
+	// thing to do on purpose (that is what stickiness is), and simpool
+	// cannot tell one agent's two tools from two agents. Only the caller
+	// knows which it meant.
+	SharedWith *LeaseDriver
+
 	lock *Lock
 	Meta Meta
 }

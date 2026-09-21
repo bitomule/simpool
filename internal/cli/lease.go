@@ -114,6 +114,30 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond))
+	// The one thing simpool can say about the failure that is invisible
+	// from inside it: another live session is already driving this slot
+	// under this same key, so both are about to write to one simulator and
+	// read each other's state back. Stickiness is per key, the default key
+	// is the git repo root, and two agents launched from one checkout land
+	// here — with --max having nothing to say about it, because the sticky
+	// renewal returns the key's own slot before capacity is counted.
+	//
+	// A warning and not a refusal: sharing a key on purpose is exactly what
+	// stickiness is for, and simpool cannot tell one agent's two tools from
+	// two agents. It is deliberately quiet in every normal case — see
+	// pool.ConcurrentLeaseDriver for the four of them.
+	if slot.SharedWith != nil {
+		// The UDID as read from disk, and only if it is there: this runs
+		// before EnsureProvisioned, so a slot that has never been
+		// provisioned has none yet, and "simulator " with nothing after it
+		// sends the reader looking for a name that does not exist.
+		what := "this slot"
+		if slot.Meta.UDID != "" {
+			what = "simulator " + slot.Meta.UDID
+		}
+		fmt.Fprintf(stderr, "simpool: warning: another live session (%s) is already leasing this slot under key %q — both of you are driving %s and will read each other's state\n", slot.SharedWith, key, what)
+		fmt.Fprintln(stderr, "simpool:   if that is not deliberate, give each caller its own --key (its worktree path, its agent name, anything unique)")
+	}
 
 	ownerCmd := "lease (key " + key + ")"
 	provisionStart := time.Now()

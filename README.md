@@ -1030,6 +1030,36 @@ same repo get two different keys, and therefore two different simulators,
 automatically. Release explicitly with `simpool release` once a session is
 done, or just let the TTL lapse.
 
+**One key means one simulator, and `--max` has nothing to say about it.**
+The sticky renewal hands a key back its own slot *before* any capacity
+accounting runs, so two callers sharing a key share a simulator even at
+`--max 1`. That is the design — it is what makes a hot loop a hot loop —
+but it is also how two agents launched from the same checkout ended up
+driving one simulator and reading each other's state back as if it were
+their own. **Give each concurrent caller its own `--key`** (its worktree
+path, its agent name, anything unique) and the second one gets a clean
+capacity refusal instead of a shared device.
+
+The tell is already on stderr, one line per call:
+
+```
+simpool: leased iPhone-17-Pro_26.3/slot-0 for key "/Users/me/Projects/App" in 12ms
+```
+
+Two callers printing the *same* key is the whole diagnosis. Since a
+recent change simpool also says so itself when it can prove it — when the
+session that last leased this slot under this key is still alive and is
+not you:
+
+```
+simpool: warning: another live session (pid 41337) is already leasing this slot under key "…"
+```
+
+It is a warning and never a refusal (sharing a key on purpose is exactly
+what stickiness is for), and it is deliberately quiet for a hot loop
+renewing its own slot, for a driver that has since exited, and whenever
+the evidence is not conclusive.
+
 **The TTL has to cover the longest silence, not the shortest gap.** This
 used to be three minutes, on the reasoning that a lease only bridges the
 seconds between consecutive hot-loop calls and that a short TTL lets an

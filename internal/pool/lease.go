@@ -227,7 +227,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
 				return nil, err
 			}
-			view := leaseSlotView(root, groupDir, dir, n, device, osVersion)
+			view := leaseSlotView(root, groupDir, dir, n, device, osVersion, key)
 			// The one path in the whole codebase that hands a slot back to
 			// the caller already on it. Everything else — take(),
 			// claimSlotForLease, preboot — is a fresh claim by definition,
@@ -270,7 +270,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			return nil, err
 		}
 		if ok {
-			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
+			return leaseSlotView(root, groupDir, dir, n, device, osVersion, key), nil
 		}
 		if overCap {
 			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
@@ -293,7 +293,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			return nil, err
 		}
 		if ok {
-			return leaseSlotView(root, groupDir, dir, next, device, osVersion), nil
+			return leaseSlotView(root, groupDir, dir, next, device, osVersion, key), nil
 		}
 		if overCap {
 			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
@@ -386,16 +386,33 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 	return true, false, av, nil
 }
 
-func leaseSlotView(root, groupDir, dir string, n int, device, osVersion string) *Slot {
-	return &Slot{
+// leaseSlotView is the one value both lease paths — sticky renewal and
+// fresh claim — return through, which is why the concurrent-driver check
+// lives here rather than in either of them.
+//
+// Read before EnsureProvisioned runs, necessarily: that is what overwrites
+// the driver fields with this call's own.
+func leaseSlotView(root, groupDir, dir string, n int, device, osVersion, key string) *Slot {
+	meta := ReadMeta(dir)
+	s := &Slot{
 		Root:     root,
 		GroupDir: groupDir,
 		Dir:      dir,
 		Number:   n,
 		Device:   device,
 		OSVer:    osVersion,
-		Meta:     ReadMeta(dir),
+		Meta:     meta,
 	}
+	// Only ever about THIS key. A slot being claimed fresh can still carry
+	// a previous, different key's driver — that key's lease lapsed or was
+	// released, so there is nobody to share with and naming them would be
+	// noise of exactly the kind this must not produce.
+	if meta.LeaseKey == key {
+		if driver, ok := ConcurrentLeaseDriver(meta); ok {
+			s.SharedWith = &driver
+		}
+	}
+	return s
 }
 
 // ReleaseLease drops key's lease wherever it is resident across every

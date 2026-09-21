@@ -1372,13 +1372,26 @@ contradictory copy.
 
 **Do not put this in your own `xcodebuild_args` to get the default.**
 Setting `xcodebuild_args` at all *selects* the `xcodebuild` path: a
-non-empty list is one of the conditions that turns it on. A target running
-today on the fast `simctl spawn` path would be moved onto the slow one in
-order to save a cost it was never paying. That is why the flag lives in
-the runner and not in each repo. What does move a target onto `xcodebuild`
-— and therefore into paying this — includes `--test_filter`, a test host,
-random test order, an XCResult bundle, and `--command_line_args`; the
-runner prints which one it was.
+non-empty list is one of the conditions that turns it on, so a target
+running today on the fast `simctl spawn` path would be moved onto the slow
+one in order to save a cost it was never paying.
+
+That warning needs its qualifier, or it gets read too broadly: it only
+bites a target that would otherwise be on the fast path. **A target with a
+`test_host` is driven through `xcodebuild` anyway**, so a repo-level flag
+on one of those costs nothing — do not go and strip it from where it is
+currently harmless. What moves a target onto `xcodebuild`, and therefore
+into paying this: `--test_filter`, a test host, random test order, an
+XCResult bundle, `--command_line_args`. The runner prints which one it
+was. Note the first: whoever filters to iterate quickly is exactly who
+pays.
+
+The reason the flag belongs here rather than in each repo is not
+hypothetical. Of six consuming repos, two had patched it by hand in
+different files, and one of those **only half-way** — the same repo
+carrying one runner with the flag and one shared runner without, so a
+session iterating through the unflagged one paid the full 600 seconds with
+no way to tell that the repo had "already fixed this".
 
 ## Pool layout
 

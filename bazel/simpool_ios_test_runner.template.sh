@@ -941,9 +941,48 @@ if [[ "$should_use_xcodebuild" == true ]]; then
     echo
   fi
 
+  # simpool: >>> diagnostics-begin
+  # When a test fails, Xcode collects verbose diagnostics from the
+  # simulator — a sysdiagnose — and that collection has its own 600-second
+  # timeout. On a machine with several pool slots booted it reaches that
+  # timeout rather than finishing: measured in Undolly at 650s of a 739s
+  # action whose tests themselves take 56s. It only fires on failure, so
+  # the cost lands exactly on the person iterating on a red test, and it
+  # looks like a hung `simctl` rather than like Xcode doing something.
+  #
+  # Turned off here, in the runner's OWN argument list, rather than left to
+  # each repo's `xcodebuild_args`. Not tidiness — putting it there is
+  # actively wrong: a non-empty custom_xcodebuild_args SELECTS xcodebuild
+  # (see the note above), so a target that runs today on the fast
+  # `simctl spawn` path would be moved onto the slow one in order to save a
+  # cost it never paid.
+  #
+  # Two ways back to the diagnostics, because they exist for something —
+  # a crash or a hang inside the simulator is exactly what a sysdiagnose
+  # is for:
+  #
+  #   - SIMPOOL_COLLECT_TEST_DIAGNOSTICS=on-failure, per run
+  #     (`--test_env=SIMPOOL_COLLECT_TEST_DIAGNOSTICS=on-failure`).
+  #   - passing `-collect-test-diagnostics` yourself in `xcodebuild_args`,
+  #     which wins outright: the loop below leaves it alone rather than
+  #     appending a second, contradictory copy.
+  collect_test_diagnostics="${SIMPOOL_COLLECT_TEST_DIAGNOSTICS:-never}"
+  diagnostics_already_set=false
+  for arg in ${custom_xcodebuild_args[@]+"${custom_xcodebuild_args[@]}"}; do
+    if [[ "$arg" == "-collect-test-diagnostics" ]]; then
+      diagnostics_already_set=true
+      break
+    fi
+  done
+  # simpool: <<< diagnostics-end
+
   args=(
     -xctestrun "$xctestrun_file" \
   )
+
+  if [[ "$diagnostics_already_set" == false ]]; then
+    args+=(-collect-test-diagnostics "$collect_test_diagnostics")
+  fi
 
   if [[ -n "$destination_timeout" ]]; then
     args+=(-destination-timeout "$destination_timeout")

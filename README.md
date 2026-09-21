@@ -1347,6 +1347,52 @@ fails rather than building a simulator of its own — see [When `simpool`
 cannot be found, the test action
 fails](#when-simpool-cannot-be-found-the-test-action-fails).
 
+### Simulator diagnostics are off on the xcodebuild path
+
+When a test **fails**, Xcode collects verbose diagnostics from the
+simulator — a sysdiagnose — and that collection carries its own
+600-second timeout. On a machine with several pool slots booted it reaches
+that timeout instead of finishing: measured in one app at **650s of a 739s
+action whose tests take 56s**. It fires only on a red test, so the cost
+lands squarely on whoever is iterating, and from outside it looks like a
+hung `simctl` rather than like Xcode doing something deliberate.
+
+The runner therefore passes `-collect-test-diagnostics never` in its own
+argument list, on the `xcodebuild` path only. Two ways to ask for the
+diagnostics back, because a crash or a hang *inside* the simulator is
+exactly what a sysdiagnose is for:
+
+```sh
+bazel test //:MyTests --test_env=SIMPOOL_COLLECT_TEST_DIAGNOSTICS=on-failure
+```
+
+or pass `-collect-test-diagnostics` yourself in `xcodebuild_args`, which
+wins outright — the runner leaves it alone rather than appending a second,
+contradictory copy.
+
+**Do not put this in your own `xcodebuild_args` to get the default.**
+Setting `xcodebuild_args` at all *selects* the `xcodebuild` path: a
+non-empty list is one of the conditions that turns it on, so a target
+running today on the fast `simctl spawn` path would be moved onto the slow
+one in order to save a cost it was never paying.
+
+That warning needs its qualifier, or it gets read too broadly: it only
+bites a target that would otherwise be on the fast path. **A target with a
+`test_host` is driven through `xcodebuild` anyway**, so a repo-level flag
+on one of those costs nothing — do not go and strip it from where it is
+currently harmless. What moves a target onto `xcodebuild`, and therefore
+into paying this: `--test_filter`, a test host, random test order, an
+XCResult bundle, `--command_line_args`. The runner prints which one it
+was. Note the first: whoever filters to iterate quickly is exactly who
+pays.
+
+The reason the flag belongs here rather than in each repo is not
+hypothetical. Of six consuming repos, two had patched it by hand in
+different files, and one of those **only half-way** — the same repo
+carrying one runner with the flag and one shared runner without, so a
+session iterating through the unflagged one paid the full 600 seconds with
+no way to tell that the repo had "already fixed this".
+
 ## Pool layout
 
 ```

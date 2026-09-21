@@ -1089,6 +1089,46 @@ what stickiness is for), and it is deliberately quiet for a hot loop
 renewing its own slot, for a driver that has since exited, and whenever
 the evidence is not conclusive.
 
+**Every lease and release stamps the machine's state.** The handout line
+and the release line both carry the 1-minute load average and free swap:
+
+```
+simpool: leased iPhone-17-Pro@26.3/slot-0 for key "…" in 12ms (load 12.06, swap 1209M free)
+released …/slot-0 (key "…") (load 31.40, swap 210M free)
+```
+
+It decides nothing and blocks nothing. It exists because the question
+"what was the machine doing when that measurement ran?" got asked three
+times in one night, after the fact, about runs that had already finished,
+and nobody could answer it. Two readings around one session are what make
+them worth anything: a run that started on a quiet machine and ended on a
+loaded one is exactly the shape nobody could reconstruct afterwards. Cost
+is one `sysctl` exec, measured at 2.2ms.
+
+**Why there is no threshold, and no input canary.** A batch of six UI
+captures came back stuck on a machine at load 66, which looked like a
+simulator that had gone deaf — accepting gestures and discarding them. Two
+things were checked before building anything on that:
+
+- **A dead HID daemon does not mean a deaf simulator.** Six booted slots
+  were sampled; two had `com.apple.coredevice.dtuhidd` gone with exit
+  status -9 while SpringBoard and backboardd were alive. One of those two
+  was then driven directly: it accepted a swipe and the accessibility tree
+  changed. The control slot, with a healthy daemon, also moved — so the
+  gesture path was working, and "both moved" means what it says. The
+  signature predicts nothing. (There *is* a published failure of this
+  shape — Xcode 27's Device Hub taking over the HID surface — but in those
+  reports a shutdown+boot does not recover it, and here it did. Probably a
+  different mechanism; worth knowing before chasing the published one.)
+- **A canary at handout would check the wrong instant.** If input loss is
+  a property of the machine under load rather than of the slot, a gesture
+  probe passes at handout and the run goes deaf ten minutes later, during
+  the batch. It would have reported healthy and been right.
+
+The load evidence is a single batch with no control arm and two variables
+moving at once. That is why this records and does not refuse: a threshold
+invented from n=1 would stop the pool for something nobody has measured.
+
 **The TTL has to cover the longest silence, not the shortest gap.** This
 used to be three minutes, on the reasoning that a lease only bridges the
 seconds between consecutive hot-loop calls and that a short TTL lets an

@@ -113,7 +113,11 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "simpool lease:", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond))
+	// The machine's state at the instant this slot changed hands, on the
+	// line that already says which slot went where. Recorded, never acted
+	// on: see pool.MachineLoad for why a threshold would be a guess, and
+	// for the question this exists to make answerable afterwards.
+	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s (%s)\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond), pool.ReadMachineLoad())
 	// The one thing simpool can say about the failure that is invisible
 	// from inside it: another live session is already driving this slot
 	// under this same key, so both are about to write to one simulator and
@@ -183,8 +187,17 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 	// see ReleaseLease's doc comment), but that must not hide whatever was
 	// successfully released elsewhere.
 	released, err := pool.ReleaseLease(root, k)
+	// Read once, before the loop: a release can clear several slots and
+	// they all end at the same instant, so one reading describes them all
+	// and re-probing per slot would just spend subprocesses to print the
+	// same number several times.
+	endLoad := pool.ReadMachineLoad()
 	for _, dir := range released {
-		fmt.Fprintf(stdout, "released %s (key %q)\n", dir, k)
+		// The pair to the handout line. Two readings around one session is
+		// what makes them worth anything: a run that started on a quiet
+		// machine and ended on a loaded one is exactly the shape nobody
+		// could reconstruct afterwards.
+		fmt.Fprintf(stdout, "released %s (key %q) (%s)\n", dir, k, endLoad)
 		// Dropping the lease does not end the session's side effects: a
 		// complete, successful `mav run` leaves `idb`'s own companion
 		// daemon attached to the slot's device (its "terminate if the

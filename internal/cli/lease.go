@@ -24,7 +24,7 @@ type leaseFlags struct {
 func parseLeaseFlags(fs *flag.FlagSet, f *leaseFlags) {
 	fs.StringVar(&f.device, "device", "", "simulator device type, e.g. \"iPhone 17 Pro\" (required)")
 	fs.StringVar(&f.os, "os", "", "simulator OS version, e.g. \"26.3\" (required)")
-	fs.StringVar(&f.key, "key", "", "sticky lease key; defaults to the current git repo's root, or the working directory if there is none")
+	fs.StringVar(&f.key, "key", "", "sticky lease key; defaults to "+pool.EnvLeaseKey+", else the current git worktree's root, else the working directory. Two concurrent callers sharing a key share a simulator — give each its own")
 	fs.DurationVar(&f.ttl, "ttl", pool.LeaseTTL(), "how long the lease lasts before it's considered abandoned; renewed on every call made with the same key (env "+pool.EnvLeaseTTL+")")
 	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
 	fs.StringVar(&f.need, "need", "", "comma-separated capabilities this slot must have, e.g. \"photos\" or \"spotlight\" (env "+pool.EnvNeed+"); see `simpool with --help`")
@@ -157,7 +157,7 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 func RunRelease(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("release", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	key := fs.String("key", "", "lease key to release; defaults to the current git repo's root, or the working directory if there is none")
+	key := fs.String("key", "", "lease key to release; defaults to "+pool.EnvLeaseKey+", else the current git worktree's root, else the working directory")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

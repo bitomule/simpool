@@ -42,6 +42,20 @@ const DefaultLeaseTTL = 10 * time.Minute
 // EnvLeaseTTL overrides DefaultLeaseTTL.
 const EnvLeaseTTL = "SIMPOOL_LEASE_TTL"
 
+// EnvLeaseKey sets the sticky lease key for every `simpool lease` and
+// `simpool release` underneath it, overriding the path-derived default
+// (see cli.defaultLeaseKey) and overridden in turn by an explicit --key.
+//
+// It exists for the one thing a path cannot express: WHO is asking. Two
+// agents running in the same checkout share a directory, so they share a
+// path-derived key, so the sticky renewal hands them one simulator and
+// they read each other's state back — the failure that was reported as a
+// lease exclusion bug. An environment variable is the only identity that
+// is both stable for a whole session and inherited by every process that
+// session spawns, which is exactly what a key has to be to be sticky for
+// one agent and distinct between two.
+const EnvLeaseKey = "SIMPOOL_LEASE_KEY"
+
 // LeaseTTL resolves the effective default lease TTL: SIMPOOL_LEASE_TTL if
 // set to a valid duration that is positive AND below ResidueIdleGrace, else
 // DefaultLeaseTTL.

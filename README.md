@@ -145,8 +145,9 @@ simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
 simpool lease --device D --os V [--key K] [--ttl D] [--max M]
     Print just a UDID and exit — for many short, independent commands
     (mav tap/swipe/screenshot) that have nothing to hold `with`'s lock
-    across. Sticky per --key (default: git repo root, else cwd); NOT a
-    flock — see "MAV in the hot loop" below.
+    across. Sticky per --key (default: SIMPOOL_LEASE_KEY, else the git
+    WORKTREE root, else cwd); NOT a flock — see "MAV in the hot loop"
+    below. Two concurrent callers sharing a key share a simulator.
 
 simpool release [--key K]
     Drop --key's lease immediately instead of waiting out its TTL, and
@@ -1029,6 +1030,34 @@ Two worktrees of the
 same repo get two different keys, and therefore two different simulators,
 automatically. Release explicitly with `simpool release` once a session is
 done, or just let the TTL lapse.
+
+**The default key is the worktree, not the repository.** Measured, and
+pinned by a test: `git rev-parse --show-toplevel` in a linked worktree
+returns that worktree's own path, so `~/Projects/App` and
+`~/Projects/App/.claude/worktrees/feature` are two keys and two
+simulators with nothing to configure. Do not "fix" this by reaching for
+the repository (`--git-common-dir`, the single `.git` every worktree
+shares) — that would collapse every worktree of a repo onto one slot.
+
+**What no path can separate is two callers in the same directory**, and
+that is what actually went wrong: two agents launched from one checkout
+have genuinely the same location, so they get the same key and the sticky
+renewal hands them one simulator. Set `SIMPOOL_LEASE_KEY` once per
+session and every `simpool lease`/`release` underneath it inherits it:
+
+```sh
+export SIMPOOL_LEASE_KEY="agent-$AGENT_NAME"   # anything unique per session
+```
+
+That is the automatic form of the rule below, and the reason it is an
+environment variable rather than something clever: an env var is the one
+identity that is both stable for a whole session *and* inherited by every
+process it spawns. Deriving the key from the calling process instead
+would have the second property and not the first — mav runs
+`target_command` under a new mav process per `mav run`, so the key would
+change between invocations of one agent and the stickiness the lease
+exists for would be gone. Precedence is `--key`, then
+`SIMPOOL_LEASE_KEY`, then the worktree path, then the working directory.
 
 **One key means one simulator, and `--max` has nothing to say about it.**
 The sticky renewal hands a key back its own slot *before* any capacity

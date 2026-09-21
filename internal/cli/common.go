@@ -116,12 +116,38 @@ func nowStamp() string {
 	return time.Now().UTC().Format("20060102T150405.000000000Z")
 }
 
-// defaultLeaseKey resolves the implicit --key for `lease`/`release`: the
-// current git repo's root, or the working directory if there is none. Two
-// worktrees of the same repo resolve to two different roots — and so two
-// different keys — which is the intended behavior: each worktree's `mav`
-// invocations get their own sticky simulator.
+// defaultLeaseKey resolves the implicit --key for `lease`/`release`:
+// SIMPOOL_LEASE_KEY if set, else the current git WORKTREE's root, else the
+// working directory.
+//
+// `--show-toplevel` is deliberately the worktree and not the repository.
+// In a linked worktree it returns that worktree's own path, so two
+// worktrees of one repo already resolve to two keys and two simulators —
+// measured, and pinned by a test, because the obvious-looking "fix" of
+// reaching for the repository instead (`--git-common-dir`, which is the
+// SHARED .git for every worktree) would collapse them onto one slot and
+// look like a tidy-up while doing it.
+//
+// What a path-derived key structurally cannot do is tell two CALLERS in
+// one directory apart, and that is the failure that was reported: two
+// agents launched from the same checkout ask under one key, and the sticky
+// renewal hands them one simulator before --max is ever consulted. No
+// location is specific enough to separate them, because their location is
+// genuinely the same.
+//
+// Hence the environment variable, which is the one identity that is
+// stable for a whole session AND inherited by every process that session
+// spawns — the two properties the key needs at once. A driver-derived key
+// (the parent process) has the second property and not the first: mav's
+// target_command runs under a new mav process per `mav run`, so a key made
+// from it would give one agent a fresh slot per invocation and break the
+// stickiness the lease exists for. An agent runner sets SIMPOOL_LEASE_KEY
+// once, per session, and every `simpool lease`/`release` underneath it
+// agrees without anyone having to remember a flag.
 func defaultLeaseKey() (string, error) {
+	if k := strings.TrimSpace(os.Getenv(pool.EnvLeaseKey)); k != "" {
+		return k, nil
+	}
 	if out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
 		if root := strings.TrimSpace(string(out)); root != "" {
 			return root, nil

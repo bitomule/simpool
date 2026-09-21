@@ -547,6 +547,19 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// exempting a key whose session is no longer what this slot's residue
 	// belongs to.
 	s.Meta.LeaseKey = leaseKey
+	// Recorded on every mode too, and cleared on the ones that have no
+	// driver, for the same reason LeaseKey is: a slot moving from `lease`
+	// to `with` must not keep naming the mav process that used to drive
+	// it, or the next lease under that key would be warned about a session
+	// this slot no longer has anything to do with.
+	if mode == "lease" {
+		driver := currentLeaseDriver()
+		s.Meta.LeaseDriverPID = driver.PID
+		s.Meta.LeaseDriverStartedAt = driver.StartedAt
+	} else {
+		s.Meta.LeaseDriverPID = 0
+		s.Meta.LeaseDriverStartedAt = ""
+	}
 	// Always clear the previous consumer's identity here, regardless of
 	// mode: `with` records its own child's ConsumerPGID/fingerprint AFTER
 	// this call returns (see with.go, right after cmd.Start()), so this

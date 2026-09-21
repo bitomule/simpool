@@ -58,6 +58,26 @@ type Meta struct {
 	// quarantine exemption to one named key, never make a slot look free
 	// to a caller that isn't it.
 	LeaseKey string `json:"leaseKey,omitempty"`
+	// LeaseDriverPID is the PARENT of the `simpool lease` process that
+	// last provisioned this slot — mav in the hot loop, or the shell when
+	// someone runs the command by hand. Not the lease process's own pid,
+	// which is worthless here: every call in a hot loop is a fresh
+	// short-lived process, so its own pid is different every time and dead
+	// by the next one. The driver above it is the thing that persists for
+	// as long as one session lasts, which is exactly the granularity
+	// "is somebody else on this slot right now" needs.
+	//
+	// Advisory like every other Meta field, and it decides nothing: it
+	// only ever produces a warning on stderr (see ConcurrentLeaseDriver).
+	// A missing or wrong value costs a warning that is not printed, never
+	// a slot handed to the wrong caller.
+	LeaseDriverPID int `json:"leaseDriverPid,omitempty"`
+	// LeaseDriverStartedAt is LeaseDriverPID's own start time
+	// (procs.ProcessStartTime, same fixed-environment capture as
+	// ConsumerStartedAt), and it is what stops macOS pid reuse from
+	// turning a finished driver into a live one. Opaque: never parsed,
+	// only ever compared for equality.
+	LeaseDriverStartedAt string `json:"leaseDriverStartedAt,omitempty"`
 	// ConsumerPGID is the process-group id of the command `simpool with`
 	// launched (which, thanks to Setpgid, always equals that command's own
 	// pid). AcquireSlots and reap use it to tell whether a free-looking

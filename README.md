@@ -145,8 +145,9 @@ simpool acquire [--device D] [--os V] [--count N] [--max M] [--wait D]
 simpool lease --device D --os V [--key K] [--ttl D] [--max M]
     Print just a UDID and exit — for many short, independent commands
     (mav tap/swipe/screenshot) that have nothing to hold `with`'s lock
-    across. Sticky per --key (default: git repo root, else cwd); NOT a
-    flock — see "MAV in the hot loop" below.
+    across. Sticky per --key (default: SIMPOOL_LEASE_KEY, else the git
+    WORKTREE root, else cwd); NOT a flock — see "MAV in the hot loop"
+    below. Two concurrent callers sharing a key share a simulator.
 
 simpool release [--key K]
     Drop --key's lease immediately instead of waiting out its TTL, and
@@ -1029,6 +1030,64 @@ Two worktrees of the
 same repo get two different keys, and therefore two different simulators,
 automatically. Release explicitly with `simpool release` once a session is
 done, or just let the TTL lapse.
+
+**The default key is the worktree, not the repository.** Measured, and
+pinned by a test: `git rev-parse --show-toplevel` in a linked worktree
+returns that worktree's own path, so `~/Projects/App` and
+`~/Projects/App/.claude/worktrees/feature` are two keys and two
+simulators with nothing to configure. Do not "fix" this by reaching for
+the repository (`--git-common-dir`, the single `.git` every worktree
+shares) — that would collapse every worktree of a repo onto one slot.
+
+**What no path can separate is two callers in the same directory**, and
+that is what actually went wrong: two agents launched from one checkout
+have genuinely the same location, so they get the same key and the sticky
+renewal hands them one simulator. Set `SIMPOOL_LEASE_KEY` once per
+session and every `simpool lease`/`release` underneath it inherits it:
+
+```sh
+export SIMPOOL_LEASE_KEY="agent-$AGENT_NAME"   # anything unique per session
+```
+
+That is the automatic form of the rule below, and the reason it is an
+environment variable rather than something clever: an env var is the one
+identity that is both stable for a whole session *and* inherited by every
+process it spawns. Deriving the key from the calling process instead
+would have the second property and not the first — mav runs
+`target_command` under a new mav process per `mav run`, so the key would
+change between invocations of one agent and the stickiness the lease
+exists for would be gone. Precedence is `--key`, then
+`SIMPOOL_LEASE_KEY`, then the worktree path, then the working directory.
+
+**One key means one simulator, and `--max` has nothing to say about it.**
+The sticky renewal hands a key back its own slot *before* any capacity
+accounting runs, so two callers sharing a key share a simulator even at
+`--max 1`. That is the design — it is what makes a hot loop a hot loop —
+but it is also how two agents launched from the same checkout ended up
+driving one simulator and reading each other's state back as if it were
+their own. **Give each concurrent caller its own `--key`** (its worktree
+path, its agent name, anything unique) and the second one gets a clean
+capacity refusal instead of a shared device.
+
+The tell is already on stderr, one line per call:
+
+```
+simpool: leased iPhone-17-Pro_26.3/slot-0 for key "/Users/me/Projects/App" in 12ms
+```
+
+Two callers printing the *same* key is the whole diagnosis. Since a
+recent change simpool also says so itself when it can prove it — when the
+session that last leased this slot under this key is still alive and is
+not you:
+
+```
+simpool: warning: another live session (pid 41337) is already leasing this slot under key "…"
+```
+
+It is a warning and never a refusal (sharing a key on purpose is exactly
+what stickiness is for), and it is deliberately quiet for a hot loop
+renewing its own slot, for a driver that has since exited, and whenever
+the evidence is not conclusive.
 
 **The TTL has to cover the longest silence, not the shortest gap.** This
 used to be three minutes, on the reasoning that a lease only bridges the

@@ -24,7 +24,7 @@ type leaseFlags struct {
 func parseLeaseFlags(fs *flag.FlagSet, f *leaseFlags) {
 	fs.StringVar(&f.device, "device", "", "simulator device type, e.g. \"iPhone 17 Pro\" (required)")
 	fs.StringVar(&f.os, "os", "", "simulator OS version, e.g. \"26.3\" (required)")
-	fs.StringVar(&f.key, "key", "", "sticky lease key; defaults to the current git repo's root, or the working directory if there is none")
+	fs.StringVar(&f.key, "key", "", "sticky lease key; defaults to "+pool.EnvLeaseKey+", else the current git worktree's root, else the working directory. Two concurrent callers sharing a key share a simulator — give each its own")
 	fs.DurationVar(&f.ttl, "ttl", pool.LeaseTTL(), "how long the lease lasts before it's considered abandoned; renewed on every call made with the same key (env "+pool.EnvLeaseTTL+")")
 	fs.IntVar(&f.max, "max", pool.MaxSlotsPerGroup(), "maximum resident slots for this device+OS group, across all callers (env "+pool.EnvMaxSlots+")")
 	fs.StringVar(&f.need, "need", "", "comma-separated capabilities this slot must have, e.g. \"photos\" or \"spotlight\" (env "+pool.EnvNeed+"); see `simpool with --help`")
@@ -114,6 +114,30 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stderr, "simpool: leased %s/slot-%d for key %q in %s\n", pool.GroupName(lf.device, lf.os), slot.Number, key, time.Since(acquireStart).Round(time.Millisecond))
+	// The one thing simpool can say about the failure that is invisible
+	// from inside it: another live session is already driving this slot
+	// under this same key, so both are about to write to one simulator and
+	// read each other's state back. Stickiness is per key, the default key
+	// is the git repo root, and two agents launched from one checkout land
+	// here — with --max having nothing to say about it, because the sticky
+	// renewal returns the key's own slot before capacity is counted.
+	//
+	// A warning and not a refusal: sharing a key on purpose is exactly what
+	// stickiness is for, and simpool cannot tell one agent's two tools from
+	// two agents. It is deliberately quiet in every normal case — see
+	// pool.ConcurrentLeaseDriver for the four of them.
+	if slot.SharedWith != nil {
+		// The UDID as read from disk, and only if it is there: this runs
+		// before EnsureProvisioned, so a slot that has never been
+		// provisioned has none yet, and "simulator " with nothing after it
+		// sends the reader looking for a name that does not exist.
+		what := "this slot"
+		if slot.Meta.UDID != "" {
+			what = "simulator " + slot.Meta.UDID
+		}
+		fmt.Fprintf(stderr, "simpool: warning: another live session (%s) is already leasing this slot under key %q — both of you are driving %s and will read each other's state\n", slot.SharedWith, key, what)
+		fmt.Fprintln(stderr, "simpool:   if that is not deliberate, give each caller its own --key (its worktree path, its agent name, anything unique)")
+	}
 
 	ownerCmd := "lease (key " + key + ")"
 	provisionStart := time.Now()
@@ -133,7 +157,7 @@ func RunLease(args []string, stdout, stderr io.Writer) int {
 func RunRelease(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("release", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	key := fs.String("key", "", "lease key to release; defaults to the current git repo's root, or the working directory if there is none")
+	key := fs.String("key", "", "lease key to release; defaults to "+pool.EnvLeaseKey+", else the current git worktree's root, else the working directory")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

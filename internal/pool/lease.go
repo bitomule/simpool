@@ -42,6 +42,20 @@ const DefaultLeaseTTL = 10 * time.Minute
 // EnvLeaseTTL overrides DefaultLeaseTTL.
 const EnvLeaseTTL = "SIMPOOL_LEASE_TTL"
 
+// EnvLeaseKey sets the sticky lease key for every `simpool lease` and
+// `simpool release` underneath it, overriding the path-derived default
+// (see cli.defaultLeaseKey) and overridden in turn by an explicit --key.
+//
+// It exists for the one thing a path cannot express: WHO is asking. Two
+// agents running in the same checkout share a directory, so they share a
+// path-derived key, so the sticky renewal hands them one simulator and
+// they read each other's state back — the failure that was reported as a
+// lease exclusion bug. An environment variable is the only identity that
+// is both stable for a whole session and inherited by every process that
+// session spawns, which is exactly what a key has to be to be sticky for
+// one agent and distinct between two.
+const EnvLeaseKey = "SIMPOOL_LEASE_KEY"
+
 // LeaseTTL resolves the effective default lease TTL: SIMPOOL_LEASE_TTL if
 // set to a valid duration that is positive AND below ResidueIdleGrace, else
 // DefaultLeaseTTL.
@@ -227,7 +241,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			if err := WriteLease(dir, Lease{Key: key, ExpiresAt: time.Now().Add(ttl)}); err != nil {
 				return nil, err
 			}
-			view := leaseSlotView(root, groupDir, dir, n, device, osVersion)
+			view := leaseSlotView(root, groupDir, dir, n, device, osVersion, key)
 			// The one path in the whole codebase that hands a slot back to
 			// the caller already on it. Everything else — take(),
 			// claimSlotForLease, preboot — is a fresh claim by definition,
@@ -270,7 +284,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			return nil, err
 		}
 		if ok {
-			return leaseSlotView(root, groupDir, dir, n, device, osVersion), nil
+			return leaseSlotView(root, groupDir, dir, n, device, osVersion, key), nil
 		}
 		if overCap {
 			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
@@ -293,7 +307,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			return nil, err
 		}
 		if ok {
-			return leaseSlotView(root, groupDir, dir, next, device, osVersion), nil
+			return leaseSlotView(root, groupDir, dir, next, device, osVersion, key), nil
 		}
 		if overCap {
 			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
@@ -386,16 +400,33 @@ func claimSlotForLease(root, groupDir, dir string, n int, device, osVersion, key
 	return true, false, av, nil
 }
 
-func leaseSlotView(root, groupDir, dir string, n int, device, osVersion string) *Slot {
-	return &Slot{
+// leaseSlotView is the one value both lease paths — sticky renewal and
+// fresh claim — return through, which is why the concurrent-driver check
+// lives here rather than in either of them.
+//
+// Read before EnsureProvisioned runs, necessarily: that is what overwrites
+// the driver fields with this call's own.
+func leaseSlotView(root, groupDir, dir string, n int, device, osVersion, key string) *Slot {
+	meta := ReadMeta(dir)
+	s := &Slot{
 		Root:     root,
 		GroupDir: groupDir,
 		Dir:      dir,
 		Number:   n,
 		Device:   device,
 		OSVer:    osVersion,
-		Meta:     ReadMeta(dir),
+		Meta:     meta,
 	}
+	// Only ever about THIS key. A slot being claimed fresh can still carry
+	// a previous, different key's driver — that key's lease lapsed or was
+	// released, so there is nobody to share with and naming them would be
+	// noise of exactly the kind this must not produce.
+	if meta.LeaseKey == key {
+		if driver, ok := ConcurrentLeaseDriver(meta); ok {
+			s.SharedWith = &driver
+		}
+	}
+	return s
 }
 
 // ReleaseLease drops key's lease wherever it is resident across every

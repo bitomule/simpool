@@ -380,47 +380,13 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 		return true, nil
 	}
 
-	// Most-recently-used first. A warm slot still has its simulator booted and
-	// the consumer's app installed, so reusing it skips a ~30s boot and a
-	// reinstall; walking slot-0 upward instead would hand out a cold slot while
-	// a warm one sat idle. Busy slots are skipped by the flock either way, so
-	// this only changes which *free* slot wins.
-	sort.SliceStable(existing, func(i, j int) bool {
-		return ReadMeta(SlotDir(groupDir, existing[i])).LastUsed.
-			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
-	})
-
-	// --need is a dispatch criterion, not a reconfigure order. Within that
-	// most-recently-used ordering, prefer a slot that already has what was
-	// asked for, and among those the LEANEST one that still satisfies it:
-	// an ordinary run must not land on the group's only photos slot and
-	// force the next photo job to pay a reconfigure for it. A capability
-	// costs real memory — measured idle, a slim slot sums 229-345 MB of
-	// resident memory and the same slot with photos and spotlight both
-	// enabled sums 1260 MB — so which slot serves which request is worth
-	// getting right.
-	want := RequestedCategories()
-	sort.SliceStable(existing, func(i, j int) bool {
-		hi := ReadMeta(SlotDir(groupDir, existing[i])).Capabilities
-		hj := ReadMeta(SlotDir(groupDir, existing[j])).Capabilities
-		si, sj := Satisfies(hi, want), Satisfies(hj, want)
-		if si != sj {
-			return si
-		}
-		if si {
-			return SurplusCategories(hi, want) < SurplusCategories(hj, want)
-		}
-		return false
-	})
+	matching, reconfigurable := dispatchOrder(groupDir, existing)
 
 	// Pass one takes only slots that already satisfy the request, so the
 	// common case is the 1.5s path and nothing is reconfigured.
-	for _, n := range existing {
+	for _, n := range matching {
 		if len(acquired) >= count || capped {
 			break
-		}
-		if !Satisfies(ReadMeta(SlotDir(groupDir, n)).Capabilities, want) {
-			continue
 		}
 		ok, err := take(n)
 		if err != nil {
@@ -501,8 +467,9 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	// default it used to be. EnsureProvisioned does the actual reconcile.
 	// Slots this call already holds are skipped by number: flock is per
 	// open file description, so a second claim from this same process would
-	// succeed and hand one slot out twice.
-	for _, n := range existing {
+	// succeed and hand one slot out twice. Matching slots refused in pass one
+	// are walked again so their refusal reflects the latest observation.
+	for _, n := range append(append([]int{}, matching...), reconfigurable...) {
 		if len(acquired) >= count || capped {
 			break
 		}
@@ -546,6 +513,49 @@ func tryAcquireSlots(root, device, osVersion string, count, max int) ([]*Slot, e
 	}
 
 	return acquired, nil
+}
+
+// dispatchOrder splits a group's resident slots into the order every
+// acquisition path — `with`, `acquire` and `lease` alike — walks them.
+//
+// matching holds the slots that already satisfy --need, leanest first and
+// most-recently-used first within that. A warm slot still has its simulator
+// booted and the consumer's app installed, so reusing it skips a ~30s boot
+// and a reinstall. Leanest first because a capability costs real memory —
+// measured idle, a slim slot sums 229-345 MB of resident memory and the same
+// slot with photos and spotlight both enabled sums 1260 MB — and an ordinary
+// run must not land on the group's only photos slot and force the next photo
+// job to pay a reconfigure for it.
+//
+// reconfigurable holds the rest, least-recently-used first. Reconfiguring
+// reboots the simulator, so warmth buys nothing there, and the most recently
+// used slot is the one most likely to still be in somebody's hands without a
+// live lease — a MAV session pinned by UDID, a lease that lapsed a minute
+// ago. A `lease --need photos` on the iPhone Duo group rebooted exactly that
+// slot while another, already capable, sat free.
+func dispatchOrder(groupDir string, existing []int) (matching, reconfigurable []int) {
+	want := RequestedCategories()
+	metas := make(map[int]Meta, len(existing))
+	for _, n := range existing {
+		metas[n] = ReadMeta(SlotDir(groupDir, n))
+		if Satisfies(metas[n].Capabilities, want) {
+			matching = append(matching, n)
+		} else {
+			reconfigurable = append(reconfigurable, n)
+		}
+	}
+	sort.SliceStable(matching, func(i, j int) bool {
+		mi, mj := metas[matching[i]], metas[matching[j]]
+		si, sj := SurplusCategories(mi.Capabilities, want), SurplusCategories(mj.Capabilities, want)
+		if si != sj {
+			return si < sj
+		}
+		return mi.LastUsed.After(mj.LastUsed)
+	})
+	sort.SliceStable(reconfigurable, func(i, j int) bool {
+		return metas[reconfigurable[i]].LastUsed.Before(metas[reconfigurable[j]].LastUsed)
+	})
+	return matching, reconfigurable
 }
 
 // AcquireSlotByNumber locks EXACTLY slot n of the device+osVersion group

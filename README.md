@@ -461,7 +461,16 @@ acquisition picks in this order:
    already serves somebody else.
 3. **Reconfigure a slot that does not match** — only with the group full.
    This is the 25-40s path, and it is now the last resort rather than what
-   every request paid.
+   every request paid. It takes the slot idle the **longest**, not the
+   most recently used: reconfiguring reboots the simulator, so warmth buys
+   nothing, and the slot used a minute ago is the one most likely to still
+   be in somebody's hands without a live lease (a MAV session pinned by
+   UDID, a lease that just lapsed).
+
+`lease` follows the same order since v0.32.0. Before that it walked
+most-recently-used first and ignored `--need` when choosing, so on the
+iPhone Duo group a `lease --need photos` rebooted a recently used slim
+slot into photos while a free photos slot sat idle.
 
 Measured end to end on this pool: the first `--need photos` took 41.3s and
 opened a photos slot; the second took 12.1s on that same slot with no

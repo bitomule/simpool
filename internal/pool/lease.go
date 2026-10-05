@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 )
 
@@ -257,13 +256,14 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 		resident[n] = true
 	}
 
-	// Most-recently-used first, same rationale as AcquireSlots: a warm
-	// slot's simulator is already booted, so handing it out first skips a
-	// ~30s cold boot.
-	sort.SliceStable(existing, func(i, j int) bool {
-		return ReadMeta(SlotDir(groupDir, existing[i])).LastUsed.
-			After(ReadMeta(SlotDir(groupDir, existing[j])).LastUsed)
-	})
+	// The same three passes as AcquireSlots, in the same order: a slot that
+	// already satisfies --need, then a new slot while the group is under its
+	// cap, and only then reconfiguring one that does not. Until v0.32.0 this
+	// path walked most-recently-used first with no regard for --need, so a
+	// `lease --need photos` rebooted a recently used slim slot into photos
+	// while a free photos slot sat idle — the README promised the dispatch on
+	// `lease` too, and only `with`/`acquire` ever did it.
+	matching, reconfigurable := dispatchOrder(groupDir, existing)
 
 	// refusals records why each slot this call could not use was refused,
 	// so a failure names the actual obstacle per slot instead of asserting
@@ -277,7 +277,7 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 	// in this slot.
 	var uses []slotUse
 
-	for _, n := range existing {
+	claim := func(n int) (*Slot, error) {
 		dir := SlotDir(groupDir, n)
 		ok, overCap, av, err := claimSlotForLease(root, groupDir, dir, n, device, osVersion, key, ttl, max, &uses)
 		if err != nil {
@@ -290,31 +290,34 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
 		}
 		refusals = append(refusals, SlotRefusal{Number: n, Availability: av})
+		return nil, nil
+	}
+
+	for _, n := range matching {
+		if s, err := claim(n); s != nil || err != nil {
+			return s, err
+		}
 	}
 
 	next := 0
-	for {
+	for len(resident) < max {
 		for resident[next] {
 			next++
 		}
-		if len(resident) >= max {
-			return nil, atCapacityError(GroupName(device, osVersion), key, max, refusals)
-		}
-		dir := SlotDir(groupDir, next)
 		resident[next] = true
-		ok, overCap, av, err := claimSlotForLease(root, groupDir, dir, next, device, osVersion, key, ttl, max, &uses)
-		if err != nil {
-			return nil, err
+		if s, err := claim(next); s != nil || err != nil {
+			return s, err
 		}
-		if ok {
-			return leaseSlotView(root, groupDir, dir, next, device, osVersion, key), nil
-		}
-		if overCap {
-			return nil, atUseCapError(GroupName(device, osVersion), key, max, uses)
-		}
-		refusals = append(refusals, SlotRefusal{Number: next, Availability: av})
 		next++
 	}
+
+	for _, n := range reconfigurable {
+		if s, err := claim(n); s != nil || err != nil {
+			return s, err
+		}
+	}
+
+	return nil, atCapacityError(GroupName(device, osVersion), key, max, refusals)
 }
 
 // claimSlotForLease writes a fresh lease for key into dir if — and only

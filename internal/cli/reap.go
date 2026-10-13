@@ -64,6 +64,8 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	orphans := fs.Bool("orphans", false, "scan the default device set for pool-named simulators no slot under this pool root currently references (e.g. left behind by a purged slot directory, or by a different/vanished pool root — see the RootTag doc comment) and report them. Read-only by itself; combine with --purge-orphans to actually delete what it finds")
 	purgeOrphans := fs.Bool("purge-orphans", false, "delete the orphaned devices --orphans finds, after verifying no live process still references each one. Implies --orphans. Still respects --dry-run for a preview")
 	purgeOrphanRuntimes := fs.Bool("purge-orphan-runtimes", false, "kill the still-running processes of simulators that no longer exist. Deleting a booted device does not stop the userland it booted: its launchd_sim tree is reparented to launchd and runs forever (measured here: 452 processes across 19 deleted devices, oldest 18 days, the machine paging itself to a standstill). Every `simpool reap` already REPORTS these; this flag is what kills them. Only ever touches processes whose device is absent from a device listing that succeeded and returned other devices — never one belonging to a live device, and nothing at all if that listing could not be trusted. Respects --dry-run")
+	pruneGhosts := fs.Bool("prune-ghosts", true, "remove slots `status` would show as missing for good: their simulator no longer exists or is unavailable, or no installed runtime provides their group's OS any more. A slot's own unavailable simulator is deleted with it; nothing outside the pool is touched, and simpool never deletes a runtime (`simpool doctor` lists the unused ones with the command to remove each). Skips slots that are held, leased or quarantined, and does nothing if the device or runtime listing could not be read. On by default, like --max, because no acquisition can ever use such a slot again. Respects --dry-run")
+	staleAfter := fs.Duration("stale-after", DefaultStaleAfter, "a group not used for this long is no longer kept warm by --warm: its warm slot would be a running simulator nobody asked for, and would keep its runtime looking needed to `simpool doctor` forever")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -120,6 +122,10 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 			// for the same slot anyway — one acts only on Booted devices
 			// and the other only on Shutdown ones.
 			enforceWarmCap(root, groupDir, *warmCap, *dryRun, stdout, stderr)
+			if age, idle := groupIdleBeyond(groupDir, *staleAfter, time.Now()); idle {
+				fmt.Fprintf(stdout, "WARM  %s  not warming: last used %s ago, beyond --stale-after %s\n", filepath.Base(groupDir), roundAge(age), roundAge(*staleAfter))
+				continue
+			}
 			enforceWarmFloor(root, groupDir, *warmCap, *dryRun, stdout, stderr)
 		}
 	}
@@ -135,6 +141,10 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	// Reporting costs one `ps` and prints nothing when there is nothing to
 	// say; killing still requires asking.
 	reapOrphanRuntimes(*purgeOrphanRuntimes, *dryRun, stdout, stderr)
+
+	if *pruneGhosts {
+		ghostPass(root, *dryRun, stdout, stderr)
+	}
 	return 0
 }
 

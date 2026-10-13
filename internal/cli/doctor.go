@@ -265,6 +265,11 @@ func RunDoctor(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Information, never a FAIL and never acted on: disk taken by runtimes
+	// says nothing about whether the pool is coherent, and which OS
+	// versions a machine keeps is its owner's call, not simpool's.
+	reportUnusedRuntimes(root, stdout)
+
 	if len(problems) == 0 {
 		fmt.Fprintln(stdout, "OK   pool is coherent:", root)
 		return 0

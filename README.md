@@ -49,6 +49,9 @@ service that runs it on a schedule.
   slimmed, what it saves, and how to turn it off
 - [Recycling](#recycling-shut-down-scrub-purge) — `--cold`, `--scrub` and
   `--purge`, and why scrubbing is not purging
+- [Ghost slots and unused runtimes](#ghost-slots-and-unused-runtimes) —
+  what `reap` prunes, what `doctor` only reports, and why simpool never
+  deletes a runtime
 - [A clean slot](#a-clean-slot-language-region-appearance-text-size) — what
   the pool resets between consumers, and why at hand-out rather than on
   release
@@ -1881,6 +1884,47 @@ the tree's leader is never missed even if the second pass fails. Within a
 device, pids are signalled in ascending order: `launchd_sim` necessarily
 holds a lower pid than anything it started, and it is the only member still
 able to spawn more.
+
+### Ghost slots and unused runtimes
+
+A simulator runtime disk image is 7.8-8.4GB and is also mounted as its own
+APFS volume. Nothing removes one when the Xcode that wanted it is replaced.
+On the machine this was written for the disk reached 98% with iOS 26.3.1,
+27.0 and 27.1 installed (22.7GB) while the only Xcode left shipped the 27.1
+simulator SDK. Four pool groups were still pinned to 27.0, and the `--warm`
+floor kept one of their slots booted, so 27.0 looked in use.
+
+simpool never deletes a runtime. Which OS versions a machine keeps is its
+owner's decision. What simpool does:
+
+- **`reap` prunes ghost slots, on by default (`--prune-ghosts`).** A ghost
+  slot is one `status` shows as `missing` for good: its simulator no longer
+  exists, or is unavailable, or no installed runtime provides its group's OS
+  any more. Its slot directory is removed. Its simulator is deleted too, but
+  only when it still exists, is unavailable, and carries that slot's own pool
+  name. Slots that are held, leased or quarantined are skipped. Nothing is
+  pruned if the device or runtime listing failed or came back empty, because
+  an empty listing looks the same as a failed one and would make every slot
+  look like a ghost.
+- **`reap --warm` stops warming groups idle past `--stale-after`** (default
+  14 days). A warm slot is a running simulator nobody asked for. It would also
+  keep its runtime looking needed forever.
+- **`doctor` reports unused runtimes, for information only.** Each line gives
+  the runtime's size and the command that removes it, `xcrun simctl runtime
+  delete <identifier>`. A runtime counts as needed if any of these is true:
+  - a device on it is running (pool-owned or not)
+  - a pool slot asking for it is held or leased
+  - an installed Xcode ships its simulator SDK (`/Applications/Xcode*.app`,
+    `xcode-select -p` and `DEVELOPER_DIR`, read from each SDK's
+    `SDKSettings.json`)
+  - a pool group asking for it was used within 14 days
+
+  If no Xcode simulator SDK can be found, or the device listing comes back
+  empty, doctor says so and lists nothing.
+
+Only disk-image runtimes appear in `xcrun simctl runtime list` and can be
+deleted this way. A runtime bundled inside an Xcode.app goes away with that
+Xcode.
 
 ## Dependencies and licenses
 

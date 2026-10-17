@@ -500,13 +500,25 @@ if [[ -n "$test_host_path" ]]; then
     fi
     xcrun_test_bundle_path="__TESTHOST__/PlugIns/$test_bundle_name.xctest"
 
-    /usr/bin/sed \
-      -e "s@\$(WRAPPEDPRODUCTNAME)@XCTRunner@g"\
-      -e "s@WRAPPEDPRODUCTNAME@XCTRunner@g"\
-      -e "s@\$(WRAPPEDPRODUCTBUNDLEIDENTIFIER)@$xcrun_test_host_bundle_identifier@g"\
-      -e "s@WRAPPEDPRODUCTBUNDLEIDENTIFIER@$xcrun_test_host_bundle_identifier@g"\
-      -i "" \
-      "$runner_app_destination/Info.plist"
+    # simpool: >>> runner-plist-begin
+    # Xcode 27.1 ships XCTRunner.app/Info.plist as a binary plist, where
+    # sed matches nothing and xcodebuild then fails with "Missing bundle
+    # ID". Same round trip as upstream ios_xctestrun_runner.template.sh:
+    # to XML, substitute, back to binary.
+    simpool_rewrite_runner_info_plist() {
+      local plist="$1" bundle_id="$2"
+      /usr/bin/plutil -convert xml1 "$plist"
+      /usr/bin/sed \
+        -e "s@\$(WRAPPEDPRODUCTNAME)@XCTRunner@g"\
+        -e "s@WRAPPEDPRODUCTNAME@XCTRunner@g"\
+        -e "s@\$(WRAPPEDPRODUCTBUNDLEIDENTIFIER)@$bundle_id@g"\
+        -e "s@WRAPPEDPRODUCTBUNDLEIDENTIFIER@$bundle_id@g"\
+        -i "" \
+        "$plist"
+      /usr/bin/plutil -convert binary1 "$plist"
+    }
+    # simpool: <<< runner-plist-end
+    simpool_rewrite_runner_info_plist "$runner_app_destination/Info.plist" "$xcrun_test_host_bundle_identifier"
 
     readonly runner_app_frameworks_destination="$runner_app_destination/Frameworks"
     mkdir -p "$runner_app_frameworks_destination"
@@ -727,6 +739,27 @@ def find_by_name(name, runtime_id):
     return None
 
 
+def resolve_runtime_id(os_version):
+    # Same rule as internal/simctl.ResolveRuntime, so this lands on the
+    # runtime the pool provisioned the slot on: an exact version wins,
+    # otherwise "26.3" takes the "26.3.1" patch runtime. The identifier
+    # cannot be derived from the version string — the 26.3.1 runtime is
+    # "...iOS-26-3", not "...iOS-26-3-1".
+    runtimes = json.loads(simctl("list", "runtimes", "-j"))["runtimes"]
+    best = None
+    for runtime in runtimes:
+        if runtime.get("platform") != "iOS" or not runtime.get("isAvailable"):
+            continue
+        if runtime["version"] == os_version:
+            return runtime["identifier"]
+        if runtime["version"].startswith(os_version + "."):
+            best = runtime
+    if best is None:
+        print(f"error: no available iOS simulator runtime matches os_version '{os_version}'", file=sys.stderr)
+        sys.exit(1)
+    return best["identifier"]
+
+
 def find_by_udid(udid):
     devices = json.loads(simctl("list", "devices", "-j"))["devices"]
     for group in devices.values():
@@ -772,7 +805,7 @@ name = os.environ.get("SIMULATOR_NAME") or f"BAZEL_TEST_{device_type}_{os_versio
 # Set when SIMPOOL_NAME_0 supplied `name` above: it is a specific slot
 # simpool already provisioned, not just a default to reuse-or-create.
 is_simpool_slot = os.environ.get("SIMPOOL_SLOT_NAME") == "true"
-runtime_id = "com.apple.CoreSimulator.SimRuntime.iOS-" + os_version.replace(".", "-")
+runtime_id = resolve_runtime_id(os_version)
 
 device = find_by_name(name, runtime_id) if reuse else None
 if device is not None:

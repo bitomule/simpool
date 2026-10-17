@@ -1351,6 +1351,25 @@ ios_unit_test(
 )
 ```
 
+`os_version` takes either the runtime's exact version or its major.minor:
+with the iOS 26.3.1 runtime installed, `"26.3.1"` and `"26.3"` both land on
+it (`xcrun simctl list runtimes` lists it as `iOS 26.3 (26.3.1)`, with the
+identifier `com.apple.CoreSimulator.SimRuntime.iOS-26-3`). That is the
+same rule `simpool --os` follows, so the runner finds the slot the pool
+provisioned whichever form the target uses. rules_apple's stock
+`ios_xctestrun_runner` does not agree with itself across releases. 4.x
+builds the runtime identifier from the string (`"26.3"` →
+`...iOS-26-3`), so `"26.3.1"` finds nothing. 5.x compares `os_version`
+to the runtime's `version` exactly, and when that misses it takes the
+runtime matching the SDK the tests were built with, so `"26.3"` with
+Xcode 27.1 runs on the iOS 27.1 runtime without saying so. For a value
+both runners read under rules_apple 5.x, use the full version.
+
+`ios_ui_test` targets work with the same runner. Since Xcode 27.1,
+`XCTRunner.app/Info.plist` ships as a binary plist; the runner converts it
+to XML before filling in the runner's name and bundle identifier and back
+to binary afterwards, as rules_apple's own runner does.
+
 Then just `bazel test //:MyTests` — no wrapper, no flags. A pool for that
 device/OS group does not have to exist yet: the first test action creates
 the slot it needs. The `simpool` **binary** does have to exist (see

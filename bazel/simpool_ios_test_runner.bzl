@@ -234,9 +234,13 @@ dependencies.
             doc = """
 The os version of the iOS simulator to run tests on — must match the
 `--os` a `simpool` pool for it was provisioned with. The supported os
-versions correspond to the output of `xcrun simctl list runtimes`, e.g.
-"26.3". By default, reads --ios_simulator_version and then falls back to
-the latest supported version.
+versions correspond to the output of `xcrun simctl list runtimes`. Either
+the runtime's exact version ("26.3.1") or its major.minor ("26.3") works:
+an exact match wins, otherwise "26.3" takes the "26.3.x" patch runtime,
+the same rule `simpool --os` uses. rules_apple 5.x's stock runner needs the
+exact version, so a value shared with it should be the full one. By
+default, reads --ios_simulator_version and then falls back to the latest
+supported version.
 """,
         ),
         "create_xcresult_bundle": attr.bool(

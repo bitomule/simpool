@@ -1370,6 +1370,18 @@ both runners read under rules_apple 5.x, use the full version.
 to XML before filling in the runner's name and bundle identifier and back
 to binary afterwards, as rules_apple's own runner does.
 
+Before `xcodebuild` runs, the runner uninstalls from the simulator every
+app it is about to install (the test host, and for UI tests also the
+`-Runner` app), so each test run starts from an empty app container.
+Bazel's zips date every file 1980-01-01, and the simulator reinstalls an
+app it already has as a delta patch that keeps any file with the same size
+and modification time. Without the uninstall, a resource whose text
+changed but not its length (a translated string, say) stayed from the
+previous build. Touching the files does not fix it reliably: the comparison
+is to the whole second, so two installs less than a second apart still keep
+the old file. The uninstall costs about 0.4 s for a 120 MB app;
+`--test_env=SIMPOOL_UNINSTALL_TIMEOUT=<seconds>` (default 60) bounds it.
+
 Then just `bazel test //:MyTests` — no wrapper, no flags. A pool for that
 device/OS group does not have to exist yet: the first test action creates
 the slot it needs. The `simpool` **binary** does have to exist (see

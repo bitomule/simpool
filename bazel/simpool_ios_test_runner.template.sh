@@ -902,6 +902,35 @@ if (( ${#custom_xcodebuild_args[@]} )); then
   should_use_xcodebuild=true
 fi
 
+# simpool: >>> stale-install-begin
+# Bazel's zips date every file 1980-01-01, and the simulator reinstalls an
+# app it already has as a delta patch that keeps any file whose size and
+# modification time (in whole seconds) match the installed copy. A resource
+# whose text changed but not its length stayed from the previous build.
+# Uninstalling first makes every install a full copy. Touching the files
+# instead is not enough: an install less than a second after the previous
+# one still keeps them.
+simpool_uninstall_previous_install() {
+  local udid="$1" timeout_s="$2"
+  shift 2
+  local app bundle_id
+  for app in "$@"; do
+    bundle_id=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$app/Info.plist")
+    if ! simpool_run_bounded "$timeout_s" xcrun simctl uninstall "$udid" "$bundle_id"; then
+      echo "warning: could not uninstall $bundle_id from $udid before the run; resources that kept their size may be the previous build's" >&2
+    fi
+  done
+}
+# simpool: <<< stale-install-end
+
+if [[ -n "$test_host_path" && "$build_for_device" == false ]]; then
+  previously_installed_apps=("$test_tmp_dir/$test_host_name.app")
+  if [[ "$test_type" = "XCUITEST" ]]; then
+    previously_installed_apps+=("$runner_app_destination")
+  fi
+  simpool_uninstall_previous_install "$simulator_id" "${SIMPOOL_UNINSTALL_TIMEOUT:-60}" "${previously_installed_apps[@]}"
+fi
+
 # Run a pre-action binary, if provided.
 pre_action_binary=%(pre_action_binary)s
 SIMULATOR_UDID="$simulator_id" \

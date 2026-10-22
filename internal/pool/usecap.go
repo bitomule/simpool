@@ -89,6 +89,12 @@ func censusInUse(groupDir string, skip map[int]bool, skipN int, forKey string) (
 
 		lock, err := TryLock(lockPath(dir))
 		if err == ErrBusy {
+			// reap shutting an idle simulator down is not a consumer, and
+			// counting it would refuse a lease seconds before that slot is
+			// free for it (see waitOutIdleShutdown).
+			if ShutdownInProgress(dir) {
+				continue
+			}
 			uses = append(uses, slotUse{n: n, av: Availability{State: SlotBusy}})
 			continue
 		}

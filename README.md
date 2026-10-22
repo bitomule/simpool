@@ -47,6 +47,9 @@ service that runs it on a schedule.
   `free`/`busy`/`leased`/`quarantined` mean, and why `--max 1` works
 - [Slim slots](#slim-slots-why-the-cap-is-6-and-not-3) — why slots boot
   slimmed, what it saves, and how to turn it off
+- [Idle shutdown](#idle-shutdown-five-minutes-and-no-warm-pool) — why a
+  free simulator goes down after five minutes, what happens to a lease that
+  arrives meanwhile, and why there is no warm pool
 - [Recycling](#recycling-shut-down-scrub-purge) — `--cold`, `--scrub` and
   `--purge`, and why scrubbing is not purging
 - [Ghost slots and unused runtimes](#ghost-slots-and-unused-runtimes) —
@@ -109,15 +112,17 @@ pool with no maintenance at all:
 brew services start simpool
 ```
 
-Every 30 minutes it runs `reap --purge-orphan-runtimes --cold 60 --warm 2
---scrub 120`:
-shut down free simulators idle over an hour, keep two warm per group,
-collect the processes of simulators that no longer exist, and reclaim a
-slot's generated caches and logs (1.3-1.9GB each, measured here) once it
-has been cold for two hours, without deleting the simulator. `reap --max`
-is on by default, so the same pass also brings any group that has drifted
-above its slot cap back down to it, deleting the excess simulators. Logs to
-`/tmp/simpool-reap.log`; stop with `brew services stop simpool`.
+Every minute it runs `reap --purge-orphan-runtimes --cold 5m --full-every
+30m --scrub 120`: shut down a free simulator five minutes after its last use
+(see [Idle shutdown](#idle-shutdown-five-minutes-and-no-warm-pool)), and
+every 30 minutes also collect the processes of simulators that no longer
+exist and reclaim a slot's generated caches and logs (1.3-1.9GB each,
+measured here) once it has been cold for two hours, without deleting the
+simulator. `reap --max` is on by default, so that half-hourly pass also
+brings any group that has drifted above its slot cap back down to it,
+deleting the excess simulators. Logs to `/tmp/simpool-reap.log` (a
+minute's pass logs only what it did); stop with `brew services stop
+simpool`.
 
 This is not optional housekeeping. `with` deliberately does not shut
 simulators down on exit (see Architecture), so with nothing scheduled the
@@ -171,7 +176,7 @@ simpool status
     acquisition paths decide by, not a separate opinion — see "Why a
     slot can be refused" below.
 
-simpool reap [--max N] [--cold N] [--stuck-after D] [--scrub N] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
+simpool reap [--max N] [--cold D] [--full-every D] [--stuck-after D] [--scrub N] [--purge N] [--prune-runs-after D] [--warm N] [--orphans] [--purge-orphans] [--purge-orphan-runtimes] [--disown-poisoned] [--dry-run]
     Recycle free+cold slots. A free slot whose previous consumer still has
     a live process attached is reclaimed — killed and shut down — if its
     recorded identity (the process-group leader's own start time) still
@@ -690,6 +695,67 @@ The refusal is deliberately *not* the capacity message: the group is not at
 its `--max`, it chose not to grow, so advising `--max` would point at the one
 remedy that cannot help.
 
+### Idle shutdown: five minutes, and no warm pool
+
+A booted simulator nobody is using is pure memory. On 2026-10-22, on an
+18 GB Mac running nine agents, booted simulators held 3.1 GB RSS across 271
+processes — more than all the agents together — and that put macOS memory
+pressure at Warning and held a queue of 31 tasks. The service used to run
+every 30 minutes with `--cold 60 --warm 2`, so a free simulator stayed up 60
+to 90 minutes, and `--warm 2` booted up to two more per group whenever
+memory looked free.
+
+Measured on that Mac (iPhone 17 Pro, iOS 26.3, load average ~35):
+
+| | |
+|---|---|
+| lease, simulator Shutdown (cold boot) | 12.4s, 14.8s, 14.6s, 11.6s |
+| lease, simulator already Booted | 1.7s, 2.4s, 2.5s |
+| one booted slim simulator | ~1.0 GB physical footprint (0.9-1.15 GB), 63-79 processes |
+| a full `reap` pass | 31s wall, 11s CPU |
+| a fast `reap` pass (`--full-every` not due) | 0.33s wall, 0.18s CPU |
+
+RSS summed over a simulator's processes swings between 1 and 4.6 GB because
+it counts shared pages once per process; `footprint` counts them once and
+is the number above.
+
+**Why five minutes.** Shutting a simulator down early costs the next lease
+~12s; keeping it up costs ~1 GB for as long as it stays up. A lease already
+keeps its slot for its 10-minute TTL after the last command, so MAV's hot
+loop never sees this. What five minutes covers is the gap between two `with`
+runs — consecutive Bazel test targets, an agent's edit-build-test cycle —
+while bounding the worst case at ~1 GB for 5-6 minutes instead of 60-90.
+Change it with `--cold` (`5m`, `90s`; a bare number is still minutes) or,
+when the flag is not passed, `SIMPOOL_IDLE_SHUTDOWN`.
+
+**Why every minute.** `--cold` is only as precise as the schedule that runs
+it. `--full-every 30m` keeps the expensive passes (`--max`, `--warm`,
+`--scrub`, `--purge`, orphans, ghosts, orphaned runtimes) on their old
+half-hour cadence, and a pass without them lists the device set once
+instead of once per slot, which is what made it cheap enough to run every
+minute.
+
+**What it never does.** It never touches a slot whose flock is held or that
+has a live lease, never deletes a simulator (it only calls `simctl
+shutdown`), and never touches a runtime.
+
+**A lease that arrives mid-shutdown.** The shutdown runs under the slot's
+flock, so nobody can be handed a half-shut simulator. It also writes a
+`shutting-down.json` marker for those 5-7 seconds, and that is what lets
+`lease` tell it apart from a consumer: instead of counting the slot as in
+use (and failing "at capacity" at `--max 1`) or provisioning a brand-new
+simulator next to it, the lease waits for the shutdown to finish — at most
+60s — and takes that slot, which `EnsureProvisioned` then boots. A marker
+from a dead process or older than two minutes is ignored.
+
+**Why no warm pool.** One simulator kept booted per group would save those
+~12s, but only on the first lease after five idle minutes, and it would cost
+~1 GB per group around the clock: five or six groups in use is five or six
+gigabytes, exactly the memory whose shortage started this. `--warm N` still
+exists for a machine with memory to spare; with it, `--cold` leaves alone
+the N slots `--warm` keeps, rather than shutting them down for the floor to
+boot again on the next pass.
+
 ### Recycling: shut down, scrub, purge
 
 A slot that has been used costs three different things, and until
@@ -697,7 +763,7 @@ recently `reap` could only address the first and the last of them.
 
 | | what it reclaims | what it costs you |
 |---|---|---|
-| `--cold N` | the memory of a booted-but-idle simulator | a cold boot (~110s) next time that slot is acquired |
+| `--cold D` | the memory of a booted-but-idle simulator (~1 GB each) | a cold boot (~12s measured on 2026-10-22) next time that slot is acquired |
 | `--scrub N` | the disk a slot's *generated* data holds: caches, unified logs, temporary files | nothing a slot cannot regenerate |
 | `--purge N` | all of that slot's disk, by deleting the simulator | a re-provision, and a **different** simulator |
 

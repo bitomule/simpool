@@ -299,6 +299,22 @@ func AcquireLease(root, device, osVersion, key string, ttl time.Duration, max in
 		}
 	}
 
+	// Before creating a slot: a matching one that reap is shutting down is
+	// free again in seconds, and rebooting it is cheaper than provisioning
+	// a new simulator.
+	refused := refusals
+	for _, r := range refused {
+		if r.Availability.State != SlotBusy {
+			continue
+		}
+		n := r.Number
+		s, err := waitOutIdleShutdown(SlotDir(groupDir, n), func() (*Slot, error) { return claim(n) })
+		refusals = refused
+		if s != nil || err != nil {
+			return s, err
+		}
+	}
+
 	next := 0
 	for len(resident) < max {
 		for resident[next] {

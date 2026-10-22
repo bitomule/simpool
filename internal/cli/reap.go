@@ -51,7 +51,10 @@ import (
 func RunReap(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	coldMinutes := fs.Int("cold", 0, "minimum idle minutes (since last use) before a free slot's simulator is shut down")
+	defaultCold, coldErr := defaultIdleShutdown()
+	cold := idleDuration(defaultCold)
+	fs.Var(&cold, "cold", "how long a free slot's simulator may sit idle (since last use) before it is shut down: minutes (60) or a duration (5m, 90s); 0 (the default) shuts down every free simulator however recently it was used (env "+EnvIdleShutdown+"). Never deletes the simulator, never touches a slot that is held or under a live lease, and leaves alone the slots --warm keeps")
+	fullEvery := fs.Duration("full-every", 0, "run the expensive passes (--max, --warm, --scrub, --purge, orphans, ghosts, orphaned runtimes) only if the last full pass was at least this long ago; the per-slot idle shutdown runs every time. Lets a schedule run reap every minute. 0 (default) makes every run a full pass")
 	stuckAfter := fs.Duration("stuck-after", 3*time.Minute, "minimum time a `with` holder must have had zero live children before it is considered stuck (not just mid-provisioning) and killed")
 	purgeMinutes := fs.Int("purge", 0, "minutes a slot must have been shut down (already cold) before its simulator is deleted outright, reclaiming disk; 0 disables purging")
 	pruneRunsAfter := fs.Duration("prune-runs-after", 24*time.Hour, "delete a free slot's run directories older than this")
@@ -67,6 +70,10 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 	pruneGhosts := fs.Bool("prune-ghosts", true, "remove slots `status` would show as missing for good: their simulator no longer exists or is unavailable, or no installed runtime provides their group's OS any more. A slot's own unavailable simulator is deleted with it; nothing outside the pool is touched, and simpool never deletes a runtime (`simpool doctor` lists the unused ones with the command to remove each). Skips slots that are held, leased or quarantined, and does nothing if the device or runtime listing could not be read. On by default, like --max, because no acquisition can ever use such a slot again. Respects --dry-run")
 	staleAfter := fs.Duration("stale-after", DefaultStaleAfter, "a group not used for this long is no longer kept warm by --warm: its warm slot would be a running simulator nobody asked for, and would keep its runtime looking needed to `simpool doctor` forever")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if coldErr != nil && !flagPassed(fs, "cold") {
+		fmt.Fprintln(stderr, "simpool reap:", coldErr)
 		return 2
 	}
 
@@ -95,10 +102,36 @@ func RunReap(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	now := time.Now()
+	full := fullPassDue(root, *fullEvery, now)
+	slotOut := stdout
+	slotScrub, slotPurge := *scrubMinutes, *purgeMinutes
+	if !full {
+		q := &quietWriter{w: stdout}
+		defer q.Flush()
+		slotOut = q
+		slotScrub, slotPurge = 0, 0
+	}
+
+	restoreFind := snapshotDevices()
 	for _, groupDir := range groups {
+		var kept map[int]bool
+		if _, stale := groupIdleBeyond(groupDir, *staleAfter, now); !stale {
+			kept = warmKept(groupDir, *warmCap)
+		}
 		for _, n := range pool.ListSlotNumbers(groupDir) {
 			dir := pool.SlotDir(groupDir, n)
-			reapSlot(root, dir, n, *coldMinutes, *purgeMinutes, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, *scrubMinutes, scrubCategories, stdout, stderr)
+			reapSlot(root, dir, n, time.Duration(cold), slotPurge, *pruneRunsAfter, *stuckAfter, *dryRun, *disownPoisoned, slotScrub, scrubCategories, kept[n], slotOut, stderr)
+		}
+	}
+	restoreFind()
+
+	if !full {
+		return 0
+	}
+	if !*dryRun && *fullEvery > 0 {
+		if err := stampFullPass(root, now); err != nil {
+			fmt.Fprintf(stderr, "simpool reap: recording full pass: %v\n", err)
 		}
 	}
 
@@ -284,6 +317,26 @@ type warmCandidate struct {
 // seams.
 var shutdownWarm = simctl.Shutdown
 
+// shutdownIdle and deletePurged are seams for the per-slot pass, so tests
+// can prove an idle shutdown only ever shuts down and never deletes.
+var shutdownIdle = simctl.Shutdown
+var deletePurged = simctl.Delete
+
+// idleShutdown shuts down a free slot's simulator under the slot's flock,
+// which the caller holds, behind the marker that tells an acquirer to wait
+// for it rather than give up on the slot (see pool.MarkShuttingDown).
+func idleShutdown(dir, label, udid string, stderr io.Writer) {
+	clear, err := pool.MarkShuttingDown(dir)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap %s: marking shutdown: %v\n", label, err)
+		clear = func() {}
+	}
+	defer clear()
+	if err := shutdownIdle(udid); err != nil {
+		fmt.Fprintf(stderr, "reap %s: %v\n", label, err)
+	}
+}
+
 // classifyWarmSlot applies every safety check a slot must pass to be
 // eligible for --warm accounting: unreadable/live lease treated as busy, a
 // poisoned slot, no UDID, the device missing or not found, and a name/state
@@ -432,7 +485,7 @@ func scrubSlot(label, udid string, idle time.Duration, scrubMinutes int, categor
 	fmt.Fprintf(stdout, "SCRUB %s  reclaimed %s from %s (%s), simulator kept\n", label, pool.HumanBytes(reclaimed), udid, strings.Join(categories, ","))
 }
 
-func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, scrubMinutes int, scrubCategories []string, stdout, stderr io.Writer) {
+func reapSlot(root, dir string, n int, cold time.Duration, purgeMinutes int, pruneRunsAfter, stuckAfter time.Duration, dryRun, disownPoisoned bool, scrubMinutes int, scrubCategories []string, keepWarm bool, stdout, stderr io.Writer) {
 	groupDir := filepath.Dir(dir)
 	label := filepath.Base(groupDir) + "/" + filepath.Base(dir)
 	lock, err := pool.TryLock(pool.LockPath(dir))
@@ -612,8 +665,8 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	if !meta.LastUsed.IsZero() {
 		idle = time.Since(meta.LastUsed)
 	}
-	if idle < time.Duration(coldMinutes)*time.Minute {
-		fmt.Fprintf(stdout, "KEEP  %s  free, idle %s (< --cold %dm)\n", label, idle.Round(time.Second), coldMinutes)
+	if idle < cold {
+		fmt.Fprintf(stdout, "KEEP  %s  free, idle %s (< --cold %s)\n", label, idle.Round(time.Second), cold)
 		return
 	}
 
@@ -622,7 +675,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		removeDeadSlotDir(groupDir, dir, label, purgeMinutes, dryRun, stdout, stderr)
 		return
 	}
-	entry, found, err := simctl.Find(meta.UDID)
+	entry, found, err := findDevice(meta.UDID)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap %s: checking device state: %v\n", label, err)
 		return
@@ -649,11 +702,13 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 		return
 	}
 	if entry.State == "Booted" {
+		if keepWarm {
+			fmt.Fprintf(stdout, "KEEP  %s  free, idle %s, one of the slots --warm keeps booted\n", label, idle.Round(time.Second))
+			return
+		}
 		fmt.Fprintf(stdout, "SHUT  %s  shutting down %s (idle %s)\n", label, meta.UDID, idle.Round(time.Second))
 		if !dryRun {
-			if err := simctl.Shutdown(meta.UDID); err != nil {
-				fmt.Fprintf(stderr, "reap %s: %v\n", label, err)
-			}
+			idleShutdown(dir, label, meta.UDID, stderr)
 		}
 		return
 	}
@@ -675,7 +730,7 @@ func reapSlot(root, dir string, n, coldMinutes, purgeMinutes int, pruneRunsAfter
 	if dryRun {
 		return
 	}
-	if err := simctl.Delete(meta.UDID); err != nil {
+	if err := deletePurged(meta.UDID); err != nil {
 		fmt.Fprintf(stderr, "reap %s: purging %s: %v\n", label, meta.UDID, err)
 		return
 	}

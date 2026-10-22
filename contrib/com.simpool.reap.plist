@@ -36,11 +36,17 @@
                              exist — only ever processes whose device is
                              absent from a device listing that succeeded and
                              returned other devices.
-    --cold 60                shut down free simulators idle for over an hour.
-                             Drop this if you would rather keep every slot
-                             warm and pay the memory.
-    --warm 2                 keep two booted per device+OS group, so the next
-                             acquisition does not pay a cold boot.
+    --cold 5m                shut down a free simulator five minutes after
+                             its last use. Each one booted holds ~1 GB; a
+                             cold boot costs the next lease ~12s (both
+                             measured on an 18 GB M-series Mac). Never
+                             deletes it, never touches a held or leased slot.
+                             Raise it (or set SIMPOOL_IDLE_SHUTDOWN and drop
+                             the flag) to trade memory for fewer cold boots.
+    --full-every 30m         this job runs every minute so --cold is honored
+                             within a minute; everything else below (and
+                             --max) runs at most every 30 minutes. A minute's
+                             pass takes ~0.3s, a full one ~25s.
     --scrub 120              on a slot cold for two hours, delete its
                              generated caches, logs and temporary files —
                              measured at 1.3-1.9GB per slot — keeping the
@@ -49,7 +55,9 @@
                              destroys nothing a slot cannot regenerate,
                              which is what separates it from --purge below.
 
-  Deliberately NOT here: --purge (deletes simulators outright by idle time)
+  Deliberately NOT here: --warm, which keeps N simulators booted per group —
+  ~1 GB each to save ~12s on a cold lease, the wrong trade on a Mac that is
+  short of memory. Nor --purge (deletes simulators outright by idle time)
   and --purge-orphans (deletes orphaned devices). Both are destructive to
   devices rather than to dead processes, and neither should run unattended.
   --max also deletes devices, but only ones the pool's own declared cap says
@@ -64,11 +72,11 @@
     <string>/opt/homebrew/bin/simpool</string>
     <string>reap</string>
     <string>--purge-orphan-runtimes</string>
-    <string>--cold</string><string>60</string>
-    <string>--warm</string><string>2</string>
+    <string>--cold</string><string>5m</string>
+    <string>--full-every</string><string>30m</string>
     <string>--scrub</string><string>120</string>
   </array>
-  <key>StartInterval</key><integer>1800</integer>
+  <key>StartInterval</key><integer>60</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>

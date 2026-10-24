@@ -211,6 +211,13 @@ func RunRelease(args []string, stdout, stderr io.Writer) int {
 		// acquisition paths use for the same act — printing it again here
 		// would only say it twice.
 		pool.ReclaimReleasedResidue(root, dir, k)
+		// Still quarantined means something the release could not reclaim
+		// is still attached; the simulator goes down now rather than at the
+		// next reap, and its residue is then reclaimable as "target not
+		// running".
+		if shutdownReleasedQuarantine(root, dir, stdout, stderr) {
+			pool.ReclaimReleasedResidue(root, dir, k)
+		}
 		// Dropping the lease is not the same as making the slot available,
 		// and saying only the first while the caller reads it as the second
 		// is what made this command look like it succeeded without changing

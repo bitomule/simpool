@@ -893,6 +893,19 @@ by both the commands that report (`status`) and the commands that decide
 | `quarantined` | Nobody holds it, but a process that could still be using its simulator is alive (or the check to find out failed) — see "Poison and recovery" below. |
 | `unverifiable` | A check itself could not complete. Never read as free. |
 
+**A quarantined slot's simulator does not stay booted.** Whatever keeps a
+slot quarantined holds neither its lock nor a live lease, so nobody the pool
+answers to is using that simulator — yet it used to stay booted, ~1 GB each,
+for the 30-minute residue grace, or for good when what was left behind is
+not residue simpool may kill. `reap` (every minute under the service) now
+shuts down a booted quarantined slot's own simulator in the same pass,
+without waiting for `--cold`, and `simpool release` does it at once when the
+slot it just released stays quarantined. Once the simulator is down, the
+next pass reclaims the residue as "target not running" and the slot is
+`free` again. A failed shutdown is logged to the reap log and retried by the
+next pass. `--disown-poisoned` leaves the device as it found it, because it
+may delete it next.
+
 `quarantined` is the one that used to be invisible. A slot in that state
 has a free `flock` and no live lease, so `status` called it **free**, while
 every acquisition path refused it — and, at `--max 1`, refused it with

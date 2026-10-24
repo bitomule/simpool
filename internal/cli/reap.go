@@ -322,19 +322,79 @@ var shutdownWarm = simctl.Shutdown
 var shutdownIdle = simctl.Shutdown
 var deletePurged = simctl.Delete
 
+// reapNow is the clock reapSlot measures idleness against, so tests can
+// stand exactly on either side of --cold.
+var reapNow = time.Now
+
 // idleShutdown shuts down a free slot's simulator under the slot's flock,
 // which the caller holds, behind the marker that tells an acquirer to wait
 // for it rather than give up on the slot (see pool.MarkShuttingDown).
-func idleShutdown(dir, label, udid string, stderr io.Writer) {
+func idleShutdown(dir, label, udid string, stderr io.Writer) error {
 	clear, err := pool.MarkShuttingDown(dir)
 	if err != nil {
 		fmt.Fprintf(stderr, "reap %s: marking shutdown: %v\n", label, err)
 		clear = func() {}
 	}
 	defer clear()
-	if err := shutdownIdle(udid); err != nil {
-		fmt.Fprintf(stderr, "reap %s: %v\n", label, err)
+	return shutdownIdle(udid)
+}
+
+// shutdownQuarantined shuts down the booted simulator of a slot that stays
+// quarantined. Whatever still references it holds neither the slot's lock
+// nor a live lease, so nobody the pool answers to is using it, and left
+// booted it holds ~1 GB until the residue grace runs out — or forever, for
+// a consumer no recovery path may kill. With the device shut down, the
+// next pass reclaims residue as "target not running" and frees the slot.
+// The caller holds the slot's flock. A failed shutdown is logged and left
+// for the next reap, which re-evaluates the slot from scratch. Reports
+// whether the slot's own device was found booted.
+func shutdownQuarantined(root, dir string, n int, label string, meta pool.Meta, poison pool.Poison, dryRun bool, stdout, stderr io.Writer) bool {
+	if meta.UDID == "" {
+		return false
 	}
+	entry, found, err := findDevice(meta.UDID)
+	if err != nil {
+		fmt.Fprintf(stderr, "reap %s: checking quarantined device state: %v\n", label, err)
+		return false
+	}
+	if !found || entry.State != "Booted" || entry.Name != pool.DeviceNameForGroup(root, filepath.Base(filepath.Dir(dir)), n) {
+		return false
+	}
+	fmt.Fprintf(stdout, "SHUT  %s  quarantined (%s) — shutting down %s\n", label, poison, meta.UDID)
+	if dryRun {
+		return true
+	}
+	if err := idleShutdown(dir, label, meta.UDID, stderr); err != nil {
+		fmt.Fprintf(stderr, "reap %s: could not shut down quarantined device %s: %v — the next reap retries\n", label, meta.UDID, err)
+	}
+	return true
+}
+
+// shutdownReleasedQuarantine is shutdownQuarantined at the one moment a
+// simpool process sees a slot become quarantined: its lease was just
+// released and recovery could not clear what it left behind. Reports
+// whether it shut the device down.
+func shutdownReleasedQuarantine(root, dir string, stdout, stderr io.Writer) bool {
+	groupDir := filepath.Dir(dir)
+	n, ok := pool.SlotNumberOf(dir)
+	if !ok {
+		return false
+	}
+	lock, err := pool.LockExistingSlot(groupDir, dir)
+	if err != nil || lock == nil {
+		return false
+	}
+	defer lock.Release()
+	if lease, err := pool.ReadLease(dir); err != nil || lease.Alive() {
+		return false
+	}
+	meta := pool.ReadMeta(dir)
+	poison := pool.CheckPoison(meta)
+	if !poison.Poisoned() {
+		return false
+	}
+	label := filepath.Base(groupDir) + "/" + filepath.Base(dir)
+	return shutdownQuarantined(root, dir, n, label, meta, poison, false, stdout, stderr)
 }
 
 // classifyWarmSlot applies every safety check a slot must pass to be
@@ -577,6 +637,9 @@ func reapSlot(root, dir string, n int, cold time.Duration, purgeMinutes int, pru
 				}
 			}
 			fmt.Fprintln(stdout, msg)
+			if !disownPoisoned {
+				shutdownQuarantined(root, dir, n, label, meta, poison, true, stdout, stderr)
+			}
 			return
 		}
 		if pool.AttemptRecovery(root, dir, n, filepath.Base(groupDir), &meta, poison) {
@@ -613,6 +676,12 @@ func reapSlot(root, dir string, n int, cold time.Duration, purgeMinutes int, pru
 			// run will see the device's actual settled state (still
 			// mid-teardown, or genuinely Shutdown) and act on it then,
 			// exactly like the ordinary SHUT case above.
+			return
+		}
+		// --disown-poisoned may delete the device next, and deleting one on
+		// the heels of a shutdown orphans its runtime; it keeps the slot as
+		// it found it.
+		if !disownPoisoned && shutdownQuarantined(root, dir, n, label, meta, poison, false, stdout, stderr) {
 			return
 		}
 		if disownPoisoned {
@@ -663,7 +732,7 @@ func reapSlot(root, dir string, n int, cold time.Duration, purgeMinutes int, pru
 
 	idle := 999999 * time.Hour
 	if !meta.LastUsed.IsZero() {
-		idle = time.Since(meta.LastUsed)
+		idle = reapNow().Sub(meta.LastUsed)
 	}
 	if idle < cold {
 		fmt.Fprintf(stdout, "KEEP  %s  free, idle %s (< --cold %s)\n", label, idle.Round(time.Second), cold)
@@ -708,7 +777,9 @@ func reapSlot(root, dir string, n int, cold time.Duration, purgeMinutes int, pru
 		}
 		fmt.Fprintf(stdout, "SHUT  %s  shutting down %s (idle %s)\n", label, meta.UDID, idle.Round(time.Second))
 		if !dryRun {
-			idleShutdown(dir, label, meta.UDID, stderr)
+			if err := idleShutdown(dir, label, meta.UDID, stderr); err != nil {
+				fmt.Fprintf(stderr, "reap %s: %v\n", label, err)
+			}
 		}
 		return
 	}

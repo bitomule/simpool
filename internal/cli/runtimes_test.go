@@ -118,6 +118,66 @@ func TestReapOrphanRuntimes_NeverTouchesLiveDevice(t *testing.T) {
 	}
 }
 
+func TestReapOrphanRuntimes_DeviceCreatedDuringDiscoverySurvives(t *testing.T) {
+	for _, mode := range []struct {
+		name   string
+		purge  bool
+		dryRun bool
+	}{
+		{name: "report"},
+		{name: "purge", purge: true},
+		{name: "dry-run", purge: true, dryRun: true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			const newUDID = "A410BA7E-344E-4AEC-8D82-049E23280897"
+			const orphanPID, activePID = 4318, 5500
+			devices := []simctl.DeviceEntry{{UDID: liveUDID, State: "Booted"}}
+			var events []string
+			origList, origSnapshot := listPoolDevices, simRuntimeSnapshot
+			t.Cleanup(func() {
+				listPoolDevices, simRuntimeSnapshot = origList, origSnapshot
+			})
+			listPoolDevices = func() ([]simctl.DeviceEntry, error) {
+				events = append(events, "list devices")
+				return append([]simctl.DeviceEntry(nil), devices...), nil
+			}
+			simRuntimeSnapshot = func() ([]procs.SimRuntimeProcess, error) {
+				events = append(events, "new device created and booted", "snapshot runtime processes")
+				devices = append(devices, simctl.DeviceEntry{UDID: newUDID, State: "Booted"})
+				return []procs.SimRuntimeProcess{
+					{PID: orphanPID, UDID: deadUDID},
+					{PID: activePID, UDID: newUDID},
+				}, nil
+			}
+			rec := withKillRecorder(t)
+			var stdout, stderr bytes.Buffer
+			reapOrphanRuntimes(mode.purge, mode.dryRun, &stdout, &stderr)
+			t.Logf("discovery: %s; selected fake PIDs: %v", strings.Join(events, " -> "), rec.killed())
+			for _, pid := range rec.killed() {
+				if pid == activePID {
+					t.Fatalf("selected active device %s's PID %d for termination", newUDID, pid)
+				}
+			}
+			if strings.Contains(stdout.String(), newUDID) {
+				t.Fatalf("reported newly created device as deleted: %s", stdout.String())
+			}
+			if !strings.Contains(stdout.String(), deadUDID) {
+				t.Fatalf("lost the genuine orphan: %s", stdout.String())
+			}
+			if mode.purge && !mode.dryRun {
+				if got := rec.killed(); len(got) != 1 || got[0] != orphanPID {
+					t.Fatalf("selected %v, want only genuine orphan PID %d", got, orphanPID)
+				}
+			} else if got := rec.killed(); len(got) != 0 {
+				t.Fatalf("selected %v for termination while only reporting", got)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("unexpected diagnostic: %s", stderr.String())
+			}
+		})
+	}
+}
+
 // Reporting has to happen without being asked — this accumulated unnoticed
 // for 18 days precisely because nothing ever mentioned it — while killing
 // still has to be asked for.

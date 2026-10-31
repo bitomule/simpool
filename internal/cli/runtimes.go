@@ -52,6 +52,14 @@ type orphanedRuntime struct {
 //
 // The returned groups are sorted by UDID so output and tests are stable.
 func findOrphanedRuntimes(stderr io.Writer) ([]orphanedRuntime, bool) {
+	// Observe processes before devices: a device created during discovery must
+	// be visible in the inventory used to judge its already-observed processes.
+	found, err := simRuntimeSnapshot()
+	if err != nil {
+		fmt.Fprintf(stderr, "reap --orphan-runtimes: reading process snapshot: %v — not touching any process this run\n", err)
+		return nil, false
+	}
+
 	devices, err := listPoolDevices()
 	if err != nil {
 		fmt.Fprintf(stderr, "reap --orphan-runtimes: listing devices: %v — not touching any process this run\n", err)
@@ -64,12 +72,6 @@ func findOrphanedRuntimes(stderr io.Writer) ([]orphanedRuntime, bool) {
 	live := make(map[string]bool, len(devices))
 	for _, d := range devices {
 		live[d.UDID] = true
-	}
-
-	found, err := simRuntimeSnapshot()
-	if err != nil {
-		fmt.Fprintf(stderr, "reap --orphan-runtimes: reading process snapshot: %v — not touching any process this run\n", err)
-		return nil, false
 	}
 
 	byUDID := map[string][]int{}
@@ -106,16 +108,10 @@ func findOrphanedRuntimes(stderr io.Writer) ([]orphanedRuntime, bool) {
 // reapOrphanRuntimes reports — and with purge, kills — the userland of
 // devices that no longer exist.
 //
-// Killing here is narrower than it looks. A process whose device is absent
-// from a listing that did report other devices can never become valid again:
-// simulator UDIDs are not reused, nothing can re-create the device under the
-// same id, and no live device's processes can be reached, since a live
-// device is by definition present in the listing that just succeeded. That
-// is also what makes a second identity re-check at kill time unnecessary
-// here in a way it is not for `with`-spawned orphans: for a recycled pid to
-// be mistaken for a member of this set, the operating system would have to
-// hand the number to a *new* process belonging to the *same deleted device*,
-// which nothing on the machine is able to create.
+// Candidate processes were observed before the device listing. Their device's
+// absence from that later listing indicates deletion, since simulator UDIDs
+// are not reused. A device created during discovery is therefore never judged
+// against an inventory taken before it existed.
 //
 // launchd_sim is signalled first within each device. It is the only process
 // in the tree that can still spawn new members, so killing the leaves first

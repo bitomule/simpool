@@ -25,13 +25,11 @@ on two different slots instead of serializing behind one shared lock.
 Zero configuration required: the template resolves the `simpool` binary
 and the real `$HOME` for the pool from inside the test action itself (see
 the template's header for why neither can be assumed present in a
-sanitized test action's environment), and falls back to stock
+sanitized test action's environment). If `simpool` cannot be found, the
+test action fails. Setting `SIMPOOL_OPTIONAL=1` explicitly opts into stock
 `ios_xctestrun_runner`-equivalent behavior — reuse-or-create a simulator by
-a fixed name — when `simpool` isn't installed at all, so this rule always
-builds and runs whether or not the host has simpool. That fallback is not
-equally *safe*, though: it reuses one fixed name across every concurrent
-test action missing simpool, which is exactly the collision this rule
-exists to prevent — the template warns on stderr when it takes that path.
+a fixed name — with a warning on stderr. That fallback shares one unmanaged
+simulator across concurrent test actions, so it has no concurrency safety.
 
 `_get_template_substitutions` and `_get_execution_environment` below, and
 most of the attributes' names/docstrings, are adapted near-verbatim from
@@ -288,7 +286,8 @@ rule never deletes it.
 Forwarded to `simpool with --max` for this rule's device+OS group. 0 (the
 default) omits `--max` entirely, so `simpool` falls back to its own
 default resolution (`SIMPOOL_MAX_SLOTS` if set in `simpool`'s own
-environment, else its built-in default of 3).
+environment, else 6 with slim enabled (the default), or 3 with
+`SIMPOOL_SLIM=0`).
 
 This is the only way to raise the cap from a Bazel test action:
 `SIMPOOL_MAX_SLOTS` is read from `simpool`'s environment, which a

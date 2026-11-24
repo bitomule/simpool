@@ -68,6 +68,9 @@ type provisionDeps struct {
 	// reason slim is; a nil restore means "disabled", so the fakes that
 	// predate it are unaffected.
 	restore func(udid string, want Presentation, timeout time.Duration) ([]string, error)
+	// renderProbe renders a known screen and reports where its content
+	// starts (see renderprobe.go). A nil renderProbe means "disabled".
+	renderProbe func(udid string, timeout time.Duration) (RenderReading, error)
 }
 
 var liveProvisionDeps = provisionDeps{
@@ -80,6 +83,7 @@ var liveProvisionDeps = provisionDeps{
 	delete:         simctl.Delete,
 	slim:           SlimDevice,
 	restore:        RestorePresentation,
+	renderProbe:    liveRenderProbe,
 }
 
 // EnvStrictSubstance, when set to "0", disables substance verification and
@@ -523,6 +527,12 @@ func ensureProvisioned(s *Slot, ownerCmd, mode, leaseKey string, deps provisionD
 	// screenshot matrix this exists to protect (see Slot.Renewed).
 	if !s.Renewed && RestoreEnabled() && deps.restore != nil {
 		reconcilePresentation(deps, udid)
+	}
+
+	if !s.Renewed && RenderProbeEnabled() && deps.renderProbe != nil {
+		if err := verifyRender(deps, s, udid, bootTimeout); err != nil {
+			return err
+		}
 	}
 
 	s.Meta.Device = s.Device

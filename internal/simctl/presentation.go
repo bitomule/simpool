@@ -149,3 +149,24 @@ func RestartSpringBoard(udid string, timeout time.Duration) error {
 	}
 	return fmt.Errorf("SpringBoard on %s did not come back within %s after being stopped", udid, timeout)
 }
+
+// Launch starts bundleID on udid, relaunching it from scratch if it was running.
+func Launch(udid, bundleID string, timeout time.Duration) error {
+	_, err := runWithTimeout(timeout, "launch", "--terminate-running-process", udid, bundleID)
+	return err
+}
+
+// Terminate stops bundleID on udid. An app that is not running is not an error.
+func Terminate(udid, bundleID string, timeout time.Duration) error {
+	_, err := runWithTimeout(timeout, "terminate", udid, bundleID)
+	if err != nil && strings.Contains(err.Error(), "found nothing to terminate") {
+		return nil
+	}
+	return err
+}
+
+// Screenshot writes a PNG of udid's screen to path.
+func Screenshot(udid, path string, timeout time.Duration) error {
+	_, err := runWithTimeout(timeout, "io", udid, "screenshot", "--type=png", path)
+	return err
+}
